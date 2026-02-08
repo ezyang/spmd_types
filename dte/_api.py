@@ -35,7 +35,7 @@ The type system can be run in two different modes:
 
 For users seeking to adopt this type system with an existing Megatron-like
 training codebase (plain Tensor and manual collectives everywhere), we
-recommend migrating your code local SPMD for the majority of your code and
+recommend migrating your code to local SPMD for the majority of your code and
 only do global SPMD annotations at module boundaries (to specify input/output
 contracts).  This minimizes the amount of code changes necessary (since your
 code is already local SPMD) for maximum benefit (cross-module sharding/partial
@@ -66,7 +66,7 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
 * Both replicate and invariant mean that the data is replicated across the
   device mesh axis.  The gradient of replicate is partial, while the
   gradient of invariant is invariant.  Intuitively, tensors are typically
-  only invariant when they are parameters (and you desire to the gradient to
+  only invariant when they are parameters (and you desire the gradient to
   have already been all-reduced) and replicated when being computed on
   (where you typically desire their gradients to be partial so you can delay
   the all-reduce, in case it can actually be a reduce-scatter.)  Notably,
@@ -168,7 +168,7 @@ To explain in more detail:
   is only semantically *one* value in this situation, even though there
   are several replicas.)
 
-So this diagram says we start off with rank 0: [A], rank 1: [B] and rank 3: [C],
+So this diagram says we start off with rank 0: [A], rank 1: [B] and rank 2: [C],
 and after the operation all three ranks have [A, B, C] (aka an all-gather).
 
 If the tensors have a leading plus, e.g., `+[A, B, C]`, this means there is a
@@ -251,7 +251,7 @@ When `tgt='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpr
 [A]  <=  [A]
 ```
 
-It is common to want to `all_reduce` on varying data; just `pinterpret(V,P)` the data
+It is common to want to `all_reduce` on varying data; just `reinterpret(V,P)` the data
 as partial before calling `all_reduce`.
 
 TODO: I think with erasure we can infer this cast
@@ -341,7 +341,7 @@ Backward:
                     +[A2]
 ```
 
-`reinterpret(I,V): I -> V`, the backwards is `all_reduce(I): V -> I`
+`reinterpret(I,V): I -> V`, the backwards is `all_reduce(I) . reinterpret(V,P): V -> I`
 
 ```
 Forward:
@@ -423,7 +423,7 @@ Backward:
 +[A, 0, 0]      [A]
 +[0, B, 0]  <=  [B]
 +[0, 0, C]      [C]
-````
+```
 
 `convert(I,V): I -> V`, the backwards is `all_gather(I): V -> I`
 
@@ -483,7 +483,7 @@ You cannot convert out of P: the only way to eliminate the pending reduction
 is to do the actual all-reduce.
 
 For convenience, we also support convert(R,I) and convert(I,R), which have the
-same meaning as reinterpret(R,I) and reinterpret(R,I).
+same meaning as reinterpret(R,I) and reinterpret(I,R).
 
 Here is a table of permissible converts (`-` is no-op, `O` is supported, `X` is when
 the semantics is the same as reinterpret.)
@@ -515,6 +515,7 @@ Invariant       reinterpret(I,R)    -                   reinterpret(I,V)    rein
                                                         convert(I,V)        convert(I,P)
 
 Varying         all_gather(R)       all_gather(I)       all_to_all()        reinterpret(V,P)
+                                                                            convert(V,P)
 
 Partial         all_reduce(R)       all_reduce(I)       reduce_scatter()    -
 ```
