@@ -594,6 +594,39 @@ P -> V      reduce_scatter()        V -> R      all_gather(R)
 
 # Global SPMD
 
+What is a global SPMD type?  We take the existing local SPMD type, and augment
+it with a partition spec that says how varying mesh dimensions should be
+reassembled together into the full tensor.  A partition spec is a tuple
+whose size matches the tensor's dimension.  For each dim, it specifies
+zero, one or several mesh axes which shard that dimension.  It is common to
+print the partition spec along with the shape of a tensor; so for example,
+`f32[8,16@tp]` says that dim=1 of the tensor has been sharded by the "tp"
+mesh axis.  It is only legal for varying mesh dimensions to occur in the
+partition spec.
+
+(Aside: another way we could have defined the global SPMD type is by replacing
+Varying with Shard(tensor dim), which is indeed how PyTorch DTensor defines
+sharding.  However, most people find the JAX-style tensor dim more intuitive
+to work with, and it is quite beneficial to be able to factor the global SPMD
+into a local SPMD type plus something extra!)
+
+We continue to do local SPMD type checking as described above.  Our new
+problem is to describe the type propagation rules for the partition spec.
+Unfortunately, unlike in local SPMD, this must be done on a per operator basis
+(for both non-comms and comms operators).
+
+Local SPMD and global SPMD can seamlessly interoperate with each other.  If you
+enter a local map (aka `shard_map`) region, you simply forget the partition spec;
+when you want to reenter global SPMD, you simply have to specify how the tensor
+should be reassembled into a full tensor.
+
+## Shard propagation
+
+
+
+
+## Worked example comparing local SPMD and global SPMD
+
 An illustrative example highlighting the difference between local and global
 SPMD is what happens when we perform the matmul in row-parallel linear
 Megatron-style TP.  In this setting, both the intermediate and the weight are
