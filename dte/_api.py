@@ -111,12 +111,22 @@ Specifically, here are the valid combinations of states:
 op(Replicate..) -> Replicate
 op(Invariant..) -> Invariant  # NB: this case is uncommon
 op(Varying..) -> Varying
-linear_op(Partial) -> Partial  # The n-ary op rule is more complicated
+linear_op(Partial) -> Partial
 
 # Invariant not allowed to mix with other types
 op(Replicate, Varying) -> Varying
-Partial + Partial -> Partial  # only bilinear functions can take multiple Partial arguments
+Partial + Partial -> Partial
 ```
+
+For n-ary operations involving Partial, only addition (and more generally,
+multilinear operations) can accept multiple Partial arguments.  This is because
+addition distributes over the pending sum: (sum of a) + (sum of b) = sum of (a + b).
+But multiplication does NOT distribute: (sum of a) * (sum of b) != sum of (a * b).
+To see why concretely, consider two partial tensors each with value [1] on two
+ranks.  Their denotations are both 1+1=2, so the product should be 4.  But if we
+locally multiply and then reduce, we get 1*1 + 1*1 = 2, which is wrong.
+Therefore, `Partial * Partial` is forbidden; you must all-reduce at least one
+operand first.
 
 TODO: Prove that these rules are correct
 
@@ -199,8 +209,6 @@ When we write the backwards for ops, we will reverse the double arrow
 (both in terms of the tensor shape, as well as whether or not there are
 semantically one or many values across the mesh axis), so it's a good
 way of checking if you have written the correct backwards.
-
-TODO: I'm not sure reversing the arrow actually makes things easier to understand.
 
 When referencing operators, we may refer to them compactly by removing `x` and
 `mesh_axis` from the function signature, and using R/V/P/I to abbreviate the
@@ -309,8 +317,14 @@ The forwards is `V -> V`, the backwards is `all_to_all: V -> V`.
 ### `reinterpret(x, mesh_axis, src, tgt)`
 
 Coerce from one local SPMD type to another local SPMD type without changing
-the local tensor.  It is guaranteed to be a no-op in forwards.  Here
-are the supported coercions:
+the local tensor.  It is guaranteed to be a no-op in forwards.
+
+**Important:** Unlike `convert`, `reinterpret` can change the semantic value of
+a tensor.  For example, `reinterpret(R,P)` treats a replicated value as if it
+were partial, meaning after reduction you get N times the original value (where
+N is the mesh axis size).  If you want to preserve semantics, use `convert`.
+
+Here are the supported coercions:
 
 `reinterpret(R,I): R -> I`, the backwards is `convert(I,P): I -> P`
 
