@@ -341,20 +341,6 @@ Backward:
                     +[A2]
 ```
 
-`reinterpret(I,V): I -> V`, the backwards is `all_reduce(I) . reinterpret(V,P): V -> I`
-
-```
-Forward:
-         [A]
-[A]  =>  [A]
-         [A]
-
-Backward:
-                    [A0]
-[A0 + A1 + A2]  <=  [A1]
-                    [A2]
-```
-
 `reinterpret(V,P): V -> P`, the backwards is `reinterpret(R,V): R -> V`
 
 ```
@@ -383,10 +369,9 @@ Backward:
 +[A]
 ```
 
-TODO[claude]: Do these compositions below directly, like the ones above
-
-`reinterpret(R,P): R -> P`, is the composition of `R -> V -> P`.  `reinterpret(I,P): I -> P`, is the composition
-of `I -> V -> P`.  Note that this reinterpret has unusual semantics: the
+`reinterpret(I,V): I -> V` is the composition of `I -> R -> V`.  `reinterpret(R,P): R -> P`
+is the composition of `R -> V -> P`.  `reinterpret(I,P): I -> P` is the composition of
+`I -> R -> P`.  Note that these reinterprets have unusual semantics: the
 resulting tensor has been scaled by the mesh axis size (because you are now
 obligated to sum each of the (equal) quantities of the rank together!) If you
 instead wanted to *preserve* the original semantic meaning of the tensor, use
@@ -399,7 +384,7 @@ coercion, `/` is transitive coercion.)
        tgt
        R I V P
 src R  - X X /
-    I  X - X /
+    I  X - / /
     V      - X
     P        -
 ```
@@ -536,10 +521,8 @@ R -> V      reinterpret(R,V)        V -> P      reinterpret(V,P)
 R -> P      reinterpret(R,P)        R -> P      reinterpret(R,P)
             convert(R,P)                        convert(R,P)
 I -> R      reinterpret(I,R)        P -> I      all_reduce(I)
-I -> V      reinterpret(I,V)        V -> I      all_reduce(I) . reinterpret(V,P)
-            convert(I,V)                        all_gather(I)
-I -> P      reinterpret(I,P)        R -> I      all_reduce(I) . reinterpret(R,P)
-            convert(I,P)                        reinterpret(R,I)
+I -> V      convert(I,V)            V -> I      all_gather(I)
+I -> P      convert(I,P)            R -> I      reinterpret(R,I)
 V -> R      all_gather(R)           P -> V      reduce_scatter()
 V -> I      all_gather(I)           I -> V      convert(I,V)
 V -> V      all_to_all()            V -> V      all_to_all()
