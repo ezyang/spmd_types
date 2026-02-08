@@ -545,9 +545,9 @@ src R  - X O O
 ## Comms by state transition
 
 Here is a table comprehensively organizing all of the operators above by state
-transition.  Note that type does NOT uniquely determine an operator: there can
-be multiple ways to get from one type to another which have different
-semantics.
+transition, omitting operators which are done by composition.  Note that type
+does NOT uniquely determine an operator: there can be multiple ways to get
+from one type to another which have different semantics.
 
 
 ```
@@ -556,8 +556,8 @@ SRC    \------------------------------------------------------------------------
 Replicate       -                   reinterpret(R,I)    reinterpret(R,V)    reinterpret(R,P)
                                                         convert(R,V)        convert(R,P)
 
-Invariant       reinterpret(I,R)    -                   reinterpret(I,V)    reinterpret(I,P)
-                                                        convert(I,V)        convert(I,P)
+Invariant       reinterpret(I,R)    -                   reinterpret(I,V)    convert(I,P)
+                                                        convert(I,V)
 
 Varying         all_gather(R)       all_gather(I)       all_to_all()        reinterpret(V,P)
                                                                             convert(V,P)
@@ -610,6 +610,8 @@ sharding.  However, most people find the JAX-style tensor dim more intuitive
 to work with, and it is quite beneficial to be able to factor the global SPMD
 into a local SPMD type plus something extra!)
 
+TODO: this is NOT actually true, the local SPMD types are different
+
 We continue to do local SPMD type checking as described above.  Our new
 problem is to describe the type propagation rules for the partition spec.
 Unfortunately, unlike in local SPMD, this must be done on a per operator basis
@@ -622,7 +624,8 @@ should be reassembled into a full tensor.
 
 ## Shard propagation
 
-
+TODO: Design problem: should contraction on sharded dimension automatically produce
+partial, or should you be forced to spell it out explicitly?
 
 
 ## Worked example comparing local SPMD and global SPMD
