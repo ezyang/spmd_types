@@ -1,5 +1,5 @@
 import torch
-# TODO[claude]: fix imports
+import torch.distributed as dist
 
 """
 
@@ -198,7 +198,7 @@ TODO: I'm not sure reversing the arrow actually makes things easier to understan
 
 When referencing operators, we may refer to them compactly by removing `x` and
 `mesh_axis` from the function signature, and using R/V/P/I to abbreviate the
-local SPMD type passed into src/dst arguments.
+local SPMD type passed into src/tgt arguments.
 
 OK, without further ado!
 
@@ -212,7 +212,7 @@ OK, without further ado!
 
 Gather shards along the mesh axis, so that every rank has the full copy of the data.
 
-When `dst='replicate'`, aka `all_gather(R): V -> R`, the backwards is `reduce_scatter: P -> V`.
+When `tgt='replicate'`, aka `all_gather(R): V -> R`, the backwards is `reduce_scatter: P -> V`.
 
 ```
 [A0 + A1 + A2]      +[A0, B0, C0]
@@ -220,7 +220,7 @@ When `dst='replicate'`, aka `all_gather(R): V -> R`, the backwards is `reduce_sc
 [C0 + C1 + C2]      +[A2, B2, C2]
 ```
 
-When `dst='invariant'`, aka `all_gather(I): V -> I`, the backwards is `convert(I,V): I -> V`.
+When `tgt='invariant'`, aka `all_gather(I): V -> I`, the backwards is `convert(I,V): I -> V`.
 
 ```
 [A]
@@ -575,61 +575,272 @@ Related work: https://arxiv.org/pdf/2506.15961
 # TODO: There may be inaccuracies in the code below as I am still working on
 # it
 
-# TODO[claude]: for all of the public (non-prefix underscore API), we need to
-# implement a separate type-checking mode, that keeps track of partial,
-# replicate and varying on a per-mesh axis basis.  We will implement just the
-# rule for einsum, which is simple.
-class LTensor:
-    pass
-
-
-# TODO: this would need to be overrideable by the user to get PGs from their
-# preferred spot; e.g., parallel_state or a (global) device mesh
-def _get_mesh_axis_group(axis_name):
-    # TODO[claude]: Introduce a concept of a global device mesh ala set_mesh
-    # and then retrieve the PG from that mesh
-    assert False
-
 # NB: partial here denotes partial summation
 ALLOWED_PCAST_STATES = {'partial', 'replicate', 'varying', 'invariant'}
 
+
+class LTensor:
+    """
+    A tensor with local SPMD type annotations.
+
+    Tracks the local SPMD type (replicate, invariant, varying, partial) for each
+    mesh axis. This enables type-checking to ensure distributed operations
+    compute mathematically correct gradients.
+
+    Attributes:
+        data: The underlying torch.Tensor
+        types: Dict mapping mesh axis names to local SPMD types
+    """
+
+    def __init__(self, data: torch.Tensor, types: dict[str, str] | None = None):
+        """
+        Create an LTensor with optional type annotations.
+
+        Args:
+            data: The underlying tensor
+            types: Dict mapping mesh axis names to types
+                   ('replicate', 'invariant', 'varying', 'partial')
+        """
+        self.data = data
+        self.types = types if types is not None else {}
+        for axis_name, typ in self.types.items():
+            if typ not in ALLOWED_PCAST_STATES:
+                raise ValueError(
+                    f"Invalid type '{typ}' for axis '{axis_name}'. "
+                    f"Must be one of {ALLOWED_PCAST_STATES}"
+                )
+
+    def get_type(self, axis_name: str) -> str | None:
+        """Get the local SPMD type for a mesh axis, or None if not tracked."""
+        return self.types.get(axis_name)
+
+    def with_type(self, axis_name: str, typ: str) -> "LTensor":
+        """Return a new LTensor with an updated type for the given axis."""
+        if typ not in ALLOWED_PCAST_STATES:
+            raise ValueError(f"Invalid type '{typ}'. Must be one of {ALLOWED_PCAST_STATES}")
+        new_types = self.types.copy()
+        new_types[axis_name] = typ
+        return LTensor(self.data, new_types)
+
+
+def einsum(equation: str, *operands: LTensor) -> LTensor:
+    """
+    Perform einsum with local SPMD type checking.
+
+    The typing rule for einsum is simple: all operands must have matching types
+    on each mesh axis, and the output inherits those types.
+
+    For each mesh axis:
+    - If all operands are Replicate -> output is Replicate
+    - If all operands are Invariant -> output is Invariant
+    - If all operands are Varying -> output is Varying
+    - If operand is Partial -> only valid for linear operations on single Partial input
+    - Mixed Replicate/Varying -> output is Varying
+    - Invariant cannot mix with other types
+
+    Args:
+        equation: The einsum equation string
+        *operands: LTensor operands
+
+    Returns:
+        LTensor with the result and inferred types
+    """
+    # Extract underlying tensors
+    tensors = [op.data for op in operands]
+
+    # Collect all mesh axes mentioned
+    all_axes = set()
+    for op in operands:
+        all_axes.update(op.types.keys())
+
+    # Type check and infer output types
+    output_types = {}
+    for axis in all_axes:
+        axis_types = []
+        for op in operands:
+            typ = op.types.get(axis)
+            if typ is not None:
+                axis_types.append(typ)
+
+        if not axis_types:
+            continue
+
+        # Check type compatibility and infer output type
+        unique_types = set(axis_types)
+
+        if len(unique_types) == 1:
+            # All same type
+            output_types[axis] = axis_types[0]
+        elif unique_types == {'replicate', 'varying'}:
+            # Mixed replicate/varying -> varying
+            output_types[axis] = 'varying'
+        elif 'invariant' in unique_types and len(unique_types) > 1:
+            raise TypeError(
+                f"Invariant type on axis '{axis}' cannot mix with other types. "
+                f"Found types: {axis_types}"
+            )
+        elif 'partial' in unique_types:
+            # Partial can only appear alone (for linear ops) or with another partial
+            # (for bilinear ops like matmul)
+            non_partial = unique_types - {'partial'}
+            if non_partial:
+                raise TypeError(
+                    f"Partial type on axis '{axis}' can only combine with partial. "
+                    f"Found types: {axis_types}"
+                )
+            output_types[axis] = 'partial'
+        else:
+            raise TypeError(
+                f"Incompatible types on axis '{axis}': {axis_types}"
+            )
+
+    # Perform the einsum
+    result = torch.einsum(equation, *tensors)
+
+    return LTensor(result, output_types)
+
+
+# Global device mesh storage
+_global_mesh = None
+
+
+def set_mesh(mesh):
+    """
+    Set the global device mesh for distributed operations.
+
+    Args:
+        mesh: A DeviceMesh object that maps axis names to process groups.
+              Must have a `get_group(axis_name)` method.
+    """
+    global _global_mesh
+    _global_mesh = mesh
+
+
+def get_mesh():
+    """
+    Get the current global device mesh.
+
+    Returns:
+        The global DeviceMesh, or None if not set.
+    """
+    return _global_mesh
+
+
+def _get_mesh_axis_group(axis_name):
+    """Get the process group for a mesh axis from the global mesh."""
+    if _global_mesh is None:
+        raise RuntimeError(
+            "No global mesh set. Call set_mesh() with a DeviceMesh before using "
+            "distributed operations."
+        )
+    return _global_mesh.get_group(axis_name)
+
+
 class _ReplicateToVarying(torch.autograd.Function):
+    """reinterpret(R,V): R -> V, backward is reinterpret(V,P): V -> P (no-op)."""
+
+    @staticmethod
     def forward(ctx, x, axis_name):
-        self.axis_name = axis_name
+        ctx.axis_name = axis_name
         return x
 
+    @staticmethod
     def backward(ctx, grad_out):
-        return psum_invariant(grad_out, self.axis_name)
+        # reinterpret(V,P) is a no-op in forward direction
+        return grad_out, None
 
 
 # NB: Something is a pcast only if it is a no-op in forwards.  But pcasts can
 # become collectives in backwards!
-# TODO[claude]: replace the asserts with proper if-raise errors
-# TODO[claude]: add docstrings for functions
-def pcast(x, axis_name, *, src: str, dst: str):
-    # NB: no pytree support on x
-    # TODO: is 'replicated' more symmetric
-    # TODO: support 'unreduced' for more compat with JAX?
-    # TODO: is 'varying' more symmetric with 'partial'/'replicate'?
-    assert src in ALLOWED_PCAST_STATES, src
-    assert dst in ALLOWED_PCAST_STATES, dst
-    if src == 'replicate' and dst == 'varying':
-        return _ReplicateToVarying.apply(x, axis_name)
+def reinterpret(x, axis_name, *, src: str, tgt: str):
+    """
+    Coerce from one local SPMD type to another without changing the local tensor.
 
-class _AllReduceFromVary(torch.autograd.Function):
-    # varying -> replicate
+    Guaranteed to be a no-op in forwards, but can have nontrivial backwards
+    that requires comms.
+
+    Args:
+        x: Input tensor
+        axis_name: The mesh axis to operate on
+        src: Source local SPMD type ('replicate', 'invariant', 'varying', 'partial')
+        tgt: Target local SPMD type ('replicate', 'invariant', 'varying', 'partial')
+
+    Supported coercions:
+        - reinterpret(R,I): R -> I, backward is convert(I,P): I -> P
+        - reinterpret(R,V): R -> V, backward is reinterpret(V,P): V -> P
+        - reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I
+        - reinterpret(V,P): V -> P, backward is reinterpret(R,V): R -> V
+        - reinterpret(R,P): R -> P, backward is reinterpret(R,P): R -> P
+    """
+    # NB: no pytree support on x
+    if src not in ALLOWED_PCAST_STATES:
+        raise ValueError(f"Invalid src state: {src}. Must be one of {ALLOWED_PCAST_STATES}")
+    if tgt not in ALLOWED_PCAST_STATES:
+        raise ValueError(f"Invalid tgt state: {tgt}. Must be one of {ALLOWED_PCAST_STATES}")
+    if src == 'replicate' and tgt == 'varying':
+        return _ReplicateToVarying.apply(x, axis_name)
+    raise NotImplementedError(f"reinterpret({src}, {tgt}) not yet implemented")
+
+
+# Alias for JAX compatibility (see docstring: "In JAX, these operations are called `pcast`")
+pcast = reinterpret
+
+
+class _AllReduceToReplicate(torch.autograd.Function):
+    """all_reduce(R): P -> R, backward is all_reduce(R): P -> R."""
+
+    @staticmethod
     def forward(ctx, x, axis_name):
-        self.axis_name = axis_name
+        ctx.axis_name = axis_name
         pg = _get_mesh_axis_group(axis_name)
         return dist.all_reduce(x, op=dist.ReduceOp.SUM, group=pg, async_op=False)
 
-    # partial -> vary
+    @staticmethod
     def backward(ctx, grad_out):
-        return pcast(grad_out, axis_name, from='partial', to='varying')
+        # backward of P -> R is P -> R (same operation)
+        pg = _get_mesh_axis_group(ctx.axis_name)
+        return dist.all_reduce(grad_out, op=dist.ReduceOp.SUM, group=pg, async_op=False), None
 
-# TODO[claude]: the typechecking version will only accept vary
-def all_reduce(x, axis_name):
-    return _AllReduceFromVary.apply(x, axis_name)
+
+class _AllReduceToInvariant(torch.autograd.Function):
+    """all_reduce(I): P -> I, backward is reinterpret(I,R): I -> R (no-op)."""
+
+    @staticmethod
+    def forward(ctx, x, axis_name):
+        ctx.axis_name = axis_name
+        pg = _get_mesh_axis_group(axis_name)
+        return dist.all_reduce(x, op=dist.ReduceOp.SUM, group=pg, async_op=False)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # reinterpret(I,R) is a no-op
+        return grad_out, None
+
+
+def all_reduce(x, axis_name, *, src: str = 'partial', tgt: str):
+    """
+    Reduce shards along the mesh axis, so every rank has the full summed value.
+
+    Args:
+        x: Input tensor with Partial type on the mesh axis
+        axis_name: The mesh axis to reduce over
+        src: Source type (must be 'partial')
+        tgt: Target type ('replicate' or 'invariant')
+
+    Returns:
+        Tensor with Replicate or Invariant type depending on tgt
+
+    When tgt='replicate', backward is all_reduce(R): P -> R
+    When tgt='invariant', backward is reinterpret(I,R): I -> R (no-op)
+    """
+    if src != 'partial':
+        raise ValueError(f"all_reduce src must be 'partial', got {src}")
+    if tgt == 'replicate':
+        return _AllReduceToReplicate.apply(x, axis_name)
+    elif tgt == 'invariant':
+        return _AllReduceToInvariant.apply(x, axis_name)
+    else:
+        raise ValueError(f"all_reduce tgt must be 'replicate' or 'invariant', got {tgt}")
 
 """
 Other notes:
