@@ -91,6 +91,14 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   can be profitable as it might be possible to do a reduce-scatter or eliminate the
   reduction entirely.  The gradient of partial is replicate.
 
+**Note on replicate vs invariant:** these types have identical *forward* values
+(each rank holds the same data), but they encode different *backward* semantics.
+A replicate tensor allows each rank to contribute distinct local gradients that
+must be aggregated (e.g., via all-reduce/reduce-scatter), while an invariant
+tensor requires the gradient itself to be identical on every rank (no implicit
+summation).  The distinction reflects how the value is *used* and how gradients
+should be interpreted, not how the forward value is computed.
+
 To summarize the forward-backward relationship of these types:
 
 ```
@@ -159,6 +167,12 @@ distributed APIs:
   varying as concatenation on dim 0, following the natural behavior of
   collectives like all-gather and reduce-scatter.  Like `reinterpret`, these
   operations can have nontrivial backwards.
+
+For ordinary local Torch ops (e.g., einsum, matmul, elementwise ops, and
+reductions over tensor dimensions like sum), there is no cross-rank
+communication, so they do not take src/tgt arguments.  Their local SPMD types
+propagate from their inputs according to the typing rules above, and any
+nontrivial type changes must be made explicit via the primitives above.
 
 TODO: Show local SPMD rules work even when the shapes across ranks are not the
 same.  I think you need to have some special collectives in this case.
@@ -273,7 +287,7 @@ as partial before calling `all_reduce`.
 
 TODO: I think with erasure we can infer this cast
 
-### `reduce_scatter(x, mesh_axis): Varying | Partial -> Varying`
+### `reduce_scatter(x, mesh_axis): Partial -> Varying`
 
 ```
 +[A0, B0, C0]      [A0 + A1 + A2]
@@ -283,12 +297,13 @@ TODO: I think with erasure we can infer this cast
 
 Reduce shards along the mesh axis, but only get one shard of the result (e.g.,
 an inefficient implementation of reduce-scatter would be to all-reduce and
-then drop the data you did not need.)  Like `all_reduce`, you can also run
-this on a varying answer (the backwards gets an extra call to `pcast: R ->
-V`); unlike `all_reduce`, this always produces a varying output, so it doesn't
-accept a tgt argument.
+then drop the data you did not need.)  Unlike `all_reduce`, this always
+produces a varying output, so it doesn't accept a tgt argument.
 
 The forwards is `P -> V`, the backwards is `all_gather: V -> R`
+
+It is common to want to `reduce_scatter` on varying data; just `reinterpret(V,P)`
+the data as partial before calling `reduce_scatter`.
 
 ```
                [A]
@@ -423,6 +438,10 @@ conversions:
 
 `convert(R,V): R -> V`, the backward is `convert(V,P) : V -> P`
 
+Input is replicated across ranks, so each rank holds the full tensor.  The
+output keeps only the local shard along the specified dim, producing a varying
+value.
+
 ```
 Forward:
                [A]
@@ -436,6 +455,10 @@ Backward:
 ```
 
 `convert(I,V): I -> V`, the backwards is `all_gather(I): V -> I`
+
+Input is invariant across ranks, so each rank holds the full tensor.  The
+output keeps only the local shard along the specified dim, producing a varying
+value.
 
 ```
 Forward
@@ -451,6 +474,10 @@ Backward:
 
 `convert(R,P): R -> P`, the backwards is `convert(R,P) : R -> P`
 
+Input is replicated across ranks.  The output keeps the same per-rank tensor
+shape, but all ranks except the first are zeroed out, producing a partial value
+that sums to the original tensor after a cross-rank reduction.
+
 ```
 Forward:
          +[A]
@@ -465,6 +492,10 @@ Backward:
 
 `convert(I,P): I -> P`, the backwards is `reinterpret(R,I): R -> I`
 
+Input is invariant across ranks.  The output keeps the same per-rank tensor
+shape, but all ranks except the first are zeroed out, producing a partial value
+that sums to the original tensor after a cross-rank reduction.
+
 ```
 Forward:
          +[A]
@@ -476,6 +507,10 @@ Backward:
 ```
 
 `convert(V,P): V -> P`, the backwards is `convert(R,V): R -> V`
+
+Input is varying, with each rank holding a shard or distinct value.  The output
+places each rank's value into a disjoint position of a partial tensor (zeros
+elsewhere) so that summing across ranks reconstructs the stacked value.
 
 ```
 Forward:
