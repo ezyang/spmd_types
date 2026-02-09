@@ -979,30 +979,8 @@ rank (you can use those versions by dropping into local SPMD, and then when
 returning to global SPMD explicitly specifying what your new desired global SPMD
 type is).
 
-The global SPMD interpretation of convert is straightforward: it is the
-identity function.  However, the global SPMD interpretations of reinterpret
-are sometimes counter-intuitive.  Here, we write "single device" versions of
-these functions to make it clear what their action is, given sharding on
-tensor dim 0 (TODO: generalize for arbitrary dim i):
-
-```
-def reinterpret_R_I(x):
-    return x
-
-def reinterpret_R_S0(x):
-    repeats = [mesh_axis_size] + [1] * (x.ndim - 1)
-    return x.repeat(repeats)
-
-def reinterpret_I_R(x):
-    return x
-
-def reinterpret_S0_P(x):
-    shape = (mesh_axis_size, x.shape[0] // mesh_axis_size) + x.shape[1:]
-    return x.view(shape).sum(0)
-
-def reinterpret_R_P(x):
-    return x * mesh_axis_size
-```
+The global SPMD interpretation of convert (when it is defined for global SPMD)
+is straightforward: it is the identity function.
 
 ### Per-mesh-dim redistribute
 
