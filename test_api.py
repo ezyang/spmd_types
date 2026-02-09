@@ -306,8 +306,10 @@ class TestEinsumTypePropagation(unittest.TestCase):
 class TestAllReduce(LocalTensorTestCase):
     """Test all_reduce operation: P -> R | I."""
 
-    def test_all_reduce_p_to_r_forward(self):
-        """all_reduce(R): P -> R, forward sums across ranks."""
+    def test_all_reduce_p_to_r(self):
+        """all_reduce(R): P -> R, sums across ranks. Tests forward and backward."""
+        from dte._api import _AllReduceToReplicate
+
         # Create "partial" input - different values per rank that need summing
         x = self._generate_inputs((4,), 'partial')
 
@@ -322,8 +324,14 @@ class TestAllReduce(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
 
-    def test_all_reduce_p_to_i_forward(self):
-        """all_reduce(I): P -> I, forward sums across ranks."""
+        # Backward check: verify backward returns valid gradient
+        grad_out = self._generate_inputs((4,), 'partial')
+        self._check_backward_not_none(_AllReduceToReplicate, (x, 'tp'), grad_out)
+
+    def test_all_reduce_p_to_i(self):
+        """all_reduce(I): P -> I, sums across ranks. Tests forward and backward."""
+        from dte._api import _AllReduceToInvariant
+
         x = self._generate_inputs((4,), 'partial')
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
@@ -333,6 +341,10 @@ class TestAllReduce(LocalTensorTestCase):
         self._assert_all_ranks_equal(result, "all_reduce result should be same on all ranks")
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
+
+        # Backward check: verify backward returns valid gradient
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_AllReduceToInvariant, (x, 'tp'), grad_out)
 
     def test_all_reduce_invalid_src(self):
         """all_reduce only accepts partial src."""
@@ -352,7 +364,7 @@ class TestAllReduce(LocalTensorTestCase):
 class TestAllGather(LocalTensorTestCase):
     """Test all_gather operation: V -> R | I."""
 
-    def test_all_gather_v_to_r_forward(self):
+    def test_all_gather_v_to_r(self):
         """all_gather(R): V -> R, gathers shards from all ranks."""
         # Create varying input - different per rank
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
@@ -365,7 +377,7 @@ class TestAllGather(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
 
-    def test_all_gather_v_to_i_forward(self):
+    def test_all_gather_v_to_i(self):
         """all_gather(I): V -> I, gathers shards from all ranks."""
         x = self.mode.rank_map(lambda r: torch.tensor([float(r) * 2]))
 
@@ -376,7 +388,7 @@ class TestAllGather(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
 
-    def test_all_gather_shard_to_r_forward(self):
+    def test_all_gather_shard_to_r(self):
         """all_gather(R): S(i) -> R, gathers shards from all ranks."""
         # Create sharded input on dim 0
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
@@ -407,7 +419,7 @@ class TestAllGather(LocalTensorTestCase):
 class TestReduceScatter(LocalTensorTestCase):
     """Test reduce_scatter operation: P -> V."""
 
-    def test_reduce_scatter_forward(self):
+    def test_reduce_scatter(self):
         """reduce_scatter: P -> V, reduces and scatters."""
         # Create input with world_size chunks per rank
         # Each rank has [A_r, B_r, C_r] where total length is world_size * chunk_size
@@ -469,7 +481,7 @@ class TestReduceScatter(LocalTensorTestCase):
 class TestAllToAll(LocalTensorTestCase):
     """Test all_to_all operation: V -> V."""
 
-    def test_all_to_all_forward(self):
+    def test_all_to_all(self):
         """all_to_all: V -> V, transposes mesh and tensor dims."""
         # Create input: rank r has [r*3, r*3+1, r*3+2]
         # After all_to_all, rank r should get [r, r+3, r+6]
@@ -512,8 +524,10 @@ class TestAllToAll(LocalTensorTestCase):
 class TestReinterpret(LocalTensorTestCase):
     """Test reinterpret operations (no-op forwards, possibly comms in backwards)."""
 
-    def test_reinterpret_r_to_v_forward(self):
-        """reinterpret(R,V): R -> V, no-op forward."""
+    def test_reinterpret_r_to_v(self):
+        """reinterpret(R,V): R -> V, no-op forward. Tests forward and backward."""
+        from dte._api import _ReplicateToVarying
+
         x = self._generate_inputs((4,), 'replicate')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
@@ -523,8 +537,14 @@ class TestReinterpret(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
-    def test_reinterpret_r_to_i_forward(self):
-        """reinterpret(R,I): R -> I, no-op forward."""
+        # Backward check
+        grad_out = self._generate_inputs((4,), 'varying')
+        self._check_backward_not_none(_ReplicateToVarying, (x, 'tp'), grad_out)
+
+    def test_reinterpret_r_to_i(self):
+        """reinterpret(R,I): R -> I, no-op forward. Tests forward and backward."""
+        from dte._api import _ReplicateToInvariant
+
         x = self._generate_inputs((4,), 'replicate')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
@@ -533,8 +553,14 @@ class TestReinterpret(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
-    def test_reinterpret_r_to_p_forward(self):
-        """reinterpret(R,P): R -> P, no-op forward."""
+        # Backward check
+        grad_out = self._generate_inputs((4,), 'invariant')
+        self._check_backward_not_none(_ReplicateToInvariant, (x, 'tp'), grad_out)
+
+    def test_reinterpret_r_to_p(self):
+        """reinterpret(R,P): R -> P, no-op forward. Tests forward and backward."""
+        from dte._api import _ReplicateToPartial
+
         x = self._generate_inputs((4,), 'replicate')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
@@ -543,8 +569,14 @@ class TestReinterpret(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
-    def test_reinterpret_i_to_r_forward(self):
-        """reinterpret(I,R): I -> R, no-op forward."""
+        # Backward check
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_ReplicateToPartial, (x, 'tp'), grad_out)
+
+    def test_reinterpret_i_to_r(self):
+        """reinterpret(I,R): I -> R, no-op forward. Tests forward and backward."""
+        from dte._api import _InvariantToReplicate
+
         x = self._generate_inputs((4,), 'invariant')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
@@ -553,8 +585,14 @@ class TestReinterpret(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
-    def test_reinterpret_v_to_p_forward(self):
-        """reinterpret(V,P): V -> P, no-op forward."""
+        # Backward check
+        grad_out = self._generate_inputs((4,), 'partial')
+        self._check_backward_not_none(_InvariantToReplicate, (x, 'tp'), grad_out)
+
+    def test_reinterpret_v_to_p(self):
+        """reinterpret(V,P): V -> P, no-op forward. Tests forward and backward."""
+        from dte._api import _VaryingToPartial
+
         x = self._generate_inputs((4,), 'varying')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
@@ -562,6 +600,10 @@ class TestReinterpret(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
+
+        # Backward check
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_VaryingToPartial, (x, 'tp'), grad_out)
 
     def test_reinterpret_same_type_noop(self):
         """reinterpret with same src and dst is identity."""
@@ -588,8 +630,10 @@ class TestReinterpret(LocalTensorTestCase):
 class TestConvert(LocalTensorTestCase):
     """Test convert operations (semantics-preserving type coercion)."""
 
-    def test_convert_r_to_v_forward(self):
-        """convert(R,V): R -> V, slices to local portion."""
+    def test_convert_r_to_v(self):
+        """convert(R,V): R -> V, slices to local portion. Tests forward and backward."""
+        from dte._api import _ConvertReplicateToVarying
+
         # Create replicated input [0, 1, 2, 3, 4, 5] on all ranks
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
@@ -601,7 +645,11 @@ class TestConvert(LocalTensorTestCase):
             expected = base[r * 2:(r + 1) * 2]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
-    def test_convert_r_to_shard_forward(self):
+        # Backward check
+        grad_out = self._generate_inputs((2,), 'varying')
+        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0), grad_out)
+
+    def test_convert_r_to_shard(self):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
@@ -612,8 +660,10 @@ class TestConvert(LocalTensorTestCase):
             expected = base[r * 2:(r + 1) * 2]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
-    def test_convert_i_to_v_forward(self):
-        """convert(I,V): I -> V, slices to local portion."""
+    def test_convert_i_to_v(self):
+        """convert(I,V): I -> V, slices to local portion. Tests forward and backward."""
+        from dte._api import _ConvertInvariantToVarying
+
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
 
@@ -623,7 +673,11 @@ class TestConvert(LocalTensorTestCase):
             expected = base[r * 2:(r + 1) * 2]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
-    def test_convert_i_to_shard_forward(self):
+        # Backward check
+        grad_out = self._generate_inputs((2,), 'varying')
+        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0), grad_out)
+
+    def test_convert_i_to_shard(self):
         """convert(I,S(i)): I -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
@@ -634,8 +688,10 @@ class TestConvert(LocalTensorTestCase):
             expected = base[r * 2:(r + 1) * 2]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
-    def test_convert_r_to_p_forward(self):
-        """convert(R,P): R -> P, zeros out non-rank-0."""
+    def test_convert_r_to_p(self):
+        """convert(R,P): R -> P, zeros out non-rank-0. Tests forward and backward."""
+        from dte._api import _ConvertReplicateToPartial
+
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
 
@@ -650,8 +706,14 @@ class TestConvert(LocalTensorTestCase):
                 msg=f"rank {r} should be zeros"
             )
 
-    def test_convert_i_to_p_forward(self):
-        """convert(I,P): I -> P, zeros out non-rank-0."""
+        # Backward check
+        grad_out = self._generate_inputs((3,), 'replicate')
+        self._check_backward_not_none(_ConvertReplicateToPartial, (x, 'tp'), grad_out)
+
+    def test_convert_i_to_p(self):
+        """convert(I,P): I -> P, zeros out non-rank-0. Tests forward and backward."""
+        from dte._api import _ConvertInvariantToPartial
+
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
 
@@ -665,8 +727,14 @@ class TestConvert(LocalTensorTestCase):
                 msg=f"rank {r} should be zeros"
             )
 
-    def test_convert_v_to_p_forward(self):
-        """convert(V,P): V -> P, places data in disjoint positions."""
+        # Backward check
+        grad_out = self._generate_inputs((3,), 'invariant')
+        self._check_backward_not_none(_ConvertInvariantToPartial, (x, 'tp'), grad_out)
+
+    def test_convert_v_to_p(self):
+        """convert(V,P): V -> P, places data in disjoint positions. Tests forward and backward."""
+        from dte._api import _ConvertVaryingToPartial
+
         # Each rank has [r]
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
 
@@ -678,7 +746,11 @@ class TestConvert(LocalTensorTestCase):
             expected[r] = float(r)
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
-    def test_convert_shard_to_p_forward(self):
+        # Backward check
+        grad_out = self._generate_inputs((self.WORLD_SIZE,), 'replicate')
+        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0), grad_out)
+
+    def test_convert_shard_to_p(self):
         """convert(S(i),P): S(i) -> P, places data in disjoint positions."""
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
 
@@ -741,7 +813,7 @@ class TestMeshSetup(unittest.TestCase):
 class TestReinterpretCompositions(LocalTensorTestCase):
     """Test compositional reinterpret operations: I->V and I->P."""
 
-    def test_reinterpret_i_to_v_forward(self):
+    def test_reinterpret_i_to_v(self):
         """reinterpret(I,V): I -> R -> V composition, no-op forward."""
         x = self._generate_inputs((4,), 'invariant')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
@@ -752,7 +824,7 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
-    def test_reinterpret_i_to_p_forward(self):
+    def test_reinterpret_i_to_p(self):
         """reinterpret(I,P): I -> R -> P composition, no-op forward."""
         x = self._generate_inputs((4,), 'invariant')
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
@@ -1079,106 +1151,6 @@ class TestRedistribute(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 1)
             self.assertEqual(result._local_tensors[r].shape[1], 6)
-
-
-class TestAutogradFunctionBackward(LocalTensorTestCase):
-    """
-    Test that autograd Function backward methods return valid gradients.
-
-    These tests directly invoke the backward methods of the autograd Functions
-    in _api.py to verify they return proper tensors (not None). This catches
-    bugs like using dist.all_reduce (which returns None) instead of
-    funcol.all_reduce(...).wait() (which returns the tensor).
-    """
-
-    def test_all_reduce_to_replicate_backward(self):
-        """_AllReduceToReplicate.backward should return valid gradient."""
-        from dte._api import _AllReduceToReplicate
-        x = self._generate_inputs((4,), 'partial')
-        grad_out = self._generate_inputs((4,), 'partial')
-        self._check_backward_not_none(_AllReduceToReplicate, (x, 'tp'), grad_out)
-
-    def test_all_reduce_to_invariant_backward(self):
-        """_AllReduceToInvariant.backward should return valid gradient."""
-        from dte._api import _AllReduceToInvariant
-        x = self._generate_inputs((4,), 'partial')
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_AllReduceToInvariant, (x, 'tp'), grad_out)
-
-    def test_invariant_to_replicate_backward(self):
-        """_InvariantToReplicate.backward should return valid gradient.
-
-        This is the operation that had the bug (returning None from dist.all_reduce).
-        """
-        from dte._api import _InvariantToReplicate
-        x = self._generate_inputs((4,), 'invariant')
-        grad_out = self._generate_inputs((4,), 'partial')
-        self._check_backward_not_none(_InvariantToReplicate, (x, 'tp'), grad_out)
-
-    def test_replicate_to_invariant_backward(self):
-        """_ReplicateToInvariant.backward should return valid gradient."""
-        from dte._api import _ReplicateToInvariant
-        x = self._generate_inputs((4,), 'replicate')
-        grad_out = self._generate_inputs((4,), 'invariant')
-        self._check_backward_not_none(_ReplicateToInvariant, (x, 'tp'), grad_out)
-
-    def test_replicate_to_varying_backward(self):
-        """_ReplicateToVarying.backward should return valid gradient."""
-        from dte._api import _ReplicateToVarying
-        x = self._generate_inputs((4,), 'replicate')
-        grad_out = self._generate_inputs((4,), 'varying')
-        self._check_backward_not_none(_ReplicateToVarying, (x, 'tp'), grad_out)
-
-    def test_varying_to_partial_backward(self):
-        """_VaryingToPartial.backward should return valid gradient."""
-        from dte._api import _VaryingToPartial
-        x = self._generate_inputs((4,), 'varying')
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_VaryingToPartial, (x, 'tp'), grad_out)
-
-    def test_replicate_to_partial_backward(self):
-        """_ReplicateToPartial.backward should return valid gradient."""
-        from dte._api import _ReplicateToPartial
-        x = self._generate_inputs((4,), 'replicate')
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_ReplicateToPartial, (x, 'tp'), grad_out)
-
-    def test_convert_replicate_to_varying_backward(self):
-        """_ConvertReplicateToVarying.backward should return valid gradient."""
-        from dte._api import _ConvertReplicateToVarying
-        x = self._generate_inputs((6,), 'replicate')
-        # Output is smaller (chunked)
-        grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0), grad_out)
-
-    def test_convert_invariant_to_varying_backward(self):
-        """_ConvertInvariantToVarying.backward should return valid gradient."""
-        from dte._api import _ConvertInvariantToVarying
-        x = self._generate_inputs((6,), 'invariant')
-        grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0), grad_out)
-
-    def test_convert_replicate_to_partial_backward(self):
-        """_ConvertReplicateToPartial.backward should return valid gradient."""
-        from dte._api import _ConvertReplicateToPartial
-        x = self._generate_inputs((4,), 'replicate')
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_ConvertReplicateToPartial, (x, 'tp'), grad_out)
-
-    def test_convert_invariant_to_partial_backward(self):
-        """_ConvertInvariantToPartial.backward should return valid gradient."""
-        from dte._api import _ConvertInvariantToPartial
-        x = self._generate_inputs((4,), 'invariant')
-        grad_out = self._generate_inputs((4,), 'invariant')
-        self._check_backward_not_none(_ConvertInvariantToPartial, (x, 'tp'), grad_out)
-
-    def test_convert_varying_to_partial_backward(self):
-        """_ConvertVaryingToPartial.backward should return valid gradient."""
-        from dte._api import _ConvertVaryingToPartial
-        x = self._generate_inputs((2,), 'varying')
-        # Output is larger (padded)
-        grad_out = self._generate_inputs((6,), 'replicate')
-        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0), grad_out)
 
 
 if __name__ == '__main__':

@@ -1475,7 +1475,19 @@ def all_reduce(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSp
     When dst=I, backward is reinterpret(I,R): I -> R (no-op)
     """
     if src is not P:
-        raise ValueError(f"all_reduce src must be P, got {src}")
+        if src is V:
+            raise ValueError(
+                f"all_reduce src must be P, got {src}. "
+                "Use reinterpret(src=V, dst=P) first to declare your intent to sum the varying values."
+            )
+        elif src is R or src is I:
+            raise ValueError(
+                f"all_reduce src must be P, got {src}. "
+                "all_reduce on replicated/invariant data is usually a bug. "
+                f"If you really want to scale by mesh size, use reinterpret(src={src}, dst=P) first."
+            )
+        else:
+            raise ValueError(f"all_reduce src must be P, got {src}")
     if dst is R:
         return _AllReduceToReplicate.apply(x, axis_name)
     elif dst is I:
@@ -1621,7 +1633,19 @@ def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAx
     The backward is all_gather(R): V -> R
     """
     if src is not P:
-        raise ValueError(f"reduce_scatter src must be P, got {src}")
+        if src is V:
+            raise ValueError(
+                f"reduce_scatter src must be P, got {src}. "
+                "Use reinterpret(src=V, dst=P) first to declare your intent to sum the varying values."
+            )
+        elif src is R or src is I:
+            raise ValueError(
+                f"reduce_scatter src must be P, got {src}. "
+                "reduce_scatter on replicated/invariant data is usually a bug. "
+                f"If you really want to scale by mesh size, use reinterpret(src={src}, dst=P) first."
+            )
+        else:
+            raise ValueError(f"reduce_scatter src must be P, got {src}")
     if not (dst is V or isinstance(dst, Shard)):
         raise ValueError(f"reduce_scatter dst must be V or S(i), got {dst}")
 
@@ -1816,10 +1840,21 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
     elif src is V and dst is P:
         return _VaryingToPartial.apply(x, axis_name)
     else:
-        raise ValueError(
-            f"reinterpret({src}, {dst}) is not supported. "
-            "Cannot reinterpret from P, and from V only V -> P is supported."
-        )
+        if src is P:
+            raise ValueError(
+                f"reinterpret({src}, {dst}) is not supported; it is semantically ill-defined. "
+                "Call all_reduce(src=P, dst=R) first to materialize the sum, "
+                "then do whatever conversion you need from R."
+            )
+        elif src is V:
+            # V -> R or V -> I
+            raise ValueError(
+                f"reinterpret({src}, {dst}) is not supported. "
+                f"We cannot unsafely assert that varying values on all ranks are actually the same. "
+                f"Ensure your source is already {dst} instead."
+            )
+        else:
+            raise ValueError(f"reinterpret({src}, {dst}) is not supported.")
 
 
 # =============================================================================
@@ -2074,10 +2109,21 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
     elif src_base is V and dst_base is P:
         return _ConvertVaryingToPartial.apply(x, axis_name, dim)
     else:
-        raise ValueError(
-            f"convert({src}, {dst}) is not supported. "
-            "Cannot convert out of P."
-        )
+        if src_base is P:
+            if dst_base is R or dst_base is I:
+                raise ValueError(
+                    f"convert({src}, {dst}) is not supported. "
+                    f"Use all_reduce(src=P, dst={dst}) to perform the reduction and get the full sum."
+                )
+            elif dst_base is V or isinstance(dst, Shard):
+                raise ValueError(
+                    f"convert({src}, {dst}) is not supported. "
+                    f"Use reduce_scatter(src=P, dst={dst}) to perform the reduction and get shards of the sum."
+                )
+            else:
+                raise ValueError(f"convert({src}, {dst}) is not supported. Cannot convert out of P.")
+        else:
+            raise ValueError(f"convert({src}, {dst}) is not supported.")
 
 
 # =============================================================================
