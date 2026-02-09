@@ -482,17 +482,15 @@ class TestAllToAll(LocalTensorTestCase):
 
     def test_all_to_all(self):
         """all_to_all: V -> V, transposes mesh and tensor dims."""
-        # Create input: rank r has [[r], [r+3], [r+6]]
+        # Create input: rank r has [r*3, r*3+1, r*3+2]
         # After all_to_all, rank r should get [r, r+3, r+6]
-        x = self.mode.rank_map(
-            lambda r: torch.tensor([[float(r + i * self.WORLD_SIZE)] for i in range(self.WORLD_SIZE)])
-        )
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)]))
 
         result = all_to_all(x, 'tp', src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
         for r in range(self.WORLD_SIZE):
-            expected = torch.tensor([float(r + i * self.WORLD_SIZE) for i in range(self.WORLD_SIZE)])
+            expected = torch.tensor([float(r + i * 3) for i in range(self.WORLD_SIZE)])
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
     def test_all_to_all_shard_to_shard(self):
@@ -652,26 +650,26 @@ class TestConvert(LocalTensorTestCase):
 
     def test_convert_r_to_shard(self):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
-        base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
+        base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
 
         result = convert(x, 'tp', src=R, dst=S(0), dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r]
+            expected = base[r * 2:(r + 1) * 2]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
     def test_convert_i_to_v(self):
         """convert(I,V): I -> V, slices to local portion. Tests forward and backward."""
         from dte._api import _ConvertInvariantToVarying
 
-        base = torch.arange(6, dtype=torch.float)
+        base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
         result = convert(x, 'tp', src=I, dst=V, dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
+            expected = base[r]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
         # Backward check
@@ -1066,7 +1064,7 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_v_to_r(self):
         """redistribute(V,R) uses all_gather."""
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
         result = redistribute(x, 'tp', src=V, dst=R, dim=0)
 
@@ -1077,7 +1075,7 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_v_to_i(self):
         """redistribute(V,I) uses all_gather."""
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
         result = redistribute(x, 'tp', src=V, dst=I, dim=0)
 
@@ -1114,13 +1112,13 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_r_to_v_uses_convert(self):
         """redistribute(R,V) delegates to convert."""
-        base = torch.arange(6, dtype=torch.float)
+        base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
         result = redistribute(x, 'tp', src=R, dst=V, dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
+            expected = base[r]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
     def test_redistribute_r_to_p_uses_convert(self):
