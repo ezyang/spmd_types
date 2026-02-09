@@ -151,7 +151,8 @@ distributed APIs:
   way for working in this situation.) In local SPMD, this is how you swap
   between stack/concat semantics (described in more detail on the functions.)
   For brevity, we will refer to the src/dst arguments by initial; e.g., R, P,
-  V, I and S(i).
+  V, I and S(i).  We will also suggestively use S(i) to describe the types
+  when this is used, but in the local SPMD type system this is equivalent to V.
 
 * We add a new `reinterpret` operator, which represents all situations where we
   you directly coerce from one local SPMD type to another without any change
@@ -254,6 +255,8 @@ OK, without further ado!
 
 TODO: In general, the Varying functions can be generalized to take a tensor dim
 argument so that they do an action on not tensor dim 0 but somewhere else.
+
+MAJOR TODO: Need to consider how to support collectives on multiple mesh axes at the same time
 
 ### `all_gather(x: Varying, mesh_axis, src, dst) -> Replicate | Invariant`
 
@@ -968,40 +971,19 @@ out2 = linear(hidden, weight, out_partial_axes='tp')
 
 ### Shard propagation for comms operators
 
-All local SPMD comms operators are also valid in global SPMD.  We simply need to describe
-how they propagate sharding.  When all tensors across ranks have the same size, we
-can interpret a list of tensors as a single tensor by stacking them on dim 0.  So these
-functions clearly work when TODO: rank preserving versus not rank preserving
+In the API description for comms operators, operators could operate on both
+Varying (non-rank preserving) and Shard (rank preserving) src/dst.  In global
+SPMD, only the Shard variants have shard propagation rules; the operators that
+operate on varying have an ambiguity on what to do with the added/removed
+rank (you can use those versions by dropping into local SPMD, and then when
+returning to global SPMD explicitly specifying what your new desired global SPMD
+type is).
 
-XXXXXXXXXXXXXXX
-
-Intuitively, all of these comms operators simply replace
-Varying with Shard(0) (you can translate this into partition spec form using the standard
-device mesh dim to tensor dim translation).  Here are all of the affected operators:
-
-```
-all_gather(R): Shard(0) -> Replicate
-all_gather(I): Shard(0) -> Invariant
-reduce_scatter: Partial -> Shard(0)
-all_to_all: Shard(0) -> Shard(0)
-reinterpret(R,V): Replicate -> Shard(0)
-reinterpret(V,P): Shard(0) -> Partial
-convert(R,V): Replicate -> Shard(0)
-convert(I,V): Replicate -> Shard(0)
-convert(V,P): Replicate -> Shard(0)
-```
-
-Do we have to only accept sharding on tensor dim 0?  Many collectives take an
-argument saying which tensor dim to operate on (e.g., an all-gather on tensor
-dim 1 instead of tensor dim 0); in which case the tensor dim Shard references
-changes accordingly.
-
-TODO: reinterpret can probably usefully take a tensor dim argument
-
-The global SPMD interpretation of convert is straightforward: it is the identity function.
-However, the global SPMD interpretations of reinterpret are sometimes counter-intuitive.
-Here, we write "single device" versions of these functions to make it clear what their
-action is, given sharding on tensor dim 0:
+The global SPMD interpretation of convert is straightforward: it is the
+identity function.  However, the global SPMD interpretations of reinterpret
+are sometimes counter-intuitive.  Here, we write "single device" versions of
+these functions to make it clear what their action is, given sharding on
+tensor dim 0 (TODO: generalize for arbitrary dim i):
 
 ```
 def reinterpret_R_I(x):
@@ -1021,6 +1003,40 @@ def reinterpret_S0_P(x):
 def reinterpret_R_P(x):
     return x * mesh_axis_size
 ```
+
+### Per-mesh-dim redistribute
+
+It is helpful to have a version of `convert` that is semantics preserving but
+allows for comms.  We will call this `redistribute`.  It routes to the following collectives:
+
+```
+redistribute(S(i),R)    =   all_gather(S(i),R)
+redistribute(S(i),I)    =   all_gather(S(i),I)
+redistribute(P,R)       =   all_reduce(P,R)
+redistribute(P,I)       =   all_reduce(P,I)
+redistribute(P,S(i))    =   reduce_scatter(P,S(i))
+redistribute(S(i),S(j)) =   all_to_all(S(i),S(j))
+```
+
+Once again, these only work if the mesh axis is the LAST to shard a particular
+tensor dimension.  We will introduce a better partition spec API below.
+
+### Partition spec redistribute
+
+The above API has two problems:
+
+* When multiple mesh axes shard the same dimension, you cannot freely do per mesh
+  axes on it; only the *last* mesh axis can be operated on.  For example, if you want
+  to reshard `f32[8@dp,tp]` to `f32[8@tp,dp]`, you have to first gather on tp,
+  all-to-all to interchange dp with tp, and then shard on dp.
+
+* It is inefficient to do redistribute on a mesh-axis by mesh-axis basis; for example,
+  if we need to do an all-reduce on both "dp" and "tp" dimension, it is much better to
+  do a single all-reduce on a communicator for the flattened device mesh.
+
+So we should also support a convenience API `redistribute(src_partition_spec, dst_partition_spec)`,
+which plans the sequence of collectives needed to arrive at the destination partition spec,
+and will flatten collectives together as possible.
 
 ## Miscellaneous design notes
 
