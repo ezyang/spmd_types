@@ -1168,7 +1168,12 @@ S = Shard  # S(i) creates a Shard with dim=i
 
 # Type aliases
 PerMeshAxisSpmdType = Union[PerMeshAxisLocalSpmdType, Shard]
-LocalSpmdType = dict[str, PerMeshAxisSpmdType]
+
+# Axis identifier: either a mesh axis name (string) or a ProcessGroup directly
+DeviceMeshAxis = str | dist.ProcessGroup
+
+# LocalSpmdType maps axis identifiers to per-axis SPMD types
+LocalSpmdType = dict[DeviceMeshAxis, PerMeshAxisSpmdType]
 # =============================================================================
 # PartitionSpec for Global SPMD
 # =============================================================================
@@ -1254,20 +1259,20 @@ class LTensor:
                     f"Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))"
                 )
 
-    def get_type(self, axis_name: str) -> PerMeshAxisSpmdType | None:
+    def get_type(self, axis: "str | dist.ProcessGroup") -> PerMeshAxisSpmdType | None:
         """Get the local SPMD type for a mesh axis, or None if not tracked."""
-        return self.types.get(axis_name)
+        return self.types.get(axis)
 
-    def with_type(self, axis_name: str, typ: PerMeshAxisSpmdType) -> "LTensor":
+    def with_type(self, axis: "str | dist.ProcessGroup", typ: PerMeshAxisSpmdType) -> "LTensor":
         """Return a new LTensor with an updated type for the given axis."""
         if not isinstance(typ, (PerMeshAxisLocalSpmdType, Shard)):
             raise TypeError(f"Invalid type '{typ}'. Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))")
         new_types = self.types.copy()
-        new_types[axis_name] = typ
+        new_types[axis] = typ
         return LTensor(self.data, new_types)
 
 
-def einsum(equation: str, *operands: LTensor, out_partial_axes: set[str] | None = None) -> LTensor:
+def einsum(equation: str, *operands: LTensor, out_partial_axes: "set[str | dist.ProcessGroup] | None" = None) -> LTensor:
     """
     Perform einsum with local SPMD type checking.
 
@@ -1403,22 +1408,37 @@ def get_mesh():
     return _global_mesh
 
 
-def _get_mesh_axis_group(axis_name):
-    """Get the process group for a mesh axis from the global mesh."""
+def _normalize_type(typ: PerMeshAxisSpmdType) -> PerMeshAxisSpmdType:
+    """Normalize a type to its canonical form.
+
+    Currently an identity function, but can be extended for type coercion.
+    """
+    return typ
+
+
+def _get_mesh_axis_group(axis: "str | dist.ProcessGroup") -> dist.ProcessGroup:
+    """Get the process group for a mesh axis.
+
+    If axis is already a ProcessGroup, return it directly.
+    If axis is a string, look it up from the global mesh.
+    """
+    if isinstance(axis, dist.ProcessGroup):
+        return axis
+    # It's a string axis name
     if _global_mesh is None:
         raise RuntimeError(
             "No global mesh set. Call set_mesh() with a DeviceMesh before using "
-            "distributed operations."
+            "distributed operations with axis names, or pass a ProcessGroup directly."
         )
-    return _global_mesh.get_group(axis_name)
+    return _global_mesh.get_group(axis)
 
 
 class _ReplicateToVarying(torch.autograd.Function):
     """reinterpret(R,V): R -> V, backward is reinterpret(V,P): V -> P (no-op)."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis):
+        ctx.axis = axis
         return x
 
     @staticmethod
@@ -1431,15 +1451,15 @@ class _AllReduceToReplicate(torch.autograd.Function):
     """all_reduce(R): P -> R, backward is all_reduce(R): P -> R."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
-        pg = _get_mesh_axis_group(axis_name)
+    def forward(ctx, x, axis):
+        ctx.axis = axis
+        pg = _get_mesh_axis_group(axis)
         return funcol.all_reduce(x, "sum", pg).wait()
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward of P -> R is P -> R (same operation)
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         return funcol.all_reduce(grad_out, "sum", pg).wait(), None
 
 
@@ -1447,9 +1467,9 @@ class _AllReduceToInvariant(torch.autograd.Function):
     """all_reduce(I): P -> I, backward is reinterpret(I,R): I -> R (no-op)."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
-        pg = _get_mesh_axis_group(axis_name)
+    def forward(ctx, x, axis):
+        ctx.axis = axis
+        pg = _get_mesh_axis_group(axis)
         return funcol.all_reduce(x, "sum", pg).wait()
 
     @staticmethod
@@ -1458,13 +1478,13 @@ class _AllReduceToInvariant(torch.autograd.Function):
         return grad_out, None
 
 
-def all_reduce(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType):
+def all_reduce(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType):
     """
     Reduce shards along the mesh axis, so every rank has the full summed value.
 
     Args:
         x: Input tensor with P type on the mesh axis
-        axis_name: The mesh axis to reduce over
+        axis: The mesh axis to reduce over (string name or ProcessGroup)
         src: Source type (must be P)
         dst: Target type (R or I)
 
@@ -1489,9 +1509,9 @@ def all_reduce(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSp
         else:
             raise ValueError(f"all_reduce src must be P, got {src}")
     if dst is R:
-        return _AllReduceToReplicate.apply(x, axis_name)
+        return _AllReduceToReplicate.apply(x, axis)
     elif dst is I:
-        return _AllReduceToInvariant.apply(x, axis_name)
+        return _AllReduceToInvariant.apply(x, axis)
     else:
         raise ValueError(f"all_reduce dst must be R or I, got {dst}")
 
@@ -1505,54 +1525,64 @@ class _AllGatherToReplicate(torch.autograd.Function):
     """all_gather(R): V -> R, backward is reduce_scatter: P -> V."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, gather_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, gather_dim, stack):
+        ctx.axis = axis
         ctx.gather_dim = gather_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         # Gather tensors from all ranks
         world_size = dist.get_world_size(pg)
         gathered = [torch.empty_like(x) for _ in range(world_size)]
         dist.all_gather(gathered, x, group=pg)
+        if stack:
+            return torch.stack(gathered, dim=gather_dim)
         return torch.cat(gathered, dim=gather_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is reduce_scatter: P -> V
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
         # Split grad_out and reduce-scatter
-        chunks = torch.chunk(grad_out, world_size, dim=ctx.gather_dim)
-        # Stack for reduce_scatter
-        stacked = torch.stack(list(chunks), dim=0)
+        if ctx.stack:
+            chunks = torch.unbind(grad_out, dim=ctx.gather_dim)
+        else:
+            chunks = torch.chunk(grad_out, world_size, dim=ctx.gather_dim)
         output = torch.empty_like(chunks[0])
         dist.reduce_scatter(output, list(chunks), op=dist.ReduceOp.SUM, group=pg)
-        return output, None, None
+        return output, None, None, None
 
 
 class _AllGatherToInvariant(torch.autograd.Function):
     """all_gather(I): V -> I, backward is convert(I,V): I -> V."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, gather_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, gather_dim, stack):
+        ctx.axis = axis
         ctx.gather_dim = gather_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         world_size = dist.get_world_size(pg)
         gathered = [torch.empty_like(x) for _ in range(world_size)]
         dist.all_gather(gathered, x, group=pg)
+        if stack:
+            return torch.stack(gathered, dim=gather_dim)
         return torch.cat(gathered, dim=gather_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(I,V): I -> V (just slice out local portion)
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
         rank = dist.get_rank(pg)
-        chunks = torch.chunk(grad_out, world_size, dim=ctx.gather_dim)
-        return chunks[rank].contiguous(), None, None
+        if ctx.stack:
+            chunks = torch.unbind(grad_out, dim=ctx.gather_dim)
+        else:
+            chunks = torch.chunk(grad_out, world_size, dim=ctx.gather_dim)
+        return chunks[rank].contiguous(), None, None, None
 
 
-def all_gather(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType, gather_dim: int = 0):
+def all_gather(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType, gather_dim: int = 0):
     """
     Gather shards along the mesh axis, so every rank has the full copy of data.
 
@@ -1564,7 +1594,7 @@ def all_gather(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
-        axis_name: The mesh axis to gather over
+        axis: The mesh axis to gather over (string name or ProcessGroup)
         src: Source type (V or S(i))
         dst: Target type (R or I)
         gather_dim: The tensor dimension to concatenate along (default: 0)
@@ -1575,14 +1605,21 @@ def all_gather(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
     When dst=R, backward is reduce_scatter: P -> V
     When dst=I, backward is convert(I,V): I -> V
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
     # Validate src is V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_gather src must be V or S(i), got {src}")
 
+    if isinstance(src, Shard):
+        gather_dim = src.dim
+
+    stack = src is V
     if dst is R:
-        return _AllGatherToReplicate.apply(x, axis_name, gather_dim)
+        return _AllGatherToReplicate.apply(x, axis, gather_dim, stack)
     elif dst is I:
-        return _AllGatherToInvariant.apply(x, axis_name, gather_dim)
+        return _AllGatherToInvariant.apply(x, axis, gather_dim, stack)
     else:
         raise ValueError(f"all_gather dst must be R or I, got {dst}")
 
@@ -1596,21 +1633,33 @@ class _ReduceScatter(torch.autograd.Function):
     """reduce_scatter: P -> V, backward is all_gather(R): V -> R."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, scatter_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, scatter_dim, stack):
+        ctx.axis = axis
         ctx.scatter_dim = scatter_dim
-        pg = _get_mesh_axis_group(axis_name)
-        # Use functional reduce_scatter_tensor which works with LocalTensorMode
-        return funcol.reduce_scatter_tensor(x, "sum", scatter_dim, pg).wait()
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
+        world_size = dist.get_world_size(pg)
+        if stack:
+            chunks = torch.unbind(x, dim=scatter_dim)
+        else:
+            chunks = torch.chunk(x, world_size, dim=scatter_dim)
+        output = torch.empty_like(chunks[0])
+        dist.reduce_scatter(output, list(chunks), op=dist.ReduceOp.SUM, group=pg)
+        return output
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(R): V -> R
-        pg = _get_mesh_axis_group(ctx.axis_name)
-        return funcol.all_gather_tensor(grad_out, ctx.scatter_dim, pg).wait(), None, None
+        pg = _get_mesh_axis_group(ctx.axis)
+        world_size = dist.get_world_size(pg)
+        gathered = [torch.empty_like(grad_out) for _ in range(world_size)]
+        dist.all_gather(gathered, grad_out, group=pg)
+        if ctx.stack:
+            return torch.stack(gathered, dim=ctx.scatter_dim), None, None, None
+        return torch.cat(gathered, dim=ctx.scatter_dim), None, None, None
 
 
-def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType = V, scatter_dim: int = 0):
+def reduce_scatter(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType = V, scatter_dim: int = 0):
     """
     Reduce shards along the mesh axis, but only get one shard of the result.
 
@@ -1622,7 +1671,7 @@ def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAx
 
     Args:
         x: Input tensor with P type on the mesh axis
-        axis_name: The mesh axis to reduce-scatter over
+        axis: The mesh axis to reduce-scatter over (string name or ProcessGroup)
         src: Source type (must be P)
         dst: Target type (V or S(i))
         scatter_dim: The tensor dimension to scatter along (default: 0)
@@ -1632,6 +1681,9 @@ def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAx
 
     The backward is all_gather(R): V -> R
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
     if src is not P:
         if src is V:
             raise ValueError(
@@ -1649,7 +1701,11 @@ def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAx
     if not (dst is V or isinstance(dst, Shard)):
         raise ValueError(f"reduce_scatter dst must be V or S(i), got {dst}")
 
-    return _ReduceScatter.apply(x, axis_name, scatter_dim)
+    if isinstance(dst, Shard):
+        scatter_dim = dst.dim
+
+    stack = dst is V
+    return _ReduceScatter.apply(x, axis, scatter_dim, stack)
 
 
 # =============================================================================
@@ -1661,31 +1717,42 @@ class _AllToAll(torch.autograd.Function):
     """all_to_all: V -> V, backward is all_to_all: V -> V."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, split_dim, concat_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, split_dim, concat_dim, stack):
+        ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.concat_dim = concat_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         world_size = dist.get_world_size(pg)
         # Split input
-        input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
+        if stack:
+            input_chunks = list(torch.unbind(x, dim=split_dim))
+        else:
+            input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         dist.all_to_all(output_chunks, input_chunks, group=pg)
+        if stack:
+            return torch.stack(output_chunks, dim=concat_dim)
         return torch.cat(output_chunks, dim=concat_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is also all_to_all (transpose back)
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
         # Split on concat_dim, gather on split_dim (reverse of forward)
-        input_chunks = list(torch.chunk(grad_out, world_size, dim=ctx.concat_dim))
+        if ctx.stack:
+            input_chunks = list(torch.unbind(grad_out, dim=ctx.concat_dim))
+        else:
+            input_chunks = list(torch.chunk(grad_out, world_size, dim=ctx.concat_dim))
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         dist.all_to_all(output_chunks, input_chunks, group=pg)
-        return torch.cat(output_chunks, dim=ctx.split_dim), None, None, None
+        if ctx.stack:
+            return torch.stack(output_chunks, dim=ctx.split_dim), None, None, None, None
+        return torch.cat(output_chunks, dim=ctx.split_dim), None, None, None, None
 
 
-def all_to_all(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType = V, split_dim: int = 0, concat_dim: int = 0):
+def all_to_all(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType = V, split_dim: int = 0, concat_dim: int = 0):
     """
     Transpose a local tensor axis with the mesh axis.
 
@@ -1697,7 +1764,7 @@ def all_to_all(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
-        axis_name: The mesh axis to transpose with
+        axis: The mesh axis to transpose with (string name or ProcessGroup)
         src: Source type (V or S(i))
         dst: Target type (V or S(j))
         split_dim: The tensor dimension to split along (default: 0)
@@ -1708,13 +1775,22 @@ def all_to_all(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
 
     The backward is also all_to_all: V -> V (with src/dst swapped)
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
     # Validate src and dst are V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_to_all src must be V or S(i), got {src}")
     if not (dst is V or isinstance(dst, Shard)):
         raise ValueError(f"all_to_all dst must be V or S(i), got {dst}")
 
-    return _AllToAll.apply(x, axis_name, split_dim, concat_dim)
+    if isinstance(src, Shard):
+        split_dim = src.dim
+    if isinstance(dst, Shard):
+        concat_dim = dst.dim
+
+    stack = src is V and dst is V
+    return _AllToAll.apply(x, axis, split_dim, concat_dim, stack)
 
 
 # =============================================================================
@@ -1726,15 +1802,15 @@ class _ReplicateToInvariant(torch.autograd.Function):
     """reinterpret(R,I): R -> I, backward is convert(I,P): I -> P."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis):
+        ctx.axis = axis
         return x  # no-op in forward
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(I,P): I -> P
         # Zero out all but rank 0
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
@@ -1748,14 +1824,14 @@ class _InvariantToReplicate(torch.autograd.Function):
     """reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis):
+        ctx.axis = axis
         return x  # no-op in forward
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_reduce(I): P -> I
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         return funcol.all_reduce(grad_out, "sum", pg).wait(), None
 
 
@@ -1763,8 +1839,8 @@ class _VaryingToPartial(torch.autograd.Function):
     """reinterpret(V,P): V -> P, backward is reinterpret(R,V): R -> V (no-op)."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis):
+        ctx.axis = axis
         return x  # no-op in forward
 
     @staticmethod
@@ -1777,8 +1853,8 @@ class _ReplicateToPartial(torch.autograd.Function):
     """reinterpret(R,P): R -> P, backward is reinterpret(R,P): R -> P."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis):
+        ctx.axis = axis
         return x  # no-op in forward
 
     @staticmethod
@@ -1788,7 +1864,7 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 
 # Update reinterpret to handle all cases
-def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType):
+def reinterpret(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType):
     """
     Coerce from one local SPMD type to another without changing the local tensor.
 
@@ -1797,7 +1873,7 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
 
     Args:
         x: Input tensor
-        axis_name: The mesh axis to operate on
+        axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type (R, I, V, P)
         dst: Target local SPMD type (R, I, V, P)
 
@@ -1824,21 +1900,21 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
         return x  # no-op
 
     if src is R and dst is V:
-        return _ReplicateToVarying.apply(x, axis_name)
+        return _ReplicateToVarying.apply(x, axis)
     elif src is R and dst is I:
-        return _ReplicateToInvariant.apply(x, axis_name)
+        return _ReplicateToInvariant.apply(x, axis)
     elif src is R and dst is P:
-        return _ReplicateToPartial.apply(x, axis_name)
+        return _ReplicateToPartial.apply(x, axis)
     elif src is I and dst is R:
-        return _InvariantToReplicate.apply(x, axis_name)
+        return _InvariantToReplicate.apply(x, axis)
     elif src is I and dst is V:
         # Composition: I -> R -> V
-        return _ReplicateToVarying.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
+        return _ReplicateToVarying.apply(_InvariantToReplicate.apply(x, axis), axis)
     elif src is I and dst is P:
         # Composition: I -> R -> P
-        return _ReplicateToPartial.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
+        return _ReplicateToPartial.apply(_InvariantToReplicate.apply(x, axis), axis)
     elif src is V and dst is P:
-        return _VaryingToPartial.apply(x, axis_name)
+        return _VaryingToPartial.apply(x, axis)
     else:
         if src is P:
             raise ValueError(
@@ -1872,14 +1948,24 @@ def _get_rank(pg):
     return dist.get_rank(pg)
 
 
-def _replicate_to_varying_fwd(x, world_size, split_dim, rank):
+def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
     """Forward: split and take local portion based on rank."""
+    if stack:
+        return x.select(split_dim, rank).contiguous()
     chunks = torch.chunk(x, world_size, dim=split_dim)
     return chunks[rank].contiguous()
 
 
-def _varying_to_partial_fwd(x, world_size, split_dim, rank):
+def _varying_to_partial_fwd(x, world_size, split_dim, rank, *, stack):
     """Forward: pad with zeros, place data at rank position."""
+    if stack:
+        pad_shape = list(x.shape)
+        pad_shape.insert(split_dim, world_size)
+        result = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        slices = [slice(None)] * len(pad_shape)
+        slices[split_dim] = rank
+        result[tuple(slices)] = x
+        return result
     pad_shape = list(x.shape)
     pad_shape[split_dim] = pad_shape[split_dim] * world_size
     result = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
@@ -1902,77 +1988,81 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
     """convert(R,V): R -> V, backward is convert(V,P): V -> P."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, split_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, split_dim, stack):
+        ctx.axis = axis
         ctx.split_dim = split_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         world_size = dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
             return mode.tensor_map(
                 x,
-                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r)
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r, stack=stack)
             )
         else:
             rank = dist.get_rank(pg)
-            return _replicate_to_varying_fwd(x, world_size, split_dim, rank)
+            return _replicate_to_varying_fwd(x, world_size, split_dim, rank, stack=stack)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(V,P): V -> P
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
             result = mode.tensor_map(
                 grad_out,
-                lambda r, t: _varying_to_partial_fwd(t, world_size, ctx.split_dim, r)
+                lambda r, t: _varying_to_partial_fwd(t, world_size, ctx.split_dim, r, stack=ctx.stack)
             )
-            return result, None, None
+            return result, None, None, None
         else:
             rank = dist.get_rank(pg)
-            return _varying_to_partial_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
+            return _varying_to_partial_fwd(grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack), None, None, None
 
 
 class _ConvertInvariantToVarying(torch.autograd.Function):
     """convert(I,V): I -> V, backward is all_gather(I): V -> I."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, split_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, split_dim, stack):
+        ctx.axis = axis
         ctx.split_dim = split_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         world_size = dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
             return mode.tensor_map(
                 x,
-                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r)
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r, stack=stack)
             )
         else:
             rank = dist.get_rank(pg)
-            return _replicate_to_varying_fwd(x, world_size, split_dim, rank)
+            return _replicate_to_varying_fwd(x, world_size, split_dim, rank, stack=stack)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(I): V -> I
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
         gathered = [torch.empty_like(grad_out) for _ in range(world_size)]
         dist.all_gather(gathered, grad_out, group=pg)
-        return torch.cat(gathered, dim=ctx.split_dim), None, None
+        if ctx.stack:
+            return torch.stack(gathered, dim=ctx.split_dim), None, None, None
+        return torch.cat(gathered, dim=ctx.split_dim), None, None, None
 
 
 class _ConvertReplicateToPartial(torch.autograd.Function):
     """convert(R,P): R -> P, backward is convert(R,P): R -> P."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
-        pg = _get_mesh_axis_group(axis_name)
+    def forward(ctx, x, axis):
+        ctx.axis = axis
+        pg = _get_mesh_axis_group(axis)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
@@ -1984,7 +2074,7 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # backward is same operation: convert(R,P)
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
@@ -1998,9 +2088,9 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
     """convert(I,P): I -> P, backward is reinterpret(R,I): R -> I (no-op)."""
 
     @staticmethod
-    def forward(ctx, x, axis_name):
-        ctx.axis_name = axis_name
-        pg = _get_mesh_axis_group(axis_name)
+    def forward(ctx, x, axis):
+        ctx.axis = axis
+        pg = _get_mesh_axis_group(axis)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
@@ -2019,41 +2109,42 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
     """convert(V,P): V -> P, backward is convert(R,V): R -> V."""
 
     @staticmethod
-    def forward(ctx, x, axis_name, split_dim):
-        ctx.axis_name = axis_name
+    def forward(ctx, x, axis, split_dim, stack):
+        ctx.axis = axis
         ctx.split_dim = split_dim
-        pg = _get_mesh_axis_group(axis_name)
+        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
         world_size = dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
             return mode.tensor_map(
                 x,
-                lambda r, t: _varying_to_partial_fwd(t, world_size, split_dim, r)
+                lambda r, t: _varying_to_partial_fwd(t, world_size, split_dim, r, stack=stack)
             )
         else:
             rank = dist.get_rank(pg)
-            return _varying_to_partial_fwd(x, world_size, split_dim, rank)
+            return _varying_to_partial_fwd(x, world_size, split_dim, rank, stack=stack)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(R,V): R -> V (take local slice)
-        pg = _get_mesh_axis_group(ctx.axis_name)
+        pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
             result = mode.tensor_map(
                 grad_out,
-                lambda r, t: _replicate_to_varying_fwd(t, world_size, ctx.split_dim, r)
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, ctx.split_dim, r, stack=ctx.stack)
             )
-            return result, None, None
+            return result, None, None, None
         else:
             rank = dist.get_rank(pg)
-            return _replicate_to_varying_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
+            return _replicate_to_varying_fwd(grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack), None, None, None
 
 
-def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
+def convert(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
     """
     Convert from one local SPMD type to another while preserving tensor semantics.
 
@@ -2062,7 +2153,7 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
 
     Args:
         x: Input tensor
-        axis_name: The mesh axis to operate on
+        axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type (R, I, V, P, or S(i))
         dst: Target local SPMD type (R, I, V, P, or S(i))
         dim: The tensor dimension for split/concat operations (default: 0).
@@ -2079,6 +2170,9 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
         - convert(S(i),P): S(i) -> P, backward is convert(R,S(i)): R -> S(i)
         - convert(R,I) and convert(I,R) are same as reinterpret
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim
@@ -2093,21 +2187,24 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
         return x  # no-op
 
     if src_base is R and dst_base is V:
-        return _ConvertReplicateToVarying.apply(x, axis_name, dim)
+        stack = not isinstance(dst, Shard)
+        return _ConvertReplicateToVarying.apply(x, axis, dim, stack)
     elif src_base is R and dst_base is P:
-        return _ConvertReplicateToPartial.apply(x, axis_name)
+        return _ConvertReplicateToPartial.apply(x, axis)
     elif src_base is R and dst_base is I:
         # Same as reinterpret
-        return _ReplicateToInvariant.apply(x, axis_name)
+        return _ReplicateToInvariant.apply(x, axis)
     elif src_base is I and dst_base is V:
-        return _ConvertInvariantToVarying.apply(x, axis_name, dim)
+        stack = not isinstance(dst, Shard)
+        return _ConvertInvariantToVarying.apply(x, axis, dim, stack)
     elif src_base is I and dst_base is P:
-        return _ConvertInvariantToPartial.apply(x, axis_name)
+        return _ConvertInvariantToPartial.apply(x, axis)
     elif src_base is I and dst_base is R:
         # Same as reinterpret
-        return _InvariantToReplicate.apply(x, axis_name)
+        return _InvariantToReplicate.apply(x, axis)
     elif src_base is V and dst_base is P:
-        return _ConvertVaryingToPartial.apply(x, axis_name, dim)
+        stack = not isinstance(src, Shard)
+        return _ConvertVaryingToPartial.apply(x, axis, dim, stack)
     else:
         if src_base is P:
             if dst_base is R or dst_base is I:
@@ -2131,7 +2228,7 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
 # =============================================================================
 
 
-def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
+def redistribute(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
     """
     Semantics-preserving conversion between local SPMD types, allowing comms.
 
@@ -2141,7 +2238,7 @@ def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmd
 
     Args:
         x: Input tensor
-        axis_name: The mesh axis to operate on
+        axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type
         dst: Target local SPMD type
         dim: Tensor dimension for shard operations (default: 0).
@@ -2177,28 +2274,28 @@ def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmd
     if src_base is dst_base:
         if src_is_shard and dst_is_shard and src.dim != dst.dim:
             # S(i) -> S(j): need all_to_all
-            return all_to_all(x, axis_name, src=src, dst=dst, split_dim=src.dim, concat_dim=dst.dim)
+            return all_to_all(x, axis, src=src, dst=dst, split_dim=src.dim, concat_dim=dst.dim)
         return x  # no-op
 
     # Varying/Shard -> Replicate: all_gather
     if src_base is V and dst_base is R:
-        return all_gather(x, axis_name, src=src, dst=R, gather_dim=dim)
+        return all_gather(x, axis, src=src, dst=R, gather_dim=dim)
 
     # Varying/Shard -> Invariant: all_gather
     if src_base is V and dst_base is I:
-        return all_gather(x, axis_name, src=src, dst=I, gather_dim=dim)
+        return all_gather(x, axis, src=src, dst=I, gather_dim=dim)
 
     # Partial -> Replicate: all_reduce
     if src_base is P and dst_base is R:
-        return all_reduce(x, axis_name, src=P, dst=R)
+        return all_reduce(x, axis, src=P, dst=R)
 
     # Partial -> Invariant: all_reduce
     if src_base is P and dst_base is I:
-        return all_reduce(x, axis_name, src=P, dst=I)
+        return all_reduce(x, axis, src=P, dst=I)
 
     # Partial -> Varying/Shard: reduce_scatter
     if src_base is P and dst_base is V:
-        return reduce_scatter(x, axis_name, src=P, dst=dst, scatter_dim=dim)
+        return reduce_scatter(x, axis, src=P, dst=dst, scatter_dim=dim)
 
     # Varying -> Varying (but different, e.g. for all_to_all with different dims)
     # This case is handled above when both are V
@@ -2206,19 +2303,19 @@ def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmd
     # For non-comm conversions, delegate to convert
     # R -> I, I -> R, R -> V, R -> P, I -> V, I -> P, V -> P
     if src_base is R and dst_base is I:
-        return convert(x, axis_name, src=R, dst=I)
+        return convert(x, axis, src=R, dst=I)
     if src_base is I and dst_base is R:
-        return convert(x, axis_name, src=I, dst=R)
+        return convert(x, axis, src=I, dst=R)
     if src_base is R and dst_base is V:
-        return convert(x, axis_name, src=R, dst=dst, dim=dim)
+        return convert(x, axis, src=R, dst=dst, dim=dim)
     if src_base is R and dst_base is P:
-        return convert(x, axis_name, src=R, dst=P)
+        return convert(x, axis, src=R, dst=P)
     if src_base is I and dst_base is V:
-        return convert(x, axis_name, src=I, dst=dst, dim=dim)
+        return convert(x, axis, src=I, dst=dst, dim=dim)
     if src_base is I and dst_base is P:
-        return convert(x, axis_name, src=I, dst=P)
+        return convert(x, axis, src=I, dst=P)
     if src_base is V and dst_base is P:
-        return convert(x, axis_name, src=src, dst=P, dim=dim)
+        return convert(x, axis, src=src, dst=P, dim=dim)
 
     raise ValueError(
         f"redistribute({src}, {dst}) is not supported."

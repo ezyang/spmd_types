@@ -367,11 +367,11 @@ class TestAllGather(LocalTensorTestCase):
     def test_all_gather_v_to_r(self):
         """all_gather(R): V -> R, gathers shards from all ranks."""
         # Create varying input - different per rank
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
         result = all_gather(x, 'tp', src=V, dst=R, gather_dim=0)
 
-        # Result should be [0, 1, 2] on all ranks (concatenation)
+        # Result should be [0, 1, 2] on all ranks (stack)
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
@@ -379,7 +379,7 @@ class TestAllGather(LocalTensorTestCase):
 
     def test_all_gather_v_to_i(self):
         """all_gather(I): V -> I, gathers shards from all ranks."""
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r) * 2]))
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
 
         result = all_gather(x, 'tp', src=V, dst=I, gather_dim=0)
 
@@ -393,7 +393,7 @@ class TestAllGather(LocalTensorTestCase):
         # Create sharded input on dim 0
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
 
-        result = all_gather(x, 'tp', src=S(0), dst=R, gather_dim=0)
+        result = all_gather(x, 'tp', src=S(0), dst=R, gather_dim=1)
 
         # Result should be concatenated shards
         expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
@@ -424,20 +424,17 @@ class TestReduceScatter(LocalTensorTestCase):
         # Create input with world_size chunks per rank
         # Each rank has [A_r, B_r, C_r] where total length is world_size * chunk_size
         chunk_size = 2
-        x = self.mode.rank_map(lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float).reshape(self.WORLD_SIZE, chunk_size) + r
+        )
 
         result = reduce_scatter(x, 'tp', src=P, dst=V, scatter_dim=0)
 
         # Each rank r gets the sum of chunk r from all ranks
-        # Rank 0 gets sum of chunks [0:2] from all ranks
-        # Rank 1 gets sum of chunks [2:4] from all ranks
-        # Rank 2 gets sum of chunks [4:6] from all ranks
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
             for src_rank in range(self.WORLD_SIZE):
-                chunk_start = r * chunk_size
-                chunk_end = (r + 1) * chunk_size
-                expected += x._local_tensors[src_rank][chunk_start:chunk_end]
+                expected += x._local_tensors[src_rank][r]
             torch.testing.assert_close(
                 result._local_tensors[r],
                 expected,
@@ -447,9 +444,11 @@ class TestReduceScatter(LocalTensorTestCase):
     def test_reduce_scatter_to_shard(self):
         """reduce_scatter: P -> S(i), reduces and scatters."""
         chunk_size = 2
-        x = self.mode.rank_map(lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
+        )
 
-        result = reduce_scatter(x, 'tp', src=P, dst=S(0), scatter_dim=0)
+        result = reduce_scatter(x, 'tp', src=P, dst=S(0), scatter_dim=1)
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -483,15 +482,17 @@ class TestAllToAll(LocalTensorTestCase):
 
     def test_all_to_all(self):
         """all_to_all: V -> V, transposes mesh and tensor dims."""
-        # Create input: rank r has [r*3, r*3+1, r*3+2]
+        # Create input: rank r has [[r], [r+3], [r+6]]
         # After all_to_all, rank r should get [r, r+3, r+6]
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)]))
+        x = self.mode.rank_map(
+            lambda r: torch.tensor([[float(r + i * self.WORLD_SIZE)] for i in range(self.WORLD_SIZE)])
+        )
 
         result = all_to_all(x, 'tp', src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
         for r in range(self.WORLD_SIZE):
-            expected = torch.tensor([float(r + i * 3) for i in range(self.WORLD_SIZE)])
+            expected = torch.tensor([float(r + i * self.WORLD_SIZE) for i in range(self.WORLD_SIZE)])
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
     def test_all_to_all_shard_to_shard(self):
@@ -499,7 +500,7 @@ class TestAllToAll(LocalTensorTestCase):
         # Each rank has a 2D tensor
         x = self.mode.rank_map(lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10)
 
-        result = all_to_all(x, 'tp', src=S(0), dst=S(1), split_dim=0, concat_dim=1)
+        result = all_to_all(x, 'tp', src=S(0), dst=S(1), split_dim=1, concat_dim=0)
 
         # Check shapes are correct
         for r in range(self.WORLD_SIZE):
@@ -634,30 +635,30 @@ class TestConvert(LocalTensorTestCase):
         """convert(R,V): R -> V, slices to local portion. Tests forward and backward."""
         from dte._api import _ConvertReplicateToVarying
 
-        # Create replicated input [0, 1, 2, 3, 4, 5] on all ranks
-        base = torch.arange(6, dtype=torch.float)
+        # Create replicated input shaped for stack semantics
+        base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
         result = convert(x, 'tp', src=R, dst=V, dim=0)
 
         # Each rank gets its chunk: rank 0 gets [0,1], rank 1 gets [2,3], rank 2 gets [4,5]
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
+            expected = base[r]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
         # Backward check
         grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0), grad_out)
+        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0, True), grad_out)
 
     def test_convert_r_to_shard(self):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
-        base = torch.arange(6, dtype=torch.float)
+        base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
         result = convert(x, 'tp', src=R, dst=S(0), dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
+            expected = base[r]
             torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
 
     def test_convert_i_to_v(self):
@@ -675,7 +676,7 @@ class TestConvert(LocalTensorTestCase):
 
         # Backward check
         grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0), grad_out)
+        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0, True), grad_out)
 
     def test_convert_i_to_shard(self):
         """convert(I,S(i)): I -> S(i), slices to local portion."""
@@ -736,7 +737,7 @@ class TestConvert(LocalTensorTestCase):
         from dte._api import _ConvertVaryingToPartial
 
         # Each rank has [r]
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
         result = convert(x, 'tp', src=V, dst=P, dim=0)
 
@@ -748,7 +749,7 @@ class TestConvert(LocalTensorTestCase):
 
         # Backward check
         grad_out = self._generate_inputs((self.WORLD_SIZE,), 'replicate')
-        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0), grad_out)
+        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0, True), grad_out)
 
     def test_convert_shard_to_p(self):
         """convert(S(i),P): S(i) -> P, places data in disjoint positions."""
@@ -846,8 +847,10 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
 
         result = all_gather(x, 'tp', src=V, dst=R, gather_dim=1)
 
-        # Result should have shape (2, 3) on all ranks
-        expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
+        # Result should have shape (2, 3, 1) on all ranks
+        expected = torch.tensor(
+            [[[0.0], [1.0], [2.0]], [[10.0], [11.0], [12.0]]]
+        )
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
@@ -859,12 +862,8 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
 
         result = all_gather(x, 'tp', src=V, dst=R, gather_dim=0)
 
-        # Result should be (6, 2) - concatenation along dim 0
-        expected = torch.tensor([
-            [0.0, 0.0], [0.0, 0.0],
-            [1.0, 1.0], [1.0, 1.0],
-            [2.0, 2.0], [2.0, 2.0],
-        ])
+        # Result should be (3, 2, 2) - stack along dim 0
+        expected = torch.stack([torch.full((2, 2), float(r)) for r in range(self.WORLD_SIZE)], dim=0)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
 
