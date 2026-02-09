@@ -80,13 +80,10 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   gradient you need for the optimizer step.
 
 * Varying means that tensor has different values across the device mesh axis.
-  Unlike the shard placement in DTensor, we intentionally don't track how the
-  differing values should be reassembled into a full tensor--this is by design,
-  as local SPMD only needs to track enough information to ensure backwards
-  correctness, not full global tensor semantics.  (However, when semantics-
-  preserving operations like `convert` need a convention, we assume varying
-  means concatenation on dim 0; see the `convert` documentation for details.)
-  The gradient of varying is varying.
+  The gradient of varying is varying.  We don't "know" how the tensor is
+  supposed to be reassembled together, just that each rank has different data.
+  Semantically, we have is a list of tensors (one per rank), and operations are
+  done per-element.
 
 * Partial means that there is a pending sum on the (differing) values
   across the device mesh axis, but it hasn't happened yet.  Delaying the reduction
@@ -143,11 +140,15 @@ TODO: Prove that these rules are correct
 For comms ops, this type system requires three changes to the classical
 distributed APIs:
 
-* The preexisting comms APIs are augmented with src/tgt arguments when needed, to
+* The preexisting comms APIs are augmented with src/dst arguments when needed, to
   disambiguate the local SPMD type of their input/outputs.  The mechanical
   reason for this is that the backwards of these comm functions depends on
   what the local SPMD types are, so passing this info helps us choose the
-  right autograd Function!
+  right autograd Function!  These arguments not only take the local SPMD types,
+  but they also (suggestively) take `Shard(tensor_dim)` as an argument.
+  In local SPMD, this is how you swap between stack/concat semantics (described
+  in more detail on the functions.)  For brevity, we will refer to the src/dst
+  arguments by initial; e.g., R, P, V, I and S(i).
 
 * We add a new `reinterpret` operator, which represents all situations where we
   you directly coerce from one local SPMD type to another without any change
@@ -172,7 +173,7 @@ distributed APIs:
 
 For ordinary local Torch ops (e.g., einsum, matmul, elementwise ops, and
 reductions over tensor dimensions like sum), there is no cross-rank
-communication, so they do not take src/tgt arguments.  Their local SPMD types
+communication, so they do not take src/dst arguments.  Their local SPMD types
 propagate from their inputs according to the typing rules above, and any
 nontrivial type changes must be made explicit via the primitives above.
 
@@ -181,11 +182,24 @@ same.  I think you need to have some special collectives in this case.
 
 ## Comms by API
 
-Let's describe all of these operators in more detail.  When reasoning about
-the semantic meaning of an operation in a distributed setting, it's helpful
-to look at the flow of data across both the device mesh axis as well as
-a tensor dim axis.  Each of these operators will have a diagram that shows the action of
-collectives on 1D tensors on three ranks.  Here is an example:
+Let's describe all of these operators in more detail.
+
+To help understand the meaning of these operations, we will provide two things
+for each function:
+
+* A *specification* of the function (e.g., `all_gather_spec`), written in
+  terms of explicit lists of tensors across all ranks.  This specification
+  specifies what happens on the denotations of the inputs/outputs; notably,
+  a partial input arrives at the specification already summed (because that's
+  what semantically it represents.)
+
+* A diagrammatic representation of this function, showing the flow of data
+  across both the device mesh axis as well as a tensor dim axis.  Each of these
+  operators will have a diagram that shows the action of collectives on 1D
+  tensors on three ranks.  This representation accurately represents pending
+  reductions.
+
+Here is an example of the diagram:
 
 ```
 [A]
@@ -197,7 +211,10 @@ To explain in more detail:
 
 * The double arrow `=>` shows the before and after an operation.
 * Each row (line) specifies the content of a different rank.
-* Each bracketed expression `[A, B, C]` indicates a 1-D tensor.
+* A variable denotes a tensor (potentially scalar).  So for example, `[A]`
+  denotes at least a 1-D tensor, while `A` can be any dimensionality.  When
+  thinking about the examples, it can be helpful to imagine `A` as a 0-d
+  scalar tensor to avoid worrying too much about the higher dimensional case.
 * If a tensor is written on only one row, all other rows have the same contents.
   (Omitting the replicated rows helps convey the meaning that there really
   is only semantically *one* value in this situation, even though there
@@ -228,60 +245,100 @@ way of checking if you have written the correct backwards.
 
 When referencing operators, we may refer to them compactly by removing `x` and
 `mesh_axis` from the function signature, and using R/V/P/I to abbreviate the
-local SPMD type passed into src/tgt arguments.
+local SPMD type passed into src/dst arguments.
 
 OK, without further ado!
 
-### `all_gather(x: Varying, mesh_axis, tgt) -> Replicate | Invariant`
+### `all_gather(x: Varying, mesh_axis, src, dst) -> Replicate | Invariant`
 
 ```
-[A]
-[B]  =>  [A, B, C]
-[C]
+def all_gather_spec(xs, src):
+    # NB: dst only affects autograd
+    match src:
+        case V:
+            '''
+            A
+            B  =>  [A, B, C]
+            C
+            '''
+            return torch.stack(xs)
+
+        case S(i):
+            '''
+            When i == 0:
+            [A0, A1]
+            [B0, B1]  =>  [A0, A1, B0, B1, C0, C1]
+            [C0, C1]
+            '''
+            return torch.concat(xs, i)
 ```
 
-Gather shards along the mesh axis, so that every rank has the full copy of the data.
+Gather shards along the mesh axis, so that every rank has the full copy of the
+data.  PyTorch's `all_gather` can either concat or stack inputs together.  When
+the source tensor is interpreted as a varying tensor, we stack the inputs together,
+creating a new dimension of size mesh axis.  But if the source tensor is a sharded
+tensor, we concat along the sharded dimension.
 
-When `tgt='replicate'`, aka `all_gather(R): V -> R`, the backwards is `reduce_scatter: P -> V`.
+The backwards for each case:
 
-```
-[A0 + A1 + A2]      +[A0, B0, C0]
-[B0 + B1 + B2]  <=  +[A1, B1, C1]
-[C0 + C1 + C2]      +[A2, B2, C2]
-```
-
-When `tgt='invariant'`, aka `all_gather(I): V -> I`, the backwards is `convert(I,V): I -> V`.
+`all_gather(V,R): V -> R`, the backwards is `reduce_scatter(V): P -> V`.
 
 ```
-[A]
-[B]  <=  [A, B, C]
-[C]
+Ax + Ay + Az      +[Ax, Bx, Cx]
+Bx + By + Bz  <=  +[Ay, By, Cy]
+Cx + Cy + Cz      +[Az, Bz, Cz]
 ```
 
-### `all_reduce(x: Partial, mesh_axis, src, tgt) -> Replicate | Invariant`
+`all_gather(V,I): V -> I`, the backwards is `convert(I,V): I -> V`.
+
+```
+A
+B  <=  [A, B, C]
+C
+```
+
+`all_gather(S(i),R): S(i) -> R`, the backwards is `reduce_scatter(S(i)): P -> S(i)`.
+
+```
+When i == 0:
+[A0x + A0y + A0z, A1x + A1y + A1z]      +[A0x, A1x, B0x, B1x, C0x, C1x]
+[B0x + B0y + B0z, B1x + B1y + B1z]  <=  +[A0y, A1y, B0y, B1y, C0y, C1y]
+[C0x + C0y + C0z, C1x + C1y + C1z]      +[A0z, A1z, B0z, B1z, C0z, C1z]
+```
+
+`all_gather(S(i),I): S(i) -> I`, the backwards is `convert(I,S(i)): I -> S(i)`.
+
+```
+[A0, A1]
+[B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
+[C0, C1]
+```
+
+### `all_reduce(x: Partial, mesh_axis, dst) -> Replicate | Invariant`
+
+```
+def all_reduce_spec(x: f32[*shape]) -> f32[*shape]:
+    return x  # Identity! The summation already occured on x's conversion to Partial
+
++A0
++A1  =>  A0 + A1 + A2
++A2
+```
 
 Reduce shards along the mesh axis, so that every rank has the full summed value.
 
-For partial input, the forwards is:
+When `dst='replicate'`, aka `all_reduce(R): P -> R`, the backwards is `all_reduce(R): P -> R`
 
 ```
-+[A0]
-+[A1]  =>  [A0 + A1 + A2]
-+[A2]
+                  +A0
+A0 + A1 + A2  <=  +A1
+                  +A2
 ```
 
-When `tgt='replicate'`, aka `all_reduce(R): P -> R`, the backwards is `all_reduce(R): P -> R`
+When `dst='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpret(I,R): I -> R`
 
 ```
-                    +[A0]
-[A0 + A1 + A2]  <=  +[A1]
-                    +[A2]
-```
-
-When `tgt='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpret(I,R): I -> R`
-
-```
-[A]  <=  [A]
+A  <=  A
 ```
 
 It is common to want to `all_reduce` on varying data; just `reinterpret(V,P)` the data
@@ -289,33 +346,53 @@ as partial before calling `all_reduce`.
 
 TODO: I think with erasure we can infer this cast
 
-### `reduce_scatter(x, mesh_axis): Partial -> Varying`
+### `reduce_scatter(x, mesh_axis, dst): Partial -> Varying`
 
 ```
-+[A0, B0, C0]      [A0 + A1 + A2]
-+[A1, B1, C1]  =>  [B0 + B1 + B2]
-+[A2, B2, C2]      [C0 + C1 + C2]
+def reduce_scatter_spec(x: f32[mesh_axis_size, *shape], dst) -> List[f32[*shape]]:
+    # NB: The semantic summation already occured on x's conversion to Partial
+    match dst:
+        case V:
+            '''
+            +[A0, B0, C0]      A0 + A1 + A2
+            +[A1, B1, C1]  =>  B0 + B1 + B2
+            +[A2, B2, C2]      C0 + C1 + C2
+            '''
+            return x.unbind()
+        case S(i):
+            '''
+            When i == 0:
+            +[A0x, A1x, B0x, B1x, C0x, C1x]      [A0x + A0y + A0z, A1x + A1y + A1z]
+            +[A0y, A1y, B0y, B1y, C0y, C1y]  <=  [B0x + B0y + B0z, B1x + B1y + B1z]
+            +[A0z, A1z, B0z, B1z, C0z, C1z]      [C0x + C0y + C0z, C1x + C1y + C1z]
+            '''
+            return 
+
 ```
 
 Reduce shards along the mesh axis, but only get one shard of the result (e.g.,
 an inefficient implementation of reduce-scatter would be to all-reduce and
-then drop the data you did not need.)  Unlike `all_reduce`, this always
-produces a varying output, so it doesn't accept a tgt argument.
+then drop the data you did not need.)  Like `all_gather`, `dst` can either
+be varying for stack semantics, or shard for concat semantics (as we will see later).
 
-The forwards is `P -> V`, the backwards is `all_gather: V -> R`
-
-It is common to want to `reduce_scatter` on varying data; just `reinterpret(V,P)`
-the data as partial before calling `reduce_scatter`.
+The forwards is `P -> V`, the backwards is `all_gather(V,R): V -> R`
 
 ```
-               [A]
-[A, B, C]  <=  [B]
-               [C]
+                     [A]
+[[A], [B], [C]]  <=  [B]
+                     [C]
 ```
+
+It is common to want to reduce-scatter on varying data; just `reinterpret(V,P)`
+the data as partial before calling `reduce_scatter_stack`.
 
 ### `all_to_all(x, mesh_axis): Varying -> Varying`
 
 ```
+def all_to_all_spec(xs: List[f32[mesh_axis_size, *shape]], src, dst) -> List[f32[mesh_axis_size, *shape]]:
+    # An all-to-all transposes a mesh axis with a tensor axis!
+    return torch.stack(xs).transpose(0, 1).unbind()
+
 [A0, A1, A2]      [A0, B0, C0]
 [B0, B1, B2]  =>  [A1, B1, C1]
 [C0, C1, C2]      [A2, B2, C2]
@@ -331,7 +408,7 @@ The forwards is `V -> V`, the backwards is `all_to_all: V -> V`.
 [C0, C1, C2]      [A2, B2, C2]
 ```
 
-### `reinterpret(x, mesh_axis, src, tgt)`
+### `reinterpret(x, mesh_axis, src, dst)`
 
 Coerce from one local SPMD type to another local SPMD type without changing
 the local tensor.  It is guaranteed to be a no-op in forwards.
@@ -346,6 +423,9 @@ Here are the supported coercions:
 `reinterpret(R,I): R -> I`, the backwards is `convert(I,P): I -> P`
 
 ```
+def reinterpret_R_I_spec(x: f32[*shape]) -> f32[*shape]:
+    return x
+
 Forward:
 [A] => [A]
 
@@ -358,6 +438,10 @@ Backward:
 `reinterpret(R,V): R -> V`, the backwards is `reinterpret(V,P): V -> P`
 
 ```
+def reinterpret_R_V_spec(x: f32[*shape]) -> List[f32[*shape]]:
+    # Makes N copies of the input
+    return [x] * mesh_axis_size
+
 Forward:
          [A]
 [A]  =>  [A]
@@ -372,6 +456,9 @@ Backward:
 `reinterpret(I,R): I -> R`, the backwards is `all_reduce(I): P -> I`
 
 ```
+def reinterpret_I_R_spec(x: f32[*shape]) -> f32[*shape]:
+    return x
+
 Forward:
 [A] => [A]
 
@@ -384,6 +471,10 @@ Backward:
 `reinterpret(V,P): V -> P`, the backwards is `reinterpret(R,V): R -> V`
 
 ```
+def reinterpret_V_P_spec(xs: List[f32[*shape]]) -> f32[*shape]:
+    # Semantically does a sum, even if physically it hasn't happened yet!
+    return sum(xs)
+
 Forward:
 [A0]      +[A0]
 [A1]  =>  +[A1]
@@ -398,6 +489,10 @@ Backward:
 `reinterpret(R,P): R -> P`, the backwards is `reinterpret(R,P): R -> P`
 
 ```
+def reinterpret_R_P(x: f32[*shape]) -> f32[*shape]:
+    # Summing each replicated entry together scales the value by axis size
+    return x * mesh_axis_size
+
 Forward:
          +[A]
 [A]  =>  +[A]
@@ -421,7 +516,7 @@ Here is a table of permissible reinterprets (`-` is no-op, `X` is direct
 coercion, `/` is transitive coercion.)
 
 ```
-       tgt
+       dst
        R I V P
 src R  - X X /
     I  X - / /
@@ -429,14 +524,17 @@ src R  - X X /
     P        -
 ```
 
-### `convert(x, mesh_axis, src, tgt)`
+### `convert(x, mesh_axis, src, dst)`
 
 Convert from one local SPMD to another while preserving the semantics of the
-tensor.  When a tensor is varying, it is ambiguous what the "semantics" of
-the tensor are; by convention we interpret varying as concatenation on dim=0,
-following the natural behavior of collectives like all-gather and reduce-scatter
-that split/combine along the outermost tensor dimension.  Here are the supported
-conversions:
+tensor.  Technically, varying and non-varying tensors can never have the same
+semantics (since a varying tensor is a list of tensors, while a non-varying
+tensor is a single tensor), but to avoid having to define another function,
+we simply say that a non-varying tensor can be interpreted as varying by
+unbinding dim 0, following the natural behavior of collectives like all-gather and reduce-scatter
+that stack/unbind on dim 0).
+
+Here are the supported conversions:
 
 `convert(R,V): R -> V`, the backward is `convert(V,P) : V -> P`
 
@@ -445,33 +543,39 @@ output keeps only the local shard along the specified dim, producing a varying
 value.
 
 ```
+def convert_R_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
+    return x.unbind()
+
 Forward:
-               [A]
-[A, B, C]  =>  [B]
-               [C]
+                     [A]
+[[A], [B], [C]]  =>  [B]
+                     [C]
 
 Backward:
-+[A, 0, 0]      [A]
-+[0, B, 0]  <=  [B]
-+[0, 0, C]      [C]
++[[A], [0], [0]]      [A]
++[[0], [B], [0]]  <=  [B]
++[[0], [0], [C]]      [C]
 ```
 
-`convert(I,V): I -> V`, the backwards is `all_gather(I): V -> I`
+`convert(I,V): I -> V`, the backwards is `all_gather_stack(I): V -> I`
 
 Input is invariant across ranks, so each rank holds the full tensor.  The
 output keeps only the local shard along the specified dim, producing a varying
 value.
 
 ```
+def convert_I_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
+    return x.unbind()
+
 Forward
-               [A]
-[A, B, C]  =>  [B]
-               [C]
+                     [A]
+[[A], [B], [C]]  =>  [B]
+                     [C]
 
 Backward:
-               [A]
-[A, B, C]  <=  [B]
-               [C]
+                     [A]
+[[A], [B], [C]]  <=  [B]
+                     [C]
 ```
 
 `convert(R,P): R -> P`, the backwards is `convert(R,P) : R -> P`
@@ -481,6 +585,9 @@ shape, but all ranks except the first are zeroed out, producing a partial value
 that sums to the original tensor after a cross-rank reduction.
 
 ```
+def convert_R_P_spec(x: f32[*shape]) -> f32[*shape]:
+    return x
+
 Forward:
          +[A]
 [A]  =>  +[0]
@@ -499,6 +606,9 @@ shape, but all ranks except the first are zeroed out, producing a partial value
 that sums to the original tensor after a cross-rank reduction.
 
 ```
+def convert_I_P_spec(x: f32[*shape]) -> f32[*shape]:
+    return x
+
 Forward:
          +[A]
 [A]  =>  +[0]
@@ -508,21 +618,24 @@ Backward:
 [A]  <=  [A]
 ```
 
-`convert(V,P): V -> P`, the backwards is `convert(R,V): R -> V`
+`convert_spec(V,P): V -> P`, the backwards is `convert(R,V): R -> V`
 
 Input is varying, with each rank holding a shard or distinct value.  The output
 places each rank's value into a disjoint position of a partial tensor (zeros
 elsewhere) so that summing across ranks reconstructs the stacked value.
 
 ```
+def convert_V_P(xs: List[f32[*shape]]) -> f32[mesh_axis_size, *shape]:
+    return torch.stack(xs)
+
 Forward:
-[A]      +[A, 0, 0]
-[B]  =>  +[0, B, 0]
-[C]      +[0, 0, C]
+[A]      +[[A], [0], [0]]
+[B]  =>  +[[0], [B], [0]]
+[C]      +[[0], [0], [C]]
 
 Backward:
 [A]
-[B]  <=  [A, B, C]
+[B]  <=  [[A], [B], [C]]
 [C]
 ```
 
@@ -536,7 +649,7 @@ Here is a table of permissible converts (`-` is no-op, `O` is supported, `X` is 
 the semantics is the same as reinterpret.)
 
 ```
-       tgt
+       dst
        R I V P
 src R  - X O O
     I  X - O O
@@ -731,7 +844,13 @@ out2 = linear(hidden, weight, out_partial_axes='tp')
 ### Shard propagation for comms operators
 
 All local SPMD comms operators are also valid in global SPMD.  We simply need to describe
-how they propagate sharding.  Intuitively, all of these comms operators simply replace
+how they propagate sharding.  When all tensors across ranks have the same size, we
+can interpret a list of tensors as a single tensor by stacking them on dim 0.  So these
+functions clearly work when TODO: rank preserving versus not rank preserving
+
+XXXXXXXXXXXXXXX
+
+Intuitively, all of these comms operators simply replace
 Varying with Shard(0) (you can translate this into partition spec form using the standard
 device mesh dim to tensor dim translation).  Here are all of the affected operators:
 
@@ -1000,7 +1119,7 @@ class _AllReduceToInvariant(torch.autograd.Function):
         return grad_out, None
 
 
-def all_reduce(x, axis_name, *, src: str = 'partial', tgt: str):
+def all_reduce(x, axis_name, *, src: str = 'partial', dst: str):
     """
     Reduce shards along the mesh axis, so every rank has the full summed value.
 
@@ -1008,22 +1127,22 @@ def all_reduce(x, axis_name, *, src: str = 'partial', tgt: str):
         x: Input tensor with Partial type on the mesh axis
         axis_name: The mesh axis to reduce over
         src: Source type (must be 'partial')
-        tgt: Target type ('replicate' or 'invariant')
+        dst: Target type ('replicate' or 'invariant')
 
     Returns:
-        Tensor with Replicate or Invariant type depending on tgt
+        Tensor with Replicate or Invariant type depending on dst
 
-    When tgt='replicate', backward is all_reduce(R): P -> R
-    When tgt='invariant', backward is reinterpret(I,R): I -> R (no-op)
+    When dst='replicate', backward is all_reduce(R): P -> R
+    When dst='invariant', backward is reinterpret(I,R): I -> R (no-op)
     """
     if src != 'partial':
         raise ValueError(f"all_reduce src must be 'partial', got {src}")
-    if tgt == 'replicate':
+    if dst == 'replicate':
         return _AllReduceToReplicate.apply(x, axis_name)
-    elif tgt == 'invariant':
+    elif dst == 'invariant':
         return _AllReduceToInvariant.apply(x, axis_name)
     else:
-        raise ValueError(f"all_reduce tgt must be 'replicate' or 'invariant', got {tgt}")
+        raise ValueError(f"all_reduce dst must be 'replicate' or 'invariant', got {dst}")
 
 
 # =============================================================================
@@ -1082,7 +1201,7 @@ class _AllGatherToInvariant(torch.autograd.Function):
         return chunks[rank].contiguous(), None, None
 
 
-def all_gather(x, axis_name, *, tgt: str, gather_dim: int = 0):
+def all_gather(x, axis_name, *, dst: str, gather_dim: int = 0):
     """
     Gather shards along the mesh axis, so every rank has the full copy of data.
 
@@ -1095,21 +1214,21 @@ def all_gather(x, axis_name, *, tgt: str, gather_dim: int = 0):
     Args:
         x: Input tensor with Varying type on the mesh axis
         axis_name: The mesh axis to gather over
-        tgt: Target type ('replicate' or 'invariant')
+        dst: Target type ('replicate' or 'invariant')
         gather_dim: The tensor dimension to concatenate along (default: 0)
 
     Returns:
-        Tensor with Replicate or Invariant type depending on tgt
+        Tensor with Replicate or Invariant type depending on dst
 
-    When tgt='replicate', backward is reduce_scatter: P -> V
-    When tgt='invariant', backward is convert(I,V): I -> V
+    When dst='replicate', backward is reduce_scatter: P -> V
+    When dst='invariant', backward is convert(I,V): I -> V
     """
-    if tgt == 'replicate':
+    if dst == 'replicate':
         return _AllGatherToReplicate.apply(x, axis_name, gather_dim)
-    elif tgt == 'invariant':
+    elif dst == 'invariant':
         return _AllGatherToInvariant.apply(x, axis_name, gather_dim)
     else:
-        raise ValueError(f"all_gather tgt must be 'replicate' or 'invariant', got {tgt}")
+        raise ValueError(f"all_gather dst must be 'replicate' or 'invariant', got {dst}")
 
 
 # =============================================================================
@@ -1286,7 +1405,7 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 
 # Update reinterpret to handle all cases
-def reinterpret(x, axis_name, *, src: str, tgt: str):
+def reinterpret(x, axis_name, *, src: str, dst: str):
     """
     Coerce from one local SPMD type to another without changing the local tensor.
 
@@ -1297,7 +1416,7 @@ def reinterpret(x, axis_name, *, src: str, tgt: str):
         x: Input tensor
         axis_name: The mesh axis to operate on
         src: Source local SPMD type ('replicate', 'invariant', 'varying', 'partial')
-        tgt: Target local SPMD type ('replicate', 'invariant', 'varying', 'partial')
+        dst: Target local SPMD type ('replicate', 'invariant', 'varying', 'partial')
 
     Supported coercions:
         - reinterpret(R,I): R -> I, backward is convert(I,P): I -> P
@@ -1308,31 +1427,31 @@ def reinterpret(x, axis_name, *, src: str, tgt: str):
     """
     if src not in ALLOWED_PCAST_STATES:
         raise ValueError(f"Invalid src state: {src}. Must be one of {ALLOWED_PCAST_STATES}")
-    if tgt not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid tgt state: {tgt}. Must be one of {ALLOWED_PCAST_STATES}")
+    if dst not in ALLOWED_PCAST_STATES:
+        raise ValueError(f"Invalid dst state: {dst}. Must be one of {ALLOWED_PCAST_STATES}")
 
-    if src == tgt:
+    if src == dst:
         return x  # no-op
 
-    if src == 'replicate' and tgt == 'varying':
+    if src == 'replicate' and dst == 'varying':
         return _ReplicateToVarying.apply(x, axis_name)
-    elif src == 'replicate' and tgt == 'invariant':
+    elif src == 'replicate' and dst == 'invariant':
         return _ReplicateToInvariant.apply(x, axis_name)
-    elif src == 'replicate' and tgt == 'partial':
+    elif src == 'replicate' and dst == 'partial':
         return _ReplicateToPartial.apply(x, axis_name)
-    elif src == 'invariant' and tgt == 'replicate':
+    elif src == 'invariant' and dst == 'replicate':
         return _InvariantToReplicate.apply(x, axis_name)
-    elif src == 'invariant' and tgt == 'varying':
+    elif src == 'invariant' and dst == 'varying':
         # Composition: I -> R -> V
         return _ReplicateToVarying.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
-    elif src == 'invariant' and tgt == 'partial':
+    elif src == 'invariant' and dst == 'partial':
         # Composition: I -> R -> P
         return _ReplicateToPartial.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
-    elif src == 'varying' and tgt == 'partial':
+    elif src == 'varying' and dst == 'partial':
         return _VaryingToPartial.apply(x, axis_name)
     else:
         raise ValueError(
-            f"reinterpret({src}, {tgt}) is not supported. "
+            f"reinterpret({src}, {dst}) is not supported. "
             "Cannot reinterpret from partial or to varying/replicate from varying."
         )
 
@@ -1537,7 +1656,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
             return _replicate_to_varying_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
 
 
-def convert(x, axis_name, *, src: str, tgt: str, dim: int = 0):
+def convert(x, axis_name, *, src: str, dst: str, dim: int = 0):
     """
     Convert from one local SPMD type to another while preserving tensor semantics.
 
@@ -1548,7 +1667,7 @@ def convert(x, axis_name, *, src: str, tgt: str, dim: int = 0):
         x: Input tensor
         axis_name: The mesh axis to operate on
         src: Source local SPMD type
-        tgt: Target local SPMD type
+        dst: Target local SPMD type
         dim: The tensor dimension for split/concat operations (default: 0)
 
     Supported conversions:
@@ -1561,31 +1680,31 @@ def convert(x, axis_name, *, src: str, tgt: str, dim: int = 0):
     """
     if src not in ALLOWED_PCAST_STATES:
         raise ValueError(f"Invalid src state: {src}. Must be one of {ALLOWED_PCAST_STATES}")
-    if tgt not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid tgt state: {tgt}. Must be one of {ALLOWED_PCAST_STATES}")
+    if dst not in ALLOWED_PCAST_STATES:
+        raise ValueError(f"Invalid dst state: {dst}. Must be one of {ALLOWED_PCAST_STATES}")
 
-    if src == tgt:
+    if src == dst:
         return x  # no-op
 
-    if src == 'replicate' and tgt == 'varying':
+    if src == 'replicate' and dst == 'varying':
         return _ConvertReplicateToVarying.apply(x, axis_name, dim)
-    elif src == 'replicate' and tgt == 'partial':
+    elif src == 'replicate' and dst == 'partial':
         return _ConvertReplicateToPartial.apply(x, axis_name)
-    elif src == 'replicate' and tgt == 'invariant':
+    elif src == 'replicate' and dst == 'invariant':
         # Same as reinterpret
         return _ReplicateToInvariant.apply(x, axis_name)
-    elif src == 'invariant' and tgt == 'varying':
+    elif src == 'invariant' and dst == 'varying':
         return _ConvertInvariantToVarying.apply(x, axis_name, dim)
-    elif src == 'invariant' and tgt == 'partial':
+    elif src == 'invariant' and dst == 'partial':
         return _ConvertInvariantToPartial.apply(x, axis_name)
-    elif src == 'invariant' and tgt == 'replicate':
+    elif src == 'invariant' and dst == 'replicate':
         # Same as reinterpret
         return _InvariantToReplicate.apply(x, axis_name)
-    elif src == 'varying' and tgt == 'partial':
+    elif src == 'varying' and dst == 'partial':
         return _ConvertVaryingToPartial.apply(x, axis_name, dim)
     else:
         raise ValueError(
-            f"convert({src}, {tgt}) is not supported. "
+            f"convert({src}, {dst}) is not supported. "
             "Cannot convert out of partial."
         )
 
