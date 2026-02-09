@@ -145,10 +145,13 @@ distributed APIs:
   reason for this is that the backwards of these comm functions depends on
   what the local SPMD types are, so passing this info helps us choose the
   right autograd Function!  These arguments not only take the local SPMD types,
-  but they also (suggestively) take `Shard(tensor_dim)` as an argument.
-  In local SPMD, this is how you swap between stack/concat semantics (described
-  in more detail on the functions.)  For brevity, we will refer to the src/dst
-  arguments by initial; e.g., R, P, V, I and S(i).
+  but they also (suggestively) take `Shard(tensor_dim)` as an argument.  Note that
+  when multiple mesh axis shard the same tensor dim, operations are only valid
+  for operating on the *last* mesh axis (see the global SPMD APIs for a better
+  way for working in this situation.) In local SPMD, this is how you swap
+  between stack/concat semantics (described in more detail on the functions.)
+  For brevity, we will refer to the src/dst arguments by initial; e.g., R, P,
+  V, I and S(i).
 
 * We add a new `reinterpret` operator, which represents all situations where we
   you directly coerce from one local SPMD type to another without any change
@@ -248,6 +251,9 @@ When referencing operators, we may refer to them compactly by removing `x` and
 local SPMD type passed into src/dst arguments.
 
 OK, without further ado!
+
+TODO: In general, the Varying functions can be generalized to take a tensor dim
+argument so that they do an action on not tensor dim 0 but somewhere else.
 
 ### `all_gather(x: Varying, mesh_axis, src, dst) -> Replicate | Invariant`
 
@@ -366,7 +372,7 @@ def reduce_scatter_spec(x: f32[mesh_axis_size, *shape], dst) -> List[f32[*shape]
             +[A0y, A1y, B0y, B1y, C0y, C1y]  =>  [B0x + B0y + B0z, B1x + B1y + B1z]
             +[A0z, A1z, B0z, B1z, C0z, C1z]      [C0x + C0y + C0z, C1x + C1y + C1z]
             '''
-            return 
+            return x.chunk(mesh_axis_size, i)
 
 ```
 
@@ -380,44 +386,80 @@ The backwards for each case:
 `reduce_scatter(V): P -> V`, the backwards is `all_gather(V,R): V -> R`.
 
 ```
-                  A
+               A
 [A, B, C]  <=  B
-                  C
+               C
 ```
 
 `reduce_scatter(S(i)): P -> S(i)`, the backwards is `all_gather(S(i),R): S(i) -> R`.
 
 ```
 When i == 0:
-                                         [A0, A1]
+                              [A0, A1]
 [A0, A1, B0, B1, C0, C1]  <=  [B0, B1]
-                                         [C0, C1]
+                              [C0, C1]
 ```
 
 It is common to want to reduce-scatter on varying data; just `reinterpret(V,P)`
 the data as partial before calling `reduce_scatter`.
 
-### `all_to_all(x, mesh_axis): Varying -> Varying`
+### `all_to_all(x, mesh_axis, src, dst): Varying -> Varying`
 
 ```
-def all_to_all_spec(xs: List[f32[mesh_axis_size, *shape]], src, dst) -> List[f32[mesh_axis_size, *shape]]:
-    # An all-to-all transposes a mesh axis with a tensor axis!
-    return torch.stack(xs).transpose(0, 1).unbind()
+def all_to_all_spec(xs, src, dst):
+    # An all-to-all transposes a mesh axis with a tensor axis.
 
-[A0, A1, A2]      [A0, B0, C0]
-[B0, B1, B2]  =>  [A1, B1, C1]
-[C0, C1, C2]      [A2, B2, C2]
+    '''
+    Diagram for all_to_all(V,V):
+    [A0, A1, A2]      [A0, B0, C0]
+    [B0, B1, B2]  =>  [A1, B1, C1]
+    [C0, C1, C2]      [A2, B2, C2]
+
+    To reason about all_to_all(S(i),S(j)), its best decompose
+    it to all_gather(S(i),R) and convert(R,S(j)), or to just
+    think of its local SPMD semantics as unsharding on one axis and resharding
+    on another.
+    '''
+
+    match src, dst:
+        case V, V:
+            x = torch.stack(xs)
+            x = x.transpose(0, 1)
+            return x.unbind()
+
+        case S(i), S(j):
+            x = torch.concat(xs, i)
+            return x.chunk(mesh_axis_size, j)
+
+        # TODO: does V,S(j) or S(i),V make sense?
 ```
 
-Transpose a local tensor axis with the mesh axis.
+The varying and shard versions of `all_to_all` are pretty different (even though
+under the hood they both have an all-to-all communication pattern), so we'll
+describe them separately.
 
-The forwards is `V -> V`, the backwards is `all_to_all: V -> V`.
+* `all_to_all(V,V)` transposes the logical mesh axis with the dim 0 local tensor axis
+  (TODO: we can hypothetically split on not dim 0 but for the non-contiguous
+  reads to be fused we'd need a special collective which NCCL doesn't
+  directly support).
+
+* `all_to_all(S(i),S(j))` intuitively unshards the tensor on dim i, and then
+  reshards it on dim j (but skips actually doing the all-gather).
+
+The forwards is `V -> V`, the backwards is `all_to_all: V -> V` (with src/dst
+and split_dim/concat_dim swapped).
+
+The backwards for each case:
+
+`all_to_all(V,V): V -> V`, the backwards is `all_to_all(V,V): V -> V`:
 
 ```
 [A0, A1, A2]      [A0, B0, C0]
 [B0, B1, B2]  <=  [A1, B1, C1]
 [C0, C1, C2]      [A2, B2, C2]
 ```
+
+`all_to_all(S(i),S(j)): S(i) -> S(j)`, the backwards is `all_to_all(S(j),S(i)): S(j) -> S(i)`.
 
 ### `reinterpret(x, mesh_axis, src, dst)`
 
@@ -438,12 +480,12 @@ def reinterpret_R_I_spec(x: f32[*shape]) -> f32[*shape]:
     return x
 
 Forward:
-[A] => [A]
+A  =>  A
 
 Backward:
-+[A]
-+[0]  <=  [A]
-+[0]
++A
++0  <=  A
++0
 ```
 
 `reinterpret(R,V): R -> V`, the backwards is `reinterpret(V,P): V -> P`
@@ -454,9 +496,9 @@ def reinterpret_R_V_spec(x: f32[*shape]) -> List[f32[*shape]]:
     return [x] * mesh_axis_size
 
 Forward:
-         [A]
-[A]  =>  [A]
-         [A]
+       A
+A  =>  A
+       A
 
 Backward:
 +A      A
@@ -471,12 +513,12 @@ def reinterpret_I_R_spec(x: f32[*shape]) -> f32[*shape]:
     return x
 
 Forward:
-[A] => [A]
+A => A
 
 Backward:
-                    +[Ax]
-[Ax + Ay + Az]  <=  +[Ay]
-                    +[Az]
+                  +Ax
+Ax + Ay + Az  <=  +Ay
+                  +Az
 ```
 
 `reinterpret(V,P): V -> P`, the backwards is `reinterpret(R,V): R -> V`
@@ -492,9 +534,9 @@ B  =>  +B
 C      +C
 
 Backward:
-[A]
-[A]  <=  [A]
-[A]
+A
+A  <=  A
+A
 ```
 
 `reinterpret(R,P): R -> P`, the backwards is `reinterpret(R,P): R -> P`
@@ -505,14 +547,14 @@ def reinterpret_R_P(x: f32[*shape]) -> f32[*shape]:
     return x * mesh_axis_size
 
 Forward:
-         +[A]
-[A]  =>  +[A]
-         +[A]
+       +A
+A  =>  +A
+       +A
 
 Backward:
-+[A]
-+[A]  <=  [A]
-+[A]
++A
++A  <=  A
++A
 ```
 
 `reinterpret(I,V): I -> V` is the composition of `I -> R -> V`.  `reinterpret(R,P): R -> P`
@@ -522,6 +564,10 @@ resulting tensor has been scaled by the mesh axis size (because you are now
 obligated to sum each of the (equal) quantities of the rank together!) If you
 instead wanted to *preserve* the original semantic meaning of the tensor, use
 `convert`.
+
+This API does not support shard for src/dst, because the restriction on no local tensor
+change means that the local SPMD semantics would be precisely the same as the corresponding
+varying operation.
 
 Here is a table of permissible reinterprets (`-` is no-op, `X` is direct
 coercion, `/` is transitive coercion.)
@@ -538,56 +584,101 @@ src R  - X X /
 ### `convert(x, mesh_axis, src, dst)`
 
 Convert from one local SPMD to another while preserving the semantics of the
-tensor.  Technically, varying and non-varying tensors can never have the same
-semantics (since a varying tensor is a list of tensors, while a non-varying
-tensor is a single tensor), but to avoid having to define another function,
-we simply say that a non-varying tensor can be interpreted as varying by
-unbinding dim 0, following the natural behavior of collectives like all-gather and reduce-scatter
-that stack/unbind on dim 0).
+tensor, without doing communications.  When src/dst is shard, this means
+preserving the global SPMD semantics of the tensor per this sharding; when
+src/dst is varying, this means preserving the local SPMD semantics (we simply
+say that a non-varying tensor can be interpreted as varying by unbinding dim
+0, following the natural behavior of collectives like all-gather and
+reduce-scatter that stack/unbind on dim 0).  The shard/varying conversions
+are actually exactly identical, except for being rank-preserving or not, so
+in the summary tables we will only include the varying versions of operations.
+However, we include both in the API description for clarity.
 
 Here are the supported conversions:
 
 `convert(R,V): R -> V`, the backward is `convert(V,P) : V -> P`
 
 Input is replicated across ranks, so each rank holds the full tensor.  The
-output keeps only the local shard along the specified dim, producing a varying
-value.
+output keeps only the local shard along tensor dim 0, producing a varying
+value.  This operation reduces the rank of the tensor.
 
 ```
 def convert_R_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
     return x.unbind()
 
 Forward:
-                     [A]
-[[A], [B], [C]]  =>  [B]
-                     [C]
+               A
+[A, B, C]  =>  B
+               C
 
 Backward:
-+[[A], [0], [0]]      [A]
-+[[0], [B], [0]]  <=  [B]
-+[[0], [0], [C]]      [C]
++[A, 0, 0]      A
++[0, B, 0]  <=  B
++[0, 0, C]      C
 ```
 
-`convert(I,V): I -> V`, the backwards is `all_gather_stack(I): V -> I`
+`convert(R,S(i)): R -> S(i)`, the backward is `convert(S(i),P) : S(i) -> P`
+
+Like above, but the rank of the tensor is not reduced, and an arbitrary tensor
+dim can be specified to be sharded.
+
+```
+def convert_R_S_spec(x, i):
+    return x.chunk(mesh_axis_size, i)
+
+
+Forward (for i = 0):
+                              [A0, A1]
+[A0, A1, B0, B1, C0, C1]  =>  [B0, B1]
+                              [C0, C1]
+
+Backward (for i = 0):
++[A0, A1, 0,  0,  0,  0 ]      [A0, A1]
++[0,  0,  B0, B1, 0,  0 ]  <=  [B0, B1]
++[0,  0,  0,  0,  C0, C1]      [C0, C1]
+```
+
+`convert(I,V): I -> V`, the backwards is `all_gather(V,I): V -> I`
 
 Input is invariant across ranks, so each rank holds the full tensor.  The
-output keeps only the local shard along the specified dim, producing a varying
-value.
+output keeps only the local slice along dim 0, producing a varying
+value.  The rank of the tensor is reduced.
 
 ```
 def convert_I_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
     return x.unbind()
 
 Forward
-                     [A]
-[[A], [B], [C]]  =>  [B]
-                     [C]
+               A
+[A, B, C]  =>  B
+               C
 
 Backward:
-                     [A]
-[[A], [B], [C]]  <=  [B]
-                     [C]
+               A
+[A, B, C]  <=  B
+               C
 ```
+
+`convert(I,S(i)): I -> S(i)`, the backwards is `all_gather(S(i),I): S(i) -> I`
+
+Like above, but the rank of the tensor is not reduced, and an arbitrary
+tensor dim can be specified to be sharded.
+
+```
+def convert_I_S_spec(x, i):
+    return x.chunk(mesh_axis_size, i)
+
+Forward (for i = 0):
+                              [A0, A1]
+[A0, A1, B0, B1, C0, C1]  =>  [B0, B1]
+                              [C0, C1]
+
+Backward (for i = 0):
+                              [A0, A1]
+[A0, A1, B0, B1, C0, C1]  <=  [B0, B1]
+                              [C0, C1]
+```
+
 
 `convert(R,P): R -> P`, the backwards is `convert(R,P) : R -> P`
 
@@ -634,20 +725,41 @@ Backward:
 Input is varying, with each rank holding a shard or distinct value.  The output
 places each rank's value into a disjoint position of a partial tensor (zeros
 elsewhere) so that summing across ranks reconstructs the stacked value.
+The rank of the tensor is increased.
 
 ```
-def convert_V_P(xs: List[f32[*shape]]) -> f32[mesh_axis_size, *shape]:
+def convert_V_P_spec(xs: List[f32[*shape]]) -> f32[mesh_axis_size, *shape]:
     return torch.stack(xs)
 
 Forward:
-[A]      +[[A], [0], [0]]
-[B]  =>  +[[0], [B], [0]]
-[C]      +[[0], [0], [C]]
+A      +[A, 0, 0]
+B  =>  +[0, B, 0]
+C      +[0, 0, C]
 
 Backward:
-[A]
-[B]  <=  [[A], [B], [C]]
-[C]
+A
+B  <=  [A, B, C]
+C
+```
+
+`convert_spec(S(i),P): S(i) -> P`, the backwards is `convert(R,S(i)): R -> S(i)`
+
+Like above, but the rank of the tensor is not reduced, and an arbitrary tensor
+dim can be specified to be scattered on.
+
+```
+def convert_S_P_spec(xs, i):
+    return torch.concat(xs, i)
+
+Forward (for i = 0):
+[A0, A1]      +[A0, A1, 0,  0,  0,  0 ]
+[B0, B1]  =>  +[0,  0,  B0, B1, 0,  0 ]
+[C0, C1]      +[0,  0,  0,  0,  C0, C1]
+
+Backward (for i = 0):
+[A0, A1]
+[B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
+[C0, C1]
 ```
 
 You cannot convert out of P: the only way to eliminate the pending reduction
