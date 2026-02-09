@@ -1314,9 +1314,11 @@ def einsum(equation: str, *operands: LTensor, out_partial_axes: set[str] | None 
     - If all operands are R -> output is R
     - If all operands are I -> output is I
     - If all operands are V -> output is V
-    - If operand is P -> only valid for linear operations on single P input
+    - If all operands are P -> output is P (but beware: this is only
+      mathematically correct for additive operations, not contractions)
     - Mixed R/V -> output is V
     - I cannot mix with other types
+    - P cannot mix with non-P types
 
     Args:
         equation: The einsum equation string
@@ -1778,7 +1780,7 @@ class _InvariantToReplicate(torch.autograd.Function):
     def backward(ctx, grad_out):
         # backward is all_reduce(I): P -> I
         pg = _get_mesh_axis_group(ctx.axis_name)
-        return dist.all_reduce(grad_out, op=dist.ReduceOp.SUM, group=pg, async_op=False), None
+        return funcol.all_reduce(grad_out, "sum", pg).wait(), None
 
 
 class _VaryingToPartial(torch.autograd.Function):
@@ -1828,6 +1830,8 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
         - reinterpret(R,V): R -> V, backward is reinterpret(V,P): V -> P
         - reinterpret(R,P): R -> P, backward is reinterpret(R,P): R -> P
         - reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I
+        - reinterpret(I,V): I -> V, composition of I -> R -> V
+        - reinterpret(I,P): I -> P, composition of I -> R -> P
         - reinterpret(V,P): V -> P, backward is reinterpret(R,V): R -> V
 
     Note: This API does not support S(i) for src/dst, because the restriction
@@ -1865,12 +1869,8 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
     else:
         raise ValueError(
             f"reinterpret({src}, {dst}) is not supported. "
-            "Cannot reinterpret from P or to V/R from V."
+            "Cannot reinterpret from P, and from V only V -> P is supported."
         )
-
-
-# Update the alias
-pcast = reinterpret
 
 
 # =============================================================================
