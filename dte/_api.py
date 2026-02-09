@@ -1169,7 +1169,72 @@ S = Shard  # S(i) creates a Shard with dim=i
 # Type aliases
 PerMeshAxisSpmdType = Union[PerMeshAxisLocalSpmdType, Shard]
 LocalSpmdType = dict[str, PerMeshAxisSpmdType]
-# GlobalSpmdType = LocalSpmdType + PartitionSpec (TODO: define PartitionSpec)
+# =============================================================================
+# PartitionSpec for Global SPMD
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class PartitionSpec:
+    """
+    A partition spec describes how tensor dimensions map to mesh axes.
+
+    Each element corresponds to a tensor dimension and specifies zero, one, or
+    multiple mesh axis names that shard that dimension. For example:
+        - PartitionSpec('tp', None) means dim 0 is sharded on 'tp', dim 1 is replicated
+        - PartitionSpec(('dp', 'tp'), None) means dim 0 is sharded on both 'dp' and 'tp'
+        - PartitionSpec() means fully replicated
+
+    When printed with a tensor shape, we use notation like f32[8@tp,16] to show
+    that dim 0 (size 8) is sharded on 'tp' while dim 1 (size 16) is replicated.
+    """
+
+    # Each element is None (replicated), a str (single mesh axis), or tuple of str (multiple axes)
+    spec: tuple[str | tuple[str, ...] | None, ...] = ()
+
+    def __init__(self, *args: str | tuple[str, ...] | None):
+        object.__setattr__(self, 'spec', args)
+
+    def __repr__(self):
+        if not self.spec:
+            return "PartitionSpec()"
+        parts = []
+        for s in self.spec:
+            if s is None:
+                parts.append("None")
+            elif isinstance(s, tuple):
+                parts.append(f"({', '.join(repr(x) for x in s)})")
+            else:
+                parts.append(repr(s))
+        return f"PartitionSpec({', '.join(parts)})"
+
+    def __len__(self):
+        return len(self.spec)
+
+    def __getitem__(self, idx):
+        return self.spec[idx]
+
+    def __iter__(self):
+        return iter(self.spec)
+
+    def get_mesh_axes(self) -> set[str]:
+        """Return all mesh axis names mentioned in this spec."""
+        axes = set()
+        for s in self.spec:
+            if s is None:
+                continue
+            elif isinstance(s, tuple):
+                axes.update(s)
+            else:
+                axes.add(s)
+        return axes
+
+    def is_replicated(self) -> bool:
+        """Return True if all dimensions are replicated (no sharding)."""
+        return all(s is None for s in self.spec)
+
+
+GlobalSpmdType = tuple[LocalSpmdType, PartitionSpec]
 
 # For backwards compatibility with string-based API
 ALLOWED_PCAST_STATES = {'partial', 'replicate', 'varying', 'invariant'}
@@ -1238,7 +1303,7 @@ class LTensor:
         return LTensor(self.data, new_types)
 
 
-def einsum(equation: str, *operands: LTensor) -> LTensor:
+def einsum(equation: str, *operands: LTensor, out_partial_axes: set[str] | None = None) -> LTensor:
     """
     Perform einsum with local SPMD type checking.
 
@@ -1256,10 +1321,18 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
     Args:
         equation: The einsum equation string
         *operands: LTensor operands
+        out_partial_axes: Optional set of mesh axis names. When specified, the
+            output is reinterpreted as partial on each of these axes. This is
+            used in global SPMD to indicate that a contracted dimension was
+            sharded and the result needs a pending reduction. In local SPMD,
+            this does the local operation then reinterpret(V,P) for each axis.
 
     Returns:
         LTensor with the result and inferred types
     """
+    if out_partial_axes is None:
+        out_partial_axes = set()
+
     # Extract underlying tensors
     tensors = [op.data for op in operands]
 
@@ -1267,6 +1340,7 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
     all_axes = set()
     for op in operands:
         all_axes.update(op.types.keys())
+    all_axes.update(out_partial_axes)
 
     # Type check and infer output types
     output_types = {}
@@ -1278,6 +1352,9 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
                 axis_types.append(typ)
 
         if not axis_types:
+            # Axis only in out_partial_axes, treat as partial output
+            if axis in out_partial_axes:
+                output_types[axis] = P
             continue
 
         # Check type compatibility and infer output type
@@ -1286,10 +1363,10 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
 
         if len(type_classes) == 1:
             # All same type
-            output_types[axis] = axis_types[0]
+            inferred_type = axis_types[0]
         elif type_classes == {Replicate, Varying}:
             # Mixed replicate/varying -> varying
-            output_types[axis] = V
+            inferred_type = V
         elif Invariant in type_classes and len(type_classes) > 1:
             raise TypeError(
                 f"Invariant type on axis '{axis}' cannot mix with other types. "
@@ -1304,11 +1381,29 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
                     f"Partial type on axis '{axis}' can only combine with partial. "
                     f"Found types: {axis_types}"
                 )
-            output_types[axis] = P
+            inferred_type = P
         else:
             raise TypeError(
                 f"Incompatible types on axis '{axis}': {axis_types}"
             )
+
+        # Apply out_partial_axes: reinterpret V as P
+        if axis in out_partial_axes:
+            if inferred_type is V or isinstance(inferred_type, Shard):
+                output_types[axis] = P
+            elif inferred_type is R:
+                # R with out_partial becomes P (via reinterpret(R,P))
+                output_types[axis] = P
+            elif inferred_type is P:
+                # Already partial
+                output_types[axis] = P
+            else:
+                raise TypeError(
+                    f"Cannot mark axis '{axis}' as partial with type {inferred_type}. "
+                    f"out_partial_axes is only valid for V, S(i), R, or P types."
+                )
+        else:
+            output_types[axis] = inferred_type
 
     # Perform the einsum
     result = torch.einsum(equation, *tensors)
@@ -2037,6 +2132,108 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
             f"convert({src}, {dst}) is not supported. "
             "Cannot convert out of P."
         )
+
+
+# =============================================================================
+# redistribute: semantics-preserving type change with comms
+# =============================================================================
+
+
+def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
+    """
+    Semantics-preserving conversion between local SPMD types, allowing comms.
+
+    Unlike convert (which is no-comm), redistribute will perform the necessary
+    collective communication to change from one type to another while preserving
+    the semantic value of the tensor.
+
+    Args:
+        x: Input tensor
+        axis_name: The mesh axis to operate on
+        src: Source local SPMD type
+        dst: Target local SPMD type
+        dim: Tensor dimension for shard operations (default: 0).
+             When src or dst is S(i), the dim from S(i) is used.
+
+    Routes to:
+        redistribute(S(i),R)    -> all_gather(S(i),R)
+        redistribute(S(i),I)    -> all_gather(S(i),I)
+        redistribute(P,R)       -> all_reduce(P,R)
+        redistribute(P,I)       -> all_reduce(P,I)
+        redistribute(P,S(i))    -> reduce_scatter(P,S(i))
+        redistribute(S(i),S(j)) -> all_to_all(S(i),S(j))
+        redistribute(V,R)       -> all_gather(V,R)
+        redistribute(V,I)       -> all_gather(V,I)
+        redistribute(P,V)       -> reduce_scatter(P,V)
+        redistribute(V,V)       -> all_to_all(V,V)
+
+    For conversions that don't require comms (R<->I, R->V, R->P, I->V, I->P, V->P),
+    this function delegates to convert or reinterpret as appropriate.
+    """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    # Extract dim from Shard if present
+    if isinstance(src, Shard):
+        dim = src.dim
+    if isinstance(dst, Shard):
+        dim = dst.dim
+
+    # Normalize to base types for dispatch
+    src_is_shard = isinstance(src, Shard)
+    dst_is_shard = isinstance(dst, Shard)
+    src_base = V if src_is_shard else src
+    dst_base = V if dst_is_shard else dst
+
+    if src_base is dst_base:
+        if src_is_shard and dst_is_shard and src.dim != dst.dim:
+            # S(i) -> S(j): need all_to_all
+            return all_to_all(x, axis_name, src=src, dst=dst, split_dim=src.dim, concat_dim=dst.dim)
+        return x  # no-op
+
+    # Varying/Shard -> Replicate: all_gather
+    if src_base is V and dst_base is R:
+        return all_gather(x, axis_name, src=src, dst=R, gather_dim=dim)
+
+    # Varying/Shard -> Invariant: all_gather
+    if src_base is V and dst_base is I:
+        return all_gather(x, axis_name, src=src, dst=I, gather_dim=dim)
+
+    # Partial -> Replicate: all_reduce
+    if src_base is P and dst_base is R:
+        return all_reduce(x, axis_name, src=P, dst=R)
+
+    # Partial -> Invariant: all_reduce
+    if src_base is P and dst_base is I:
+        return all_reduce(x, axis_name, src=P, dst=I)
+
+    # Partial -> Varying/Shard: reduce_scatter
+    if src_base is P and dst_base is V:
+        return reduce_scatter(x, axis_name, src=P, dst=dst, scatter_dim=dim)
+
+    # Varying -> Varying (but different, e.g. for all_to_all with different dims)
+    # This case is handled above when both are V
+
+    # For non-comm conversions, delegate to convert
+    # R -> I, I -> R, R -> V, R -> P, I -> V, I -> P, V -> P
+    if src_base is R and dst_base is I:
+        return convert(x, axis_name, src=R, dst=I)
+    if src_base is I and dst_base is R:
+        return convert(x, axis_name, src=I, dst=R)
+    if src_base is R and dst_base is V:
+        return convert(x, axis_name, src=R, dst=dst, dim=dim)
+    if src_base is R and dst_base is P:
+        return convert(x, axis_name, src=R, dst=P)
+    if src_base is I and dst_base is V:
+        return convert(x, axis_name, src=I, dst=dst, dim=dim)
+    if src_base is I and dst_base is P:
+        return convert(x, axis_name, src=I, dst=P)
+    if src_base is V and dst_base is P:
+        return convert(x, axis_name, src=src, dst=P, dim=dim)
+
+    raise ValueError(
+        f"redistribute({src}, {dst}) is not supported."
+    )
 
 
 """
