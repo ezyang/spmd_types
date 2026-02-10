@@ -807,6 +807,7 @@ vice versa.  Also remember that the backwards of a backwards is its forwards,
 so you can read the table left-to-right and right-to-left (but for ease of
 reading, we've included the flipped rows explicitly).
 
+```
 Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
 R -> I      reinterpret(R,I)        I -> P      convert(I,P)
@@ -825,6 +826,7 @@ V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
+```
 
 # Global SPMD
 
