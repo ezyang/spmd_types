@@ -130,8 +130,8 @@ operand first.
 
 TODO: Prove that these rules are correct
 
-For comms ops, this type system requires three changes to the classical
-distributed APIs:
+For comms ops, this type system requires augmenting the classical distributed
+APIs in three ways:
 
 * The preexisting comms APIs are augmented with src/dst arguments when needed, to
   disambiguate the local SPMD type of their input/outputs.  The mechanical
@@ -1049,4 +1049,13 @@ this right now.
 
 TODO: need to worry about intermixed PG / mesh axis names
 
+TODO: Need to worry about flattened PGs.  In particular, we may need to do a
+reduction on multiple axes at the same time in local SPMD.  The classic way
+this will be done is just by running a collective directly with the flattened
+PG.  But then we need to be able to relate the flattened PG to the unflattened
+ones to handle typechecking in this case?
+
 TODO: worry about runtime cost of setting types inside the function body
+
+TODO: Need api for all reduce with avg (semantically a sum plus divide, but we
+need the fused version)

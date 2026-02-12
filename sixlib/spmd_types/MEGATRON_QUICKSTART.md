@@ -1,0 +1,168 @@
+This quick start guide is to help developers working on Megatron-derived
+training frameworks quickly adapt their code to use `spmd_types`.  It will
+only cover local SPMD types.  For a more theoretical and complete discussion of
+the design, see `DESIGN.md`.
+
+# Why use this?
+
+Have you ever:
+
+* Forgotten to call `copy_to_tensor_model_parallel_region` when you should
+  have?
+
+* Accidentally all-reduced a tensor too many times because you forgot that
+  you had already reduced it?
+
+* Forgotten that you had a pending reduction and used a non-linear function on
+  a tensor without all-reducing first?
+
+* Gotten annoyed at how slow E2E testing that a model gives the same results
+  with no results compared to with DP+CP+TP, because you can only test
+  numerics in a multi-process setup?
+
+`spmd_types` provides an optional type system that keeps track of whether or
+not your data (and gradients) are varying or have pending reductions, which
+are able to catch all of these bugs without needing to do any numerics testing
+at all.  Annotate your module inputs and parameters with their SPMD types, and
+then run your code with type checking on to verify that you haven't made
+mistakes that would result in incorrect gradients.
+
+# Types
+
+Every tensor has a local SPMD type.  You can set it with `assert_local_type`,
+and when typechecking is enabled using the `SpmdTypeMode()` context manager,
+we will propagate them through PyTorch functions.
+
+```
+import sixlib.spmd_types as spmd
+
+t = torch.ones(20)
+print(spmd.has_local_type(t))  # False, no type specified yet
+spmd.assert_local_type(t, {'tp': spmd.I})
+print(spmd.get_local_type(t))  # {'tp': spmd.I}
+with spmd.SpmdTypeMode():
+    print(spmd.get_local_type(t * 4))  # {'tp': spmd.I}
+spmd.assert_local_type(t, {'tp': spmd.R})  # Error, because type is inconsistent!
+```
+
+A local SPMD type is a dictionary from string mesh axes (or raw process groups, if
+you are not using PyTorch DeviceMesh) to a per-axis local type: Replicate (R),
+Invariant (I), Varying (V) or Partial (P).  These types describe how the
+tensor is distributed over the mesh axis:
+
+* Varying means you have differing values across the axis (e.g., the tensor is
+  sharded across that axis).  The gradient of Varying is Varying.
+
+* Partial means you have a pending reduction across the axis (e.g., you did a
+  contraction on a sharded dimension).  The gradient of Partial is Replicate.
+
+* Replicate and Invariant mean you have the same values across the axis (e.g.,
+  a parameter, or a non-sharded quantity).  Replicate and Invariant differ in
+  their backwards behavior: the gradients of a Replicate tensor are Partial,
+  while gradients of an Invariant tensor are Invariant.  (How can you figure
+  out which one to use? More on this shortly.)
+
+The local types of gradients are summarized by this handy table:
+
+```
+Forward     Backward
+----------------------
+Replicate   Partial
+Partial     Replicate
+Invariant   Invariant
+Varying     Varying
+```
+
+# Operators
+
+`spmd_types` provides its own versions of distributed collectives and local
+operations which interact with the types in a non-trivial way.  An easy way to
+get started is to see [which function from Megatron](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/mappings.py) you are using, and then use the corresponding function
+from our API:
+
+```
+Megatron function                                       spmd_types function
+---------------------------------------------------------------------------------------------------------
+copy_to_tensor_model_parallel_region(x)                 spmd.reinterpret   (x, tp, src=spmd.I,      dst=spmd.R)
+reduce_from_tensor_model_parallel_region(x)             spmd.all_reduce    (x, tp,                  dst=spmd.I)
+scatter_to_tensor_model_parallel_region(x)              spmd.reduce_scatter(x, tp,                  dst=spmd.S(-1))
+gather_from_tensor_model_parallel_region(x)             spmd.all_gather    (x, tp, src=spmd.S(-1),  dst=spmd.R)
+scatter_to_sequence_parallel_region(x)                  spmd.convert       (x, tp, src=spmd.I,      dst=spmd.S(0))
+gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True)
+                                                        spmd.all_gather    (x, tp, src=spmd.S(0),   dst=spmd.R)
+gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=False)
+                                                        spmd.all_gather    (x, tp, src=spmd.S(0),   dst=spmd.I)
+reduce_scatter_to_sequence_parallel_region(x)           spmd.reduce_scatter(x, tp,                  dst=spmd.S(0))
+all_gather_last_dim_from_tensor_parallel_region(x)      spmd.all_gather    (x, tp, src=spmd.S(-1),  dst=spmd.R)
+reduce_scatter_last_dim_to_tensor_parallel_region(x)    spmd.reduce_scatter(x, tp,                  dst=spmd.S(-1))
+all_to_all(group, x)                                    spmd.all_to_all    (x, group)
+```
+
+Instead of having an API for each variation of forward-backward combination, we
+instead provide a unified API with a function per collective.  We distinguish
+between which autograd function is desired via the new src/dst arguments to our
+collectives, which tell you what the input and output local spmd type of the
+function is on the particular specified mesh axis (tp, by default, for the
+Megatron APIs).  Some other things of note:
+
+* We omit `src` on the reduction APIs, because these only ever take Partial
+  (`spmd.P`) as input
+
+* If you pass `Shard(i)` (abbreviated as `S(i)`) to src/dst, this means that,
+  not only is the tensor varying over a mesh axis, but it is semantically
+  (according to global SPMD) sharded on tensor axis i, and so we wish to do a
+  concat/split on that particular tensor dimension.  If you pass Varying,
+  instead, we will do a stack/unbind on dimension 0.
+
+* `spmd.reinterpret` and `spmd.convert` are not collectives, but instead
+  type "conversion" functions that change the local SPMD type of their tensor.
+  A `reinterpret` is guaranteed to do no work (it keeps the local data exactly
+  exactly as is, unchanged), while a `convert` is guaranteed to be global SPMD
+  semantics preserving (e.g., a tensor that sharded on tensor dim 0, is
+  semantically equivalent to the full tensor you get by concatenating all the
+  shards on dim 0).  TODO: maybe Megatron style alias (copy/scatter) might be
+  intuitive for people; unfortunately, scatter could also denote a comms, so
+  it's not a great name.
+
+Although it can be somewhat counter-intuitive to directly deal with these new
+functions (in particular, if you forked Megatron-LM, we suggest you keep the old
+functions and replace their implementations with calls to our API), the explicit
+types in the new API are important for understanding the local SPMD types of
+your tensors.  Assuming that your original training code wasn't buggy, if you
+see a call to `reduce_from_tensor_model_parallel_region`, you know that your
+output tensor is invariant--and more importantly, you know that its gradient is
+invariant (not partial!)
+
+# Advice about Invariant vs Replicate
+
+Although Megatron contains many functions for working with the Invariant type,
+it is actually not recommended: in general, you want to have Replicate instead
+in your forwards, so that you can delay all-reduce as long as possible, having
+Invariant only on parameters.  However, we recommend porting an existing
+training codebase as-is, applying types accurately for what it does at the
+moment, before considering refactors that take advantage of the type checking
+to verify correctness.
+
+# Forwards/Backwards
+
+Here is a table that summarizes the forward-backward relationships between the
+operators in our API (abbreviating the function calls to only include src/dst
+when it would disambiguate between multiple different operators).  We've
+separated the less efficient invariant conversions from the rest.
+
+```
+Fwd Type    Forward                 Bwd Type    Backward
+----------------------------------------------------------------------------
+R -> V      convert(R,V)            V -> P      convert(V,P)
+R -> P      convert(R,P)            R -> P      convert(R,P)
+I -> R      reinterpret(I,R)        P -> I      all_reduce(I)
+V -> R      all_gather(R)           P -> V      reduce_scatter()
+V -> V      all_to_all()            V -> V      all_to_all()
+P -> R      all_reduce(R)           P -> R      all_reduce(R)
+P -> V      reduce_scatter()        V -> R      all_gather(R)
+----------------------------------------------------------------------------
+P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
+V -> I      all_gather(I)           I -> V      convert(I,V)
+I -> V      convert(I,V)            V -> I      all_gather(I)
+----------------------------------------------------------------------------
+```

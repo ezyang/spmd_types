@@ -34,9 +34,9 @@ from sixlib.spmd_types import (
 )
 from sixlib.spmd_types._checker import (
     _infer_mul_output_type_for_axis,
-    get_spmd_type,
+    assert_local_type,
+    get_axis_local_type,
     infer_output_type_for_axis,
-    set_spmd_types,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (
@@ -124,7 +124,7 @@ class LocalTensorTestCase(unittest.TestCase):
             result = self.mode.rank_map(lambda r: base.clone())
         else:
             result = self.mode.rank_map(lambda r: torch.randn(shape) + r)
-        set_spmd_types(result, {axis: typ})
+        assert_local_type(result, {axis: typ})
         return result
 
     def _assert_all_ranks_equal(self, lt, msg=""):
@@ -227,7 +227,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
         # Backward check: verify backward returns valid gradient
         grad_out = self._generate_inputs((4,), "tp", P)
@@ -246,7 +246,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
         # Backward check: verify backward returns valid gradient
         grad_out = self._generate_inputs((4,), "tp", I)
@@ -282,7 +282,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
         # Check in-place: returned tensor shares storage with input
         for r in range(self.WORLD_SIZE):
@@ -308,7 +308,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
         # Check in-place: returned tensor shares storage with input
         for r in range(self.WORLD_SIZE):
@@ -320,11 +320,11 @@ class TestAllReduce(LocalTensorTestCase):
 
     def test_all_reduce_preserves_other_axes(self):
         """all_reduce preserves SPMD types on other mesh axes."""
-        x = self._generate_inputs((4,), "tp", P)
-        set_spmd_types(x, {"tp": P, "dp": R})
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        assert_local_type(x, {"tp": P, "dp": R})
         result = all_reduce(x, "tp", src=P, dst=R)
-        self.assertIs(get_spmd_type(result, "tp"), R)
-        self.assertIs(get_spmd_type(result, "dp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "dp"), R)
 
     def test_all_reduce_type_mismatch(self):
         """all_reduce raises SpmdTypeError when input type doesn't match src."""
@@ -340,6 +340,7 @@ class TestAllGather(LocalTensorTestCase):
         """all_gather(R): V -> R, gathers shards from all ranks."""
         # Create varying input - different per rank
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        assert_local_type(x, {"tp": V})
 
         result = all_gather(x, "tp", src=V, dst=R)
 
@@ -348,11 +349,12 @@ class TestAllGather(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_all_gather_v_to_i(self):
         """all_gather(I): V -> I, gathers shards from all ranks."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
+        assert_local_type(x, {"tp": V})
 
         result = all_gather(x, "tp", src=V, dst=I)
 
@@ -360,13 +362,13 @@ class TestAllGather(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
     def test_all_gather_shard_to_r(self):
         """all_gather(R): S(i) -> R, gathers shards from all ranks."""
         # Create sharded input on dim 0
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
-        set_spmd_types(x, {"tp": S(0)})
+        assert_local_type(x, {"tp": V})
 
         result = all_gather(x, "tp", src=S(0), dst=R)
 
@@ -375,7 +377,7 @@ class TestAllGather(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_all_gather_invalid_src(self):
         """all_gather only accepts V or S(i) src."""
@@ -406,7 +408,7 @@ class TestReduceScatter(LocalTensorTestCase):
             ).reshape(self.WORLD_SIZE, chunk_size)
             + r
         )
-        set_spmd_types(x, {"tp": P})
+        assert_local_type(x, {"tp": P})
 
         result = reduce_scatter(x, "tp", src=P, dst=V, scatter_dim=0)
 
@@ -418,7 +420,7 @@ class TestReduceScatter(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_reduce_scatter_to_shard(self):
         """reduce_scatter: P -> S(i), reduces and scatters."""
@@ -426,7 +428,7 @@ class TestReduceScatter(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
-        set_spmd_types(x, {"tp": P})
+        assert_local_type(x, {"tp": P})
 
         result = reduce_scatter(x, "tp", src=P, dst=S(0), scatter_dim=1)
 
@@ -439,7 +441,7 @@ class TestReduceScatter(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertEqual(get_spmd_type(result, "tp"), S(0))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_reduce_scatter_invalid_src(self):
         """reduce_scatter only accepts P (or V, which is auto-reinterpreted) src."""
@@ -466,6 +468,7 @@ class TestAllToAll(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)])
         )
+        assert_local_type(x, {"tp": V})
 
         result = all_to_all(x, "tp", src=V, dst=V, split_dim=0, concat_dim=0)
 
@@ -475,7 +478,7 @@ class TestAllToAll(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_all_to_all_shard_to_shard(self):
         """all_to_all: S(i) -> S(j), resharding between dimensions."""
@@ -483,7 +486,7 @@ class TestAllToAll(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
         )
-        set_spmd_types(x, {"tp": S(0)})
+        assert_local_type(x, {"tp": V})
 
         result = all_to_all(x, "tp", src=S(0), dst=S(1), split_dim=1, concat_dim=0)
 
@@ -491,7 +494,7 @@ class TestAllToAll(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 1)
             self.assertEqual(result._local_tensors[r].shape[1], 6)
-        self.assertEqual(get_spmd_type(result, "tp"), S(1))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_all_to_all_invalid_src(self):
         """all_to_all only accepts V or S(i) src."""
@@ -521,7 +524,7 @@ class TestReinterpret(LocalTensorTestCase):
         # Forward is no-op, values unchanged
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
         # Backward check
         grad_out = self._generate_inputs((4,), "tp", V)
@@ -536,7 +539,7 @@ class TestReinterpret(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
         # Backward check
         grad_out = self._generate_inputs((4,), "tp", I)
@@ -551,7 +554,7 @@ class TestReinterpret(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
         # Backward check
         grad_out = self._generate_inputs((4,), "tp", R)
@@ -566,7 +569,7 @@ class TestReinterpret(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
         # Backward check
         grad_out = self._generate_inputs((4,), "tp", P)
@@ -581,7 +584,7 @@ class TestReinterpret(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
         # Backward check
         grad_out = self._generate_inputs((4,), "tp", R)
@@ -593,7 +596,7 @@ class TestReinterpret(LocalTensorTestCase):
         result = reinterpret(x, "tp", src=R, dst=R)
         # Should return same tensor
         self.assertIs(result, x)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_reinterpret_shard_rejected(self):
         """reinterpret rejects Shard types."""
@@ -618,7 +621,7 @@ class TestConvert(LocalTensorTestCase):
         # Create replicated input shaped for stack semantics
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": R})
+        assert_local_type(x, {"tp": R})
 
         result = convert(x, "tp", src=R, dst=V, dim=0)
 
@@ -628,7 +631,7 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
         # Backward check
         grad_out = self._generate_inputs((2,), "tp", V)
@@ -640,7 +643,7 @@ class TestConvert(LocalTensorTestCase):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": R})
+        assert_local_type(x, {"tp": R})
 
         result = convert(x, "tp", src=R, dst=S(0), dim=0)
 
@@ -649,13 +652,13 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertEqual(get_spmd_type(result, "tp"), S(0))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_convert_i_to_v(self):
         """convert(I,V): I -> V, slices to local portion. Tests forward and backward."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": I})
+        assert_local_type(x, {"tp": I})
 
         result = convert(x, "tp", src=I, dst=V, dim=0)
 
@@ -664,7 +667,7 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
         # Backward check
         grad_out = self._generate_inputs((2,), "tp", V)
@@ -676,7 +679,7 @@ class TestConvert(LocalTensorTestCase):
         """convert(I,S(i)): I -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": I})
+        assert_local_type(x, {"tp": I})
 
         result = convert(x, "tp", src=I, dst=S(0), dim=0)
 
@@ -685,13 +688,13 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertEqual(get_spmd_type(result, "tp"), S(0))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_convert_r_to_p(self):
         """convert(R,P): R -> P, zeros out non-rank-0. Tests forward and backward."""
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": R})
+        assert_local_type(x, {"tp": R})
 
         result = convert(x, "tp", src=R, dst=P)
 
@@ -703,7 +706,7 @@ class TestConvert(LocalTensorTestCase):
                 torch.zeros_like(base),
                 msg=f"rank {r} should be zeros",
             )
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
         # Backward check
         grad_out = self._generate_inputs((3,), "tp", R)
@@ -713,7 +716,7 @@ class TestConvert(LocalTensorTestCase):
         """convert(I,P): I -> P, zeros out non-rank-0. Tests forward and backward."""
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": I})
+        assert_local_type(x, {"tp": I})
 
         result = convert(x, "tp", src=I, dst=P)
 
@@ -724,7 +727,7 @@ class TestConvert(LocalTensorTestCase):
                 torch.zeros_like(base),
                 msg=f"rank {r} should be zeros",
             )
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
         # Backward check
         grad_out = self._generate_inputs((3,), "tp", I)
@@ -734,6 +737,7 @@ class TestConvert(LocalTensorTestCase):
         """convert(V,P): V -> P, places data in disjoint positions. Tests forward and backward."""
         # Each rank has [r]
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        assert_local_type(x, {"tp": V})
 
         result = convert(x, "tp", src=V, dst=P, dim=0)
 
@@ -744,7 +748,7 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
         # Backward check
         grad_out = self._generate_inputs((self.WORLD_SIZE,), "tp", R)
@@ -755,7 +759,7 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_shard_to_p(self):
         """convert(S(i),P): S(i) -> P, places data in disjoint positions."""
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
-        set_spmd_types(x, {"tp": S(0)})
+        assert_local_type(x, {"tp": V})
 
         result = convert(x, "tp", src=S(0), dst=P, dim=0)
 
@@ -765,14 +769,14 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
     def test_convert_same_type_noop(self):
         """convert with same src and dst is identity."""
         x = self._generate_inputs((4,), "tp", R)
         result = convert(x, "tp", src=R, dst=R)
         self.assertIs(result, x)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_convert_r_to_i_same_as_reinterpret(self):
         """convert(R,I) should work like reinterpret(R,I)."""
@@ -783,7 +787,7 @@ class TestConvert(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
     def test_convert_i_to_r_same_as_reinterpret(self):
         """convert(I,R) should work like reinterpret(I,R)."""
@@ -794,7 +798,7 @@ class TestConvert(LocalTensorTestCase):
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_convert_from_partial_error(self):
         """convert cannot convert from partial."""
@@ -832,7 +836,7 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_reinterpret_i_to_p(self):
         """reinterpret(I,P): I -> R -> P composition, no-op forward."""
@@ -844,7 +848,7 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
 
 class TestAllGatherMultiDim(LocalTensorTestCase):
@@ -854,7 +858,7 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         """all_gather with S(1) concatenates on dim 1."""
         # Each rank has shape (2, 1)
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
-        set_spmd_types(x, {"tp": S(1)})
+        assert_local_type(x, {"tp": V})
 
         result = all_gather(x, "tp", src=S(1), dst=R)
 
@@ -863,12 +867,13 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_all_gather_2d_tensors(self):
         """all_gather with 2D varying tensors."""
         # Each rank has a 2x2 matrix
         x = self.mode.rank_map(lambda r: torch.full((2, 2), float(r)))
+        assert_local_type(x, {"tp": V})
 
         result = all_gather(x, "tp", src=V, dst=R)
 
@@ -878,7 +883,7 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
 
 class TestAllToAllMultiDim(LocalTensorTestCase):
@@ -890,6 +895,7 @@ class TestAllToAllMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
         )
+        assert_local_type(x, {"tp": V})
 
         result = all_to_all(x, "tp", split_dim=0, concat_dim=0)
 
@@ -1026,6 +1032,7 @@ class TestRedistribute(LocalTensorTestCase):
     def test_redistribute_v_to_r(self):
         """redistribute(V,R) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        assert_local_type(x, {"tp": V})
 
         result = redistribute(x, "tp", src=V, dst=R, dim=0)
 
@@ -1033,11 +1040,12 @@ class TestRedistribute(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_redistribute_v_to_i(self):
         """redistribute(V,I) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        assert_local_type(x, {"tp": V})
 
         result = redistribute(x, "tp", src=V, dst=I, dim=0)
 
@@ -1045,7 +1053,7 @@ class TestRedistribute(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_spmd_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
     def test_redistribute_p_to_r(self):
         """redistribute(P,R) uses all_reduce."""
@@ -1057,7 +1065,7 @@ class TestRedistribute(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_redistribute_p_to_s(self):
         """redistribute(P,S(0)) uses reduce_scatter."""
@@ -1065,7 +1073,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
-        set_spmd_types(x, {"tp": P})
+        assert_local_type(x, {"tp": P})
 
         result = redistribute(x, "tp", src=P, dst=S(0))
 
@@ -1078,13 +1086,13 @@ class TestRedistribute(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertEqual(get_spmd_type(result, "tp"), S(0))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_redistribute_r_to_v_uses_convert(self):
         """redistribute(R,V) delegates to convert."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": R})
+        assert_local_type(x, {"tp": R})
 
         result = redistribute(x, "tp", src=R, dst=V, dim=0)
 
@@ -1093,34 +1101,34 @@ class TestRedistribute(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_spmd_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_redistribute_r_to_p_uses_convert(self):
         """redistribute(R,P) delegates to convert."""
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
-        set_spmd_types(x, {"tp": R})
+        assert_local_type(x, {"tp": R})
 
         result = redistribute(x, "tp", src=R, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], torch.zeros_like(base))
-        self.assertIs(get_spmd_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
 
     def test_redistribute_same_type_noop(self):
         """redistribute with same src and dst is identity."""
         x = self._generate_inputs((4,), "tp", R)
         result = redistribute(x, "tp", src=R, dst=R)
         self.assertIs(result, x)
-        self.assertIs(get_spmd_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_redistribute_shard_to_shard_uses_all_to_all(self):
         """redistribute(S(i),S(j)) with different dims uses all_to_all."""
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
         )
-        set_spmd_types(x, {"tp": S(0)})
+        assert_local_type(x, {"tp": V})
 
         result = redistribute(x, "tp", src=S(0), dst=S(1), dim=0)
 
@@ -1128,7 +1136,98 @@ class TestRedistribute(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 1)
             self.assertEqual(result._local_tensors[r].shape[1], 6)
-        self.assertEqual(get_spmd_type(result, "tp"), S(1))
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+
+class TestLinearTypePropagation(LocalTensorTestCase):
+    """Test type propagation through F.linear (matmul + optional bias)."""
+
+    def test_linear_r_v_gives_v(self):
+        """F.linear with R weight and V input should give V output, not R.
+
+        Regression: V is canonicalized to {} so its type was silently dropped
+        during per-axis type collection, making the output R instead of V.
+        """
+        inp = self._generate_inputs((2, 4), "tp", V)
+        weight = self._generate_inputs((3, 4), "tp", R)
+        result = torch.nn.functional.linear(inp, weight)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_matmul_r_v_gives_v(self):
+        """torch.matmul with R and V should give V output."""
+        x = self._generate_inputs((2, 4), "tp", R)
+        y = self._generate_inputs((4, 3), "tp", V)
+        result = torch.matmul(x, y)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_add_r_v_gives_v(self):
+        """torch.add with R and V should give V output."""
+        x = self._generate_inputs((4,), "tp", R)
+        y = self._generate_inputs((4,), "tp", V)
+        result = torch.add(x, y)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+
+class TestStrictMode(LocalTensorTestCase):
+    """Test SpmdTypeMode strict mode which errors on unannotated tensors."""
+
+    def setUp(self):
+        """Enter LocalTensorMode and strict SpmdTypeMode for each test."""
+        self.mode = LocalTensorMode(self.WORLD_SIZE)
+        self.mode.__enter__()
+        self.spmd_mode = SpmdTypeMode(strict=True)
+        self.spmd_mode.__enter__()
+
+    def test_strict_mixed_annotated_unannotated_fails(self):
+        """Strict mode raises when one operand is annotated and the other is not."""
+        x = self._generate_inputs((4,), "tp", R)
+        y = self.mode.rank_map(lambda r: torch.randn(4))
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, y)
+
+    def test_strict_mixed_cat_fails(self):
+        """Strict mode catches mixed typed/untyped tensors inside lists (e.g. torch.cat)."""
+        x = self._generate_inputs((4,), "tp", R)
+        y = self.mode.rank_map(lambda r: torch.randn(4))
+        with self.assertRaises(SpmdTypeError):
+            torch.cat([x, y])
+
+    def test_strict_all_annotated_passes(self):
+        """Strict mode allows operations when all tensors are annotated."""
+        x = self._generate_inputs((4,), "tp", R)
+        y = self._generate_inputs((4,), "tp", R)
+        result = torch.add(x, y)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
+
+    def test_strict_all_v_annotated_mixed_with_unannotated_fails(self):
+        """Strict mode catches all-V tensor (canonicalizes to {}) mixed with unannotated."""
+        x = self._generate_inputs((4,), "tp", V)
+        # x has _spmd_types attr (set to {} after canonicalization)
+        y = self.mode.rank_map(lambda r: torch.randn(4))
+        # y has no _spmd_types attr at all
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, y)
+
+    def test_strict_all_unannotated_passes(self):
+        """Strict mode allows operations when no tensors are annotated (no SPMD tracking)."""
+        x = self.mode.rank_map(lambda r: torch.randn(4))
+        y = self.mode.rank_map(lambda r: torch.randn(4))
+        result = torch.add(x, y)  # Should not raise — no typed tensors
+        self.assertEqual(get_axis_local_type(result, "tp"), V)
+
+    def test_nonstrict_mixed_passes(self):
+        """Non-strict mode (default) allows mixing annotated and unannotated tensors."""
+        self.spmd_mode.__exit__(None, None, None)
+        nonstrict = SpmdTypeMode(strict=False)
+        nonstrict.__enter__()
+        try:
+            x = self._generate_inputs((4,), "tp", R)
+            y = self.mode.rank_map(lambda r: torch.randn(4))
+            result = torch.add(x, y)  # Should not raise
+            self.assertIs(get_axis_local_type(result, "tp"), R)
+        finally:
+            nonstrict.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
 
 
 class TestTypeErrorMessages(expecttest.TestCase):
@@ -1148,7 +1247,7 @@ class TestTypeErrorMessages(expecttest.TestCase):
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R]
 Are you missing a collective? e.g.,
-  reinterpret(tensor, axis, src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)""",
+  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
     def test_general_I_V(self):
@@ -1160,8 +1259,8 @@ Are you missing a collective? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, V]
 Are you missing a collective? e.g.,
-  reinterpret(tensor, axis, src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
-  reinterpret(tensor, axis, src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
+  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
     def test_general_I_P(self):
@@ -1173,8 +1272,8 @@ Are you missing a collective? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, P]
 Are you missing a collective? e.g.,
-  convert(tensor, axis, src=I, dst=P) on the Invariant operand (zeros non-rank-0 in forward, no-op backward)
-  all_reduce(tensor, axis, src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
+  convert(tensor, 'tp', src=I, dst=P) on the Invariant operand (zeros non-rank-0 in forward, no-op backward)
+  all_reduce(tensor, 'tp', src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
         )
 
     def test_general_P_R(self):
@@ -1186,8 +1285,8 @@ Are you missing a collective? e.g.,
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [P, R]
 Are you missing a collective? e.g.,
-  all_reduce(tensor, axis, src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)
-  convert(tensor, axis, src=R, dst=P) on the Replicate operand (zeros non-rank-0 in forward, zeros non-rank-0 in backward)""",
+  all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)
+  convert(tensor, 'tp', src=R, dst=P) on the Replicate operand (zeros non-rank-0 in forward, zeros non-rank-0 in backward)""",
         )
 
     def test_general_P_V(self):
@@ -1199,7 +1298,7 @@ Are you missing a collective? e.g.,
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [P, V]
 Are you missing a collective? e.g.,
-  all_reduce(tensor, axis, src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
+  all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
     def test_general_R_P_V(self):
@@ -1211,7 +1310,7 @@ Are you missing a collective? e.g.,
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [R, P, V]
 Are you missing a collective? e.g.,
-  all_reduce(tensor, axis, src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
+  all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
     def test_general_I_R_V(self):
@@ -1223,8 +1322,8 @@ Are you missing a collective? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R, V]
 Are you missing a collective? e.g.,
-  reinterpret(tensor, axis, src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
-  reinterpret(tensor, axis, src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
+  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
     def test_mul_P_P(self):
@@ -1236,7 +1335,7 @@ Are you missing a collective? e.g.,
             """\
 Partial * Partial on axis 'tp' is forbidden (not linear). Found types: [P, P]
 Are you missing a collective? e.g.,
-  all_reduce(tensor, axis, src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
+  all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
     def test_mul_P_V(self):
@@ -1248,7 +1347,7 @@ Are you missing a collective? e.g.,
             """\
 Partial type on axis 'tp' can only multiply with Replicate. Found types: [P, V]
 Are you missing a collective? e.g.,
-  all_reduce(tensor, axis, src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
+  all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
     def test_mul_P_I(self):
@@ -1260,9 +1359,19 @@ Are you missing a collective? e.g.,
             """\
 Partial type on axis 'tp' can only multiply with Replicate. Found types: [P, I]
 Are you missing a collective? e.g.,
-  reinterpret(tensor, axis, src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
-  all_reduce(tensor, axis, src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
+  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  all_reduce(tensor, 'tp', src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
         )
+
+
+class TestRejectsShard(unittest.TestCase):
+    """Test that type-setting APIs reject Shard types (only local SPMD types allowed)."""
+
+    def test_assert_local_type_rejects_shard(self):
+        """assert_local_type should reject S(i) since it's not a PerMeshAxisLocalSpmdType."""
+        x = torch.randn(4)
+        with self.assertRaises(TypeError):
+            assert_local_type(x, {"tp": S(0)})
 
 
 if __name__ == "__main__":

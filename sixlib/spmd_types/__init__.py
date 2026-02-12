@@ -2,7 +2,7 @@
 
 # Collectives and operations
 from sixlib.spmd_types._checker import (
-    assert_type,
+    assert_local_type,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (
