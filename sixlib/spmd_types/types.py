@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, TypeAlias
+from typing import Literal, TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -110,11 +110,21 @@ Partial = P
 # Type aliases
 PerMeshAxisSpmdType = PerMeshAxisLocalSpmdType | Shard
 
+# Per-axis type for global SPMD: R, I, P, or S(i). V is excluded.
+PerMeshAxisGlobalSpmdType = (
+    Literal[
+        PerMeshAxisLocalSpmdType.R,
+        PerMeshAxisLocalSpmdType.I,
+        PerMeshAxisLocalSpmdType.P,
+    ]
+    | Shard
+)
+
 # Axis identifier: either a mesh axis name (string) or a ProcessGroup directly
 DeviceMeshAxis: TypeAlias = "str | ProcessGroup"
 
-# LocalSpmdType maps axis identifiers to per-axis SPMD types
-LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisSpmdType]"
+# LocalSpmdType maps axis identifiers to per-axis local SPMD types (R, I, V, P)
+LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisLocalSpmdType]"
 
 # =============================================================================
 # PartitionSpec for Global SPMD
@@ -142,7 +152,8 @@ class PartitionSpec(tuple):
         return f"PartitionSpec({pr})"
 
 
-GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"
+# GlobalSpmdType maps axis identifiers to per-axis global SPMD types (R, I, P, S(i))
+GlobalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisGlobalSpmdType]"
 
 
 class SpmdTypeError(RuntimeError):
@@ -167,6 +178,32 @@ def _canonicalize_shard(typ: PerMeshAxisSpmdType, ndim: int) -> PerMeshAxisSpmdT
     """
     if isinstance(typ, Shard) and typ.dim < 0:
         return Shard(typ.dim % ndim)
+    return typ
+
+
+def to_global_type(
+    typ: PerMeshAxisLocalSpmdType, shard: Shard | None = None,
+) -> PerMeshAxisGlobalSpmdType:
+    """Map a local per-axis type to its global counterpart.
+
+    V -> S(i) (requires shard arg), R -> R, I -> I, P -> P.
+    """
+    if typ is V:
+        if shard is None:
+            raise SpmdTypeError(
+                "Cannot convert V to a global type without a Shard"
+            )
+        return shard
+    return typ
+
+
+def to_local_type(typ: PerMeshAxisGlobalSpmdType) -> PerMeshAxisLocalSpmdType:
+    """Map a global per-axis type to its local counterpart.
+
+    S(i) -> V, R -> R, I -> I, P -> P.
+    """
+    if isinstance(typ, Shard):
+        return V
     return typ
 
 

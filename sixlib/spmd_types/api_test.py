@@ -127,17 +127,19 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_shard_to_shard_uses_all_to_all(self):
         """redistribute(S(i),S(j)) with different dims uses all_to_all."""
+        # dim 1 must be divisible by world_size for S(0)->S(1)
+        # since all_to_all splits on dst.dim=1.
         x = self.mode.rank_map(
-            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+            lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
         assert_type(x, {"tp": V})
 
         result = redistribute(x, "tp", src=S(0), dst=S(1))
 
-        # Check shapes are correct
+        # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
-            self.assertEqual(result._local_tensors[r].shape[0], 1)
-            self.assertEqual(result._local_tensors[r].shape[1], 6)
+            self.assertEqual(result._local_tensors[r].shape[0], 6)
+            self.assertEqual(result._local_tensors[r].shape[1], 1)
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
 

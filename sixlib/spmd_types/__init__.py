@@ -5,6 +5,7 @@ from __future__ import annotations
 from sixlib.spmd_types._checker import (  # noqa: F401
     assert_local_type,
     assert_type,
+    local_map,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (  # noqa: F401
@@ -29,12 +30,14 @@ from sixlib.spmd_types._mesh import (  # noqa: F401
 
 # Types
 from sixlib.spmd_types.types import (  # noqa: F401
+    GlobalSpmdType,
     I,
     Invariant,
     LocalSpmdType,
     P,
     Partial,
     PartitionSpec,
+    PerMeshAxisGlobalSpmdType,
     PerMeshAxisLocalSpmdType,
     PerMeshAxisSpmdType,
     R,
@@ -42,6 +45,8 @@ from sixlib.spmd_types.types import (  # noqa: F401
     S,
     Shard,
     SpmdTypeError,
+    to_global_type,
+    to_local_type,
     V,
     Varying,
 )
