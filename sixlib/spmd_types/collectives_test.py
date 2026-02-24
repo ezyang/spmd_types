@@ -293,18 +293,19 @@ class TestAllToAll(LocalTensorTestCase):
 
     def test_all_to_all_shard_to_shard(self):
         """all_to_all: S(i) -> S(j), resharding between dimensions."""
-        # Each rank has a 2D tensor
+        # Each rank has a 2D tensor; dim 1 must be divisible by world_size
+        # for S(0)->S(1) since split_dim=dst.dim=1.
         x = self.mode.rank_map(
-            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+            lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
         assert_type(x, {"tp": V})
 
         result = all_to_all(x, "tp", src=S(0), dst=S(1))
 
-        # Check shapes are correct
+        # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
-            self.assertEqual(result._local_tensors[r].shape[0], 1)
-            self.assertEqual(result._local_tensors[r].shape[1], 6)
+            self.assertEqual(result._local_tensors[r].shape[0], 6)
+            self.assertEqual(result._local_tensors[r].shape[1], 1)
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_all_to_all_invalid_src(self):
