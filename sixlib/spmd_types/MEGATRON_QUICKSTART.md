@@ -35,7 +35,7 @@ Every tensor has a local SPMD type.  You can set it with `assert_type`,
 and when typechecking is enabled using the `SpmdTypeMode()` context manager,
 we will propagate them through PyTorch functions.
 
-```
+```python
 import sixlib.spmd_types as spmd
 from sixlib.spmd_types import PartitionSpec
 
@@ -50,7 +50,7 @@ spmd.assert_type(t, {'tp': spmd.R})  # Error, because type is inconsistent!
 
 The full signature is:
 
-```
+```python
 spmd.assert_type(tensor, local_spmd_type, partition_spec=None)
 ```
 
@@ -73,7 +73,7 @@ tensor is distributed over the mesh axis:
 
 The local types of gradients are summarized by this handy table:
 
-```
+```text
 Forward     Backward
 ----------------------
 Replicate   Partial
@@ -109,7 +109,7 @@ ambiguous; use an explicit `PartitionSpec` in that case.
 
 Here are some examples with a device mesh of `('dp', 'tp')`:
 
-```
+```python
 from sixlib.spmd_types import PartitionSpec
 
 # input is [batch@dp, seq, hidden@tp]
@@ -134,7 +134,7 @@ operations which interact with the types in a non-trivial way.  An easy way to
 get started is to see [which function from Megatron](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/mappings.py) you are using, and then use the corresponding function
 from our API:
 
-```
+```text
 Megatron function                                       spmd_types function
 ---------------------------------------------------------------------------------------------------------
 copy_to_tensor_model_parallel_region(x)                 spmd.reinterpret   (x, tp, src=spmd.I,      dst=spmd.R)
@@ -192,7 +192,7 @@ invariant (not partial!)
 How do types propagate through your program on operators that are not the
 collectives listed above?  The rules are fairly simple:
 
-```
+```text
 op(Replicate..) -> Replicate
 op(Invariant..) -> Invariant  # NB: this case is uncommon
 op(Varying..) -> Varying
@@ -229,7 +229,7 @@ global SPMD semantics, you still need to do a summation across all the ranks.
 You can clearly specify that you meant to do the full summation (but are
 delaying it) with:
 
-```
+```python
 spmd.sum(x, pg, src=spmd.S(0), dst=spmd.P)
 ```
 
@@ -239,7 +239,7 @@ summation and declare a pending summation over this pg as well.
 
 The following operations are supported by spmd:
 
-```
+```python
 spmd.sum(x, pg, src, dst)
 spmd.linear(x, w, pg, src, dst)
 spmd.einsum(equation, *args, pg, src, dst)
@@ -248,7 +248,7 @@ spmd.einsum(equation, *args, pg, src, dst)
 It is also supported to provide tuples for pg/src/dst, indicating that there
 are multiple mesh axes which are producing pending reductions, e.g.,
 
-```
+```python
 spmd.sum(x, (ax1, ax2), src=(spmd.S(0), spmd.S(1)), dst=(spmd.P, spmd.P))
 ```
 
@@ -277,7 +277,7 @@ operators in our API (abbreviating the function calls to only include src/dst
 when it would disambiguate between multiple different operators).  We've
 separated the less efficient invariant conversions from the rest.
 
-```
+```text
 Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
 R -> V      convert(R,V)            V -> P      convert(V,P)

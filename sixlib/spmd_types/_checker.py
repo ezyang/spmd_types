@@ -188,7 +188,10 @@ def _format_error_with_suggestions(
     suggestions = _suggest_fixes(axis, axis_types, infer_fn)
     if not suggestions:
         return base_msg
-    lines = [base_msg, "Are you missing a collective? e.g.,"]
+    lines = [
+        base_msg,
+        "Are you missing a collective or a reinterpret/convert call? e.g.,",
+    ]
     for operation, consequence, from_type in suggestions:
         lines.append(
             f"  {operation} on the {_TYPE_FULL_NAMES[from_type]} operand ({consequence})"

@@ -16,11 +16,29 @@ from sixlib.spmd_types.types import (
     Shard,
     V,
 )
-from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
+
+try:
+    from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
+
+    _HAS_LOCAL_TENSOR = True
+except ImportError:
+    _HAS_LOCAL_TENSOR = False
+
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
+
+
+def _get_local_tensor_mode(x: torch.Tensor):
+    """Return the active LocalTensorMode if x is a LocalTensor, else None."""
+    if not _HAS_LOCAL_TENSOR:
+        return None
+    mode = local_tensor_mode()
+    if mode is not None and isinstance(x, LocalTensor):
+        return mode
+    return None
+
 
 # =============================================================================
 # reinterpret autograd Functions
@@ -55,8 +73,8 @@ class _ReplicateToInvariant(torch.autograd.Function):
         # Zero out all but rank 0
         pg = _get_mesh_axis_group(ctx.axis)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(grad_out, LocalTensor):
+        mode = _get_local_tensor_mode(grad_out)
+        if mode is not None:
             return mode.tensor_map(
                 grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
             ), None
@@ -387,8 +405,8 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(x, LocalTensor):
+        mode = _get_local_tensor_mode(x)
+        if mode is not None:
             return mode.tensor_map(
                 x,
                 lambda r, t: _replicate_to_varying_fwd(
@@ -407,8 +425,8 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
         pg = _get_mesh_axis_group(ctx.axis)
         world_size = _dist.dist.get_world_size(pg)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(grad_out, LocalTensor):
+        mode = _get_local_tensor_mode(grad_out)
+        if mode is not None:
             result = mode.tensor_map(
                 grad_out,
                 lambda r, t: _varying_to_partial_fwd(
@@ -439,8 +457,8 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(x, LocalTensor):
+        mode = _get_local_tensor_mode(x)
+        if mode is not None:
             return mode.tensor_map(
                 x,
                 lambda r, t: _replicate_to_varying_fwd(
@@ -470,8 +488,8 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
         ctx.axis = axis
         pg = _get_mesh_axis_group(axis)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(x, LocalTensor):
+        mode = _get_local_tensor_mode(x)
+        if mode is not None:
             return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
             rank = _dist.dist.get_rank(pg)
@@ -482,8 +500,8 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
         # backward is same operation: convert(R,P)
         pg = _get_mesh_axis_group(ctx.axis)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(grad_out, LocalTensor):
+        mode = _get_local_tensor_mode(grad_out)
+        if mode is not None:
             return mode.tensor_map(
                 grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
             ), None
@@ -500,8 +518,8 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
         ctx.axis = axis
         pg = _get_mesh_axis_group(axis)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(x, LocalTensor):
+        mode = _get_local_tensor_mode(x)
+        if mode is not None:
             return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
             rank = _dist.dist.get_rank(pg)
@@ -524,8 +542,8 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(x, LocalTensor):
+        mode = _get_local_tensor_mode(x)
+        if mode is not None:
             return mode.tensor_map(
                 x,
                 lambda r, t: _varying_to_partial_fwd(
@@ -542,8 +560,8 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         pg = _get_mesh_axis_group(ctx.axis)
         world_size = _dist.dist.get_world_size(pg)
 
-        mode = local_tensor_mode()
-        if mode is not None and isinstance(grad_out, LocalTensor):
+        mode = _get_local_tensor_mode(grad_out)
+        if mode is not None:
             result = mode.tensor_map(
                 grad_out,
                 lambda r, t: _replicate_to_varying_fwd(

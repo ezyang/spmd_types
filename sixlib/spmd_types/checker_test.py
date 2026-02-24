@@ -248,7 +248,7 @@ class TestTypeErrorMessages(expecttest.TestCase):
             str(ctx.exception),
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
@@ -260,7 +260,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, V]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
@@ -273,7 +273,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, P]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
         )
 
@@ -285,7 +285,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [P, R]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
@@ -297,7 +297,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [P, V]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
@@ -309,7 +309,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Partial type on axis 'tp' can only combine with partial. Found types: [R, P, V]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
@@ -321,7 +321,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R, V]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
@@ -334,7 +334,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Partial in multiple factors of multilinear op on axis 'tp' is forbidden. Found types: [P, P]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
@@ -346,7 +346,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Partial type on axis 'tp' can only multiply with Replicate. Found types: [P, V]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
 
@@ -358,7 +358,7 @@ Are you missing a collective? e.g.,
             str(ctx.exception),
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [P, I]
-Are you missing a collective? e.g.,
+Are you missing a collective or a reinterpret/convert call? e.g.,
   reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   all_reduce(tensor, 'tp', src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
         )

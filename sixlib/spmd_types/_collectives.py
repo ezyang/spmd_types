@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 import torch
 from sixlib.spmd_types import _dist
@@ -175,31 +175,61 @@ class _AllGather(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, axis, dst, gather_dim, stack):
+    def forward(ctx, x, axis, dst, gather_dim, stack, split_sizes):
         ctx.axis = axis
         ctx.dst = dst
         ctx.gather_dim = gather_dim
         ctx.stack = stack
+        ctx.split_sizes = split_sizes
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
-        gathered = [torch.empty_like(x) for _ in range(world_size)]
-        _dist.dist.all_gather(gathered, x, group=pg)
-        if stack:
-            return torch.stack(gathered, dim=gather_dim)
-        return torch.cat(gathered, dim=gather_dim)
+        if split_sizes is None:
+            gathered = [torch.empty_like(x) for _ in range(world_size)]
+            _dist.dist.all_gather(gathered, x, group=pg)
+            if stack:
+                return torch.stack(gathered, dim=gather_dim)
+            return torch.cat(gathered, dim=gather_dim)
+        else:
+            ctx.rank = _dist.dist.get_rank(pg)
+            gathered = []
+            for s in split_sizes:
+                shape = list(x.shape)
+                shape[gather_dim] = s
+                gathered.append(torch.empty(shape, dtype=x.dtype, device=x.device))
+            _dist.dist.all_gather(gathered, x, group=pg)
+            return torch.cat(gathered, dim=gather_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
-        dst_type = V if ctx.stack else Shard(ctx.gather_dim)
-        if ctx.dst is R:
-            # backward is reduce_scatter: P -> V
-            grad = reduce_scatter(
-                grad_out, ctx.axis, src=P, dst=dst_type, scatter_dim=ctx.gather_dim
-            )
+        if ctx.split_sizes is None:
+            dst_type = V if ctx.stack else Shard(ctx.gather_dim)
+            if ctx.dst is R:
+                # backward is reduce_scatter: P -> V
+                grad = reduce_scatter(
+                    grad_out, ctx.axis, src=P, dst=dst_type, scatter_dim=ctx.gather_dim
+                )
+            else:
+                # backward is convert(I,V): I -> V
+                grad = convert(grad_out, ctx.axis, src=I, dst=dst_type)
+            return grad, None, None, None, None, None
+
         else:
-            # backward is convert(I,V): I -> V
-            grad = convert(grad_out, ctx.axis, src=I, dst=dst_type)
-        return grad, None, None, None, None
+            if ctx.dst is R:
+                # backward is reduce_scatter: P -> V
+                output = reduce_scatter(
+                    grad_out,
+                    ctx.axis,
+                    src=P,
+                    dst=Shard(ctx.gather_dim),
+                    split_sizes=ctx.split_sizes,
+                )
+            else:
+                # backward is convert(I,V): I -> V
+                chunks = list(
+                    torch.split(grad_out, list(ctx.split_sizes), dim=ctx.gather_dim)
+                )
+                output = chunks[ctx.rank].contiguous()
+            return output, None, None, None, None, None
 
 
 def all_gather(
@@ -208,6 +238,7 @@ def all_gather(
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType,
+    split_sizes: Optional[List[int]] = None,
 ):
     """``all_gather(x: Varying, mesh_axis, src, dst) -> Replicate | Invariant``
 
@@ -245,6 +276,7 @@ def all_gather(
         axis: The mesh axis to gather over (string name or ProcessGroup)
         src: Source type (V or S(i)). When V, stacks on dim 0. When S(i), concatenates on dim i.
         dst: Destination type (R or I)
+        split_sizes: Per-rank sizes for uneven gathering.
 
     Returns:
         Tensor with R or I type depending on dst
@@ -301,6 +333,7 @@ def all_gather(
             axis,
             src=src,
             dst=dst,
+            split_sizes=split_sizes,
         )
     # Canonicalize negative Shard dims
     src = _canonicalize_shard(src, x.ndim)
@@ -309,10 +342,15 @@ def all_gather(
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_gather src must be V or S(i), got {src}")
 
+    if split_sizes is not None and not isinstance(src, Shard):
+        raise ValueError(
+            f"all_gather split_sizes is only supported with src=S(i), got src={src}"
+        )
+
     gather_dim = src.dim if isinstance(src, Shard) else 0
     stack = src is V
     if dst is R or dst is I:
-        return _AllGather.apply(x, axis, dst, gather_dim, stack)
+        return _AllGather.apply(x, axis, dst, gather_dim, stack, split_sizes)
     else:
         raise ValueError(f"all_gather dst must be R or I, got {dst}")
 
@@ -326,19 +364,31 @@ class _ReduceScatter(torch.autograd.Function):
     """reduce_scatter: P -> V, backward is all_gather(R): V -> R."""
 
     @staticmethod
-    def forward(ctx, x, axis, scatter_dim, stack):
+    def forward(ctx, x, axis, scatter_dim, stack, split_sizes):
         ctx.axis = axis
         ctx.scatter_dim = scatter_dim
         ctx.stack = stack
+        ctx.split_sizes = split_sizes
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
+
         if stack:
+            assert split_sizes is None
             # x stacked on dim 0: shape[0] == world_size
             result = x.new_empty([1] + list(x.shape[1:]))
             _dist.dist.reduce_scatter_tensor(
                 result, x, op=_dist.dist.ReduceOp.SUM, group=pg
             )
             return result.squeeze(0)
+        elif split_sizes is not None:
+            assert stack is False
+            ctx.rank = _dist.dist.get_rank(pg)
+            x_list = list(torch.split(x, list(split_sizes), dim=scatter_dim))
+            output = torch.empty_like(x_list[ctx.rank])
+            _dist.dist.reduce_scatter(
+                output, x_list, op=_dist.dist.ReduceOp.SUM, group=pg
+            )
+            return output
         else:
             # reduce_scatter_tensor always scatters along dim 0, so we
             # movedim before/after when scatter_dim != 0.
@@ -359,9 +409,30 @@ class _ReduceScatter(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is all_gather(R): V -> R
-        src_type = V if ctx.stack else Shard(ctx.scatter_dim)
-        return all_gather(grad_out, ctx.axis, src=src_type, dst=R), None, None, None
+        if ctx.split_sizes is None:
+            # backward is all_gather(R): V -> R
+            src_type = V if ctx.stack else Shard(ctx.scatter_dim)
+            return (
+                all_gather(grad_out, ctx.axis, src=src_type, dst=R),
+                None,
+                None,
+                None,
+                None,
+            )
+        else:
+            return (
+                all_gather(
+                    grad_out,
+                    ctx.axis,
+                    src=Shard(ctx.scatter_dim),
+                    dst=R,
+                    split_sizes=ctx.split_sizes,
+                ),
+                None,
+                None,
+                None,
+                None,
+            )
 
 
 def reduce_scatter(
@@ -371,6 +442,7 @@ def reduce_scatter(
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType = V,
     scatter_dim: int | None = None,
+    split_sizes: Optional[List[int]] = None,
 ):
     """``reduce_scatter(x, mesh_axis, dst): Partial -> Varying``
 
@@ -409,6 +481,7 @@ def reduce_scatter(
         scatter_dim: The tensor dimension to scatter along. Defaults to 0 when
             dst is V; inferred from the shard dim when dst is S(i). If both
             scatter_dim and dst=S(i) are provided, they must agree.
+        split_sizes: Per-rank sizes along ``scatter_dim`` for uneven scatter.
 
     Returns:
         Tensor with V or S(i) type depending on dst
@@ -440,6 +513,7 @@ def reduce_scatter(
             src=src,
             dst=dst,
             scatter_dim=scatter_dim,
+            split_sizes=split_sizes,
         )
     # Canonicalize negative Shard dims
     dst = _canonicalize_shard(dst, x.ndim)
@@ -458,6 +532,11 @@ def reduce_scatter(
     if not (dst is V or isinstance(dst, Shard)):
         raise ValueError(f"reduce_scatter dst must be V or S(i), got {dst}")
 
+    if split_sizes is not None and not isinstance(dst, Shard):
+        raise ValueError(
+            f"reduce_scatter split_sizes is only supported with dst=S(i), got dst={dst}"
+        )
+
     if isinstance(dst, Shard):
         if scatter_dim is not None and scatter_dim != dst.dim:
             raise ValueError(
@@ -470,7 +549,7 @@ def reduce_scatter(
             scatter_dim = 0
 
     stack = dst is V
-    return _ReduceScatter.apply(x, axis, scatter_dim, stack)
+    return _ReduceScatter.apply(x, axis, scatter_dim, stack, split_sizes)
 
 
 # =============================================================================

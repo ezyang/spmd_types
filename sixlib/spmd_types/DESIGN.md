@@ -61,11 +61,12 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
 
 * Both replicate and invariant mean that the data is replicated across the
   device mesh axis.  The gradient of replicate is partial, while the
-  gradient of invariant is invariant.  Intuitively, tensors are typically
-  only invariant when they are parameters (and you desire the gradient to
-  have already been all-reduced) and replicated when being computed on
-  (where you typically desire their gradients to be partial so you can delay
-  the all-reduce, in case it can actually be a reduce-scatter.)  Notably,
+  gradient of invariant is invariant.  Intuitively, tensors are invariant when every rank performs
+  identical computation on them (e.g., parameters, or a globally reduced
+  loss used only for logging) and replicated when being computed on
+  differently per rank (where you typically desire their gradients to be
+  partial so you can delay the all-reduce, in case it can actually be a
+  reduce-scatter.)  Notably,
   operations involving invariant tensors correspond directly to Megatron-style
   autograd functions like `CopyToModelParallelRegion`: when you
   `reinterpret(I,R)` an invariant tensor for use in computation, the backward
@@ -101,24 +102,16 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   other.  In most cases you will want the more specific `S(i)` instead, which
   additionally records which tensor dimension was split; plain V is the
   fallback for situations where that information is unavailable or
-  inapplicable.
+  inapplicable (e.g., unevenly split shards).
 
 * Partial means that there is a pending sum on the (differing) values
   across the device mesh axis, but it hasn't happened yet.  Delaying the reduction
   can be profitable as it might be possible to do a reduce-scatter or eliminate the
   reduction entirely.  The gradient of partial is replicate.
 
-**Note on replicate vs invariant:** these types have identical *forward* values
-(each rank holds the same data), but they encode different *backward* semantics.
-A replicate tensor allows each rank to contribute distinct local gradients that
-must be aggregated (e.g., via all-reduce/reduce-scatter), while an invariant
-tensor requires the gradient itself to be identical on every rank (no implicit
-summation).  The distinction reflects how the value is *used* and how gradients
-should be interpreted, not how the forward value is computed.
-
 To summarize the forward-backward relationship of these types:
 
-```
+```text
 Forward     Backward
 ----------------------
 Replicate   Partial
@@ -132,7 +125,7 @@ communication on these operators; so the type system forbids combinations of
 types that would require comms in backwards to get correct gradients.
 Specifically, here are the valid combinations of states:
 
-```
+```text
 op(Replicate..) -> Replicate
 op(Invariant..) -> Invariant  # NB: this case is uncommon
 op(Varying..) -> Varying
@@ -223,7 +216,7 @@ for each function:
 
 Here is an example of the diagram:
 
-```
+```text
 [A]
 [B]  =>  [A, B, C]
 [C]
@@ -252,7 +245,7 @@ get from summing up all of the tensors.  So for example, these two diagrams
 are semantically equivalent (and you physically get from the left to the right
 with an all-gather):
 
-```
+```text
 +[A]
 +[B]  ==  [A + B + C]
 +[C]
@@ -288,7 +281,7 @@ does NOT uniquely determine an operator: there can be multiple ways to get
 from one type to another which have different semantics.
 
 
-```
+```text
       \   DST   Replicate           Invariant           Varying             Partial
 SRC    \----------------------------------------------------------------------------------------
 Replicate       -                   reinterpret(R,I)    reinterpret(R,V)    reinterpret(R,P)
@@ -337,6 +330,7 @@ vice versa.  Also remember that the backwards of a backwards is its forwards,
 so you can read the table left-to-right and right-to-left (but for ease of
 reading, we've included the flipped rows explicitly).
 
+```text
 Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
 R -> I      reinterpret(R,I)        I -> P      convert(I,P)
@@ -355,6 +349,7 @@ V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
+```
 
 ## Loss gradient types
 
@@ -373,7 +368,7 @@ cycle through a transformer block depends on whether sequence parallelism
 **With SP=True** (common case), inter-block activations are V@tp on the
 sequence dimension:
 
-```
+```text
 V@tp(seq)  ->  all_gather(R)  ->  R@tp  ->  column matmul  ->  V@tp(hidden)
      ^                                                              |
      <-  reduce_scatter: P->V  <-  row matmul  <-  ... ops ...   <-
@@ -385,7 +380,7 @@ is `reduce_scatter(): P->V` (backward: all_gather(R)).
 
 **With SP=False**, inter-block activations are I@tp:
 
-```
+```text
 I@tp  ->  reinterpret(I,R)  ->  R@tp  ->  column matmul  ->  V@tp
   ^                                                            |
   <-  all_reduce(I): P->I  <-  row matmul  <-  ... ops ...  <-
@@ -454,6 +449,24 @@ where these transitions are expected.  Similarly, autograd backward functions
 call the underlying autograd Function classes directly and are not affected by
 the gate.
 
+To summarize, the type transitions available in forward code without
+`expert_mode` are:
+
+```text
+I <---> R          reinterpret (both directions)
+R <---> V          convert(R,V) / all_gather(V,R)
+P  ---> R          all_reduce
+P  ---> V          reduce_scatter
+V  ---> V          all_to_all
+```
+
+The backward for each of these can be derived from the forward-backward type
+rules (R<->P, I<->I, V<->V).
+
+Other transitions (R->P via `convert`, I->V via `convert`, V->I via
+`all_gather(I)`, P->I via `all_reduce(I)`, V->P via `reinterpret`) are also
+available without `expert_mode`, but are less commonly needed.
+
 # Global SPMD
 
 What is a global SPMD type?  We take the existing local SPMD type, and augment
@@ -465,6 +478,39 @@ print the partition spec along with the shape of a tensor; so for example,
 `f32[8,16@tp]` says that dim=1 of the tensor has been sharded by the "tp"
 mesh axis.  It is only legal for varying mesh dimensions to occur in the
 partition spec.
+
+A partition spec is conceptually a tuple with one entry per tensor dimension,
+where each entry names zero, one, or multiple mesh axes:
+
+```python
+@dataclass
+class PartitionSpec:
+    # One entry per tensor dim.  Each entry is:
+    #   None           -- this dim is not sharded (replicated)
+    #   'axis'         -- sharded on one mesh axis
+    #   ('ax1', 'ax2') -- sharded on multiple mesh axes (size is product)
+    dims: tuple[str | tuple[str, ...] | None, ...]
+```
+
+As a concrete example, consider a weight tensor of shape `[hidden, vocab]` on a
+mesh with axes `dp=8, tp=4`.  Suppose we want the weight replicated on `dp` and
+column-sharded on `tp` (i.e., `vocab` is split across `tp` ranks).  The global
+SPMD type would be:
+
+```python
+# Per-axis local types: replicated on dp, varying (sharded) on tp
+local_type = {'dp': R, 'tp': V}
+
+# Partition spec: dim 0 (hidden) is unsharded, dim 1 (vocab) is sharded on 'tp'
+partition_spec = PartitionSpec(None, 'tp')
+
+# Printed together with shape: f32[hidden, vocab@tp]
+# Each tp-rank holds a local tensor of shape [hidden, vocab // 4].
+```
+
+The partition spec carries the mapping from tensor dimensions to mesh axes, so
+that collectives like `all_gather` and `reduce_scatter` know which dimension to
+concatenate or split along.
 
 (Aside: already in the local SPMD API, we have also made available a Shard(i)
 for expressing sharding on a per-device mesh basis.  This form can be more
@@ -501,9 +547,12 @@ following choices for how local and global SPMD types can interact:
 
 One of our design goals is you can simply forget the partition spec, decaying
 a global SPMD type into a local SPMD type, and still have a well-typed
-program.  One consequence of this is, unlike DTensor, classic operations like
-sum(), matmul() and einsum() will not automatically work in cases where an
-operation can be done completely locally except for a pending reduction.
+program.  This means that strictly fewer programs are well-typed under global
+SPMD than under local SPMD: any valid global SPMD program is also a valid local
+SPMD program (by erasing partition specs), but not vice versa.  One consequence
+of this is, unlike DTensor, classic operations like sum(), matmul() and
+einsum() will not automatically work in cases where an operation can be done
+completely locally except for a pending reduction.
 
 
 ## Shard propagation
@@ -513,7 +562,7 @@ mesh of sharded tensors.  The question of shard propagation is, given an input
 PartitionSpec `in_spec`, does there exist an output PartitionSpec `out_spec`
 such that this equality holds:
 
-```
+```text
 map(f, in_spec(x)) == out_spec(f(x))
 ```
 
@@ -537,31 +586,41 @@ In practice, contracted dimensions often **are** sharded.  For example, in a
 row-parallel linear (`blf,fd->bld` with `f` sharded on TP), the contraction
 dimension `f` is sharded.  The local einsum on each rank computes only a
 partial result; to get the correct global answer, the partial results must be
-summed across ranks.  The question is how to express this.  When a contracted
-dimension is sharded, we can in principle do the operation entirely locally by
-declaring that there is a pending reduction.  This is PyTorch DTensor's
-behavior by default; it will transparently generate partial reductions from
-ordinary operations when warranted.  However, we find this problematic for two
-reasons:
+summed across ranks.  The question is how to express this.
 
-1. First, implicitly converting the varying output to partial, when necessary
-   to have correct global SPMD semantics, would mean that behavior in local
-   SPMD and global SPMD regions differ.  This is doable; we simply need to
-   know if we are global SPMD or local SPMD at runtime, but it is aesthetically
-   displeasing because, for the most part, global SPMD is just a strict
-   subset of local SPMD operations.
+One natural idea is to have shard propagation infer this automatically: if the
+system can see that a contracted dimension is sharded, it can deduce that the
+output must be partial.  This is PyTorch DTensor's behavior by default; it will
+transparently generate partial reductions from ordinary operations when
+warranted.  However, this does not work in our system, for a fundamental reason
+and two practical ones:
 
-2. Second, in discussions with people who have traditionally programmed in local
-   SPMD (that's most people in PyTorch!) and then have tried out global SPMD
-   via DTensor, they have generally found that understanding when partial pops
-   up and how it propagates to be quite confusing.  Usually, the story goes that
-   they just wrote some code, and then they're debugging why extra collectives
-   have occurred, and they only then realize that there are some partial tensors
-   floating around.
+1. **Erasure makes inference impossible in general.**  One of our design goals
+   is that partition specs are erasable: you can forget them, decaying a global
+   SPMD type into a local SPMD type, and still have a well-typed program (see
+   above).  But if you erase the partition specs from the inputs, there is no
+   way to look at the inputs and determine that a contracted dimension was
+   sharded -- that information is gone.  So the system *cannot* infer partial
+   outputs from input sharding; the caller must state it explicitly.
 
-So we take a different approach: you must explicitly specify when you want an
+2. **Local/global SPMD consistency.**  Implicitly converting the output to
+   partial when necessary for correct global SPMD semantics would mean that
+   behavior in local SPMD and global SPMD regions differs.  This is doable --
+   we simply need to know which mode we are in at runtime -- but it is
+   aesthetically displeasing because, for the most part, global SPMD is just a
+   strict subset of local SPMD operations.
+
+3. **Usability.**  In discussions with people who have traditionally programmed
+   in local SPMD (that's most people in PyTorch!) and then tried out global
+   SPMD via DTensor, they have generally found that understanding when partial
+   pops up and how it propagates to be quite confusing.  Usually, the story
+   goes that they just wrote some code, and then they're debugging why extra
+   collectives have occurred, and they only then realize that there are some
+   partial tensors floating around.
+
+So we take a different approach: you must explicitly specify when you want a
 partial output on these operators.  Because this ambiguity only arises for
-partial outputs, we expose this as simply as a new keyword argument
+partial outputs, we expose this as simply a new keyword argument
 `out_partial_axes` which is a set of device mesh axes to be partial on.  In
 local SPMD, the semantics of this argument is to do the local operation and
 then `reinterpret` the result as partial on each of the out partial axes.
@@ -578,7 +637,7 @@ perform an all-reduce to compute the real value of the linear.  To correctly
 express that we want to do a *global* matrix multiply, you must run *two*
 operations in local SPMD:
 
-```
+```python
 out: Varying = linear(hidden: Varying, weight: Varying)
 out2: Partial = reinterpret(out: Varying, to='partial')
 ```
@@ -590,7 +649,7 @@ want a global matmul!"
 
 In global SPMD, we would instead error on the linear call.  Instead, you would write:
 
-```
+```python
 out2 = linear(hidden, weight, out_partial_axes='tp')
 ```
 
@@ -617,7 +676,7 @@ The above API has two problems:
 
 * When multiple mesh axes shard the same dimension, you cannot freely do per mesh
   axes on it; only the *last* mesh axis can be operated on.  For example, if you want
-  to reshard `f32[8@dp,tp]` to `f32[8@tp,dp]`, you have to first gather on tp,
+  to reshard `f32[8@(dp,tp)]` to `f32[8@(tp,dp)]`, you have to first gather on tp,
   all-to-all to interchange dp with tp, and then shard on dp.
 
 * It is inefficient to do redistribute on a mesh-axis by mesh-axis basis; for example,

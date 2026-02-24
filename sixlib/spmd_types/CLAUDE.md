@@ -54,6 +54,10 @@ Do not use Unicode characters (arrows, em dashes, etc.) in code or documentation
 
 Suppress FLAKE8 C901 (function too complex) warnings with `# noqa: C901` on the function definition line rather than refactoring, as complex functions are a common pattern in this codebase.
 
+## Markdown
+
+All fenced code blocks in markdown files must have a language tag. Use `python` for Python code, `bash` for shell commands, and `text` for tables, pseudo-code, or plain text blocks.
+
 ## Testing
 
 Assume you are ALREADY in a conda env, no need to activate.
@@ -97,7 +101,7 @@ R and I have identical forward values; they differ only in backward semantics.
 
 No communication happens on regular ops. Valid combinations:
 
-```
+```text
 op(R..) -> R
 op(I..) -> I          # uncommon
 op(V..) -> V
@@ -123,7 +127,7 @@ I cannot mix with other types. P can only combine with P via addition (multiline
 
 ### State transition table (which op for src -> dst)
 
-```
+```text
          dst:  R                  I                  V                P
 src: R         -                  reinterpret(R,I)   reinterpret(R,V) reinterpret(R,P)
                                                      convert(R,V)     convert(R,P)
@@ -136,7 +140,7 @@ src: R         -                  reinterpret(R,I)   reinterpret(R,V) reinterpre
 
 ### Forward-backward pairs
 
-```
+```text
 Forward                    Backward
 reinterpret(R,I): R->I     convert(I,P): I->P
 reinterpret(R,V): R->V     reinterpret(V,P): V->P
@@ -170,6 +174,16 @@ Some `reinterpret`/`convert` operations require `expert_mode=True` because they 
 - **`reinterpret(R,V)`**, **`convert(V,P)`** / **`convert(S(i),P)`**: Legitimate backwards, unlikely forwards
 
 `redistribute` and autograd backwards bypass this gate automatically.
+
+Common forward transitions (no `expert_mode` needed):
+
+```text
+I <---> R          reinterpret (both directions)
+R <---> V          convert(R,V) / all_gather(V,R)
+P  ---> R          all_reduce
+P  ---> V          reduce_scatter
+V  ---> V          all_to_all
+```
 
 ### Global SPMD additions
 

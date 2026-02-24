@@ -322,6 +322,116 @@ class TestAllToAll(LocalTensorTestCase):
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
 
+class TestAllGatherUnevenShard(LocalTensorTestCase):
+    """Test all_gather with uneven split_sizes on S(i)."""
+
+    def test_all_gather_uneven_shard_to_r(self):
+        """all_gather(R) with split_sizes: S(0) -> R, uneven shards."""
+        # World size is 3. Create per-rank shards of sizes [3, 2, 2].
+        split_sizes = [3, 2, 2]
+        x = self.mode.rank_map(
+            lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
+        )
+        assert_type(x, {"tp": V})
+
+        result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+
+        # Result should be concatenation of all shards on all ranks
+        expected = torch.cat(
+            [
+                torch.arange(split_sizes[r], dtype=torch.float) + r * 10
+                for r in range(self.WORLD_SIZE)
+            ]
+        )
+        self._assert_all_ranks_equal(result)
+        for r in range(self.WORLD_SIZE):
+            torch.testing.assert_close(result._local_tensors[r], expected)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
+
+    def test_all_gather_uneven_shard_to_i(self):
+        """all_gather(I) with split_sizes: S(0) -> I, uneven shards."""
+        split_sizes = [3, 2, 2]
+        x = self.mode.rank_map(
+            lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
+        )
+        assert_type(x, {"tp": V})
+
+        result = all_gather(x, "tp", src=S(0), dst=I, split_sizes=split_sizes)
+
+        expected = torch.cat(
+            [
+                torch.arange(split_sizes[r], dtype=torch.float) + r * 10
+                for r in range(self.WORLD_SIZE)
+            ]
+        )
+        self._assert_all_ranks_equal(result)
+        for r in range(self.WORLD_SIZE):
+            torch.testing.assert_close(result._local_tensors[r], expected)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
+
+    def test_all_gather_uneven_shard_2d(self):
+        """all_gather with split_sizes on 2D tensors: S(0) -> R."""
+        split_sizes = [2, 3, 1]
+        D = 4
+        x = self.mode.rank_map(lambda r: torch.randn(split_sizes[r], D) + r)
+        assert_type(x, {"tp": V})
+
+        result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+
+        # Result should have shape (sum(split_sizes), D) = (6, 4)
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (6, D))
+        self._assert_all_ranks_equal(result)
+        self.assertIs(get_axis_local_type(result, "tp"), R)
+
+    def test_all_gather_split_sizes_rejected_for_v(self):
+        """split_sizes should be rejected when src=V."""
+        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        assert_type(x, {"tp": V})
+        with self.assertRaises(ValueError) as ctx:
+            all_gather(x, "tp", src=V, dst=R, split_sizes=[1, 1, 1])
+        self.assertIn("only supported with src=S(i)", str(ctx.exception))
+
+
+class TestReduceScatterUnevenShard(LocalTensorTestCase):
+    """Test reduce_scatter with uneven split_sizes on S(i)."""
+
+    @unittest.skip(
+        "LocalTensorMode does not support c10d.reduce_scatter_ (list API). "
+        "Covered by test_mlp_spmd_types_uneven_split with real GPUs."
+    )
+    def test_reduce_scatter_uneven_shard(self):
+        """reduce_scatter with split_sizes: P -> S(0), uneven chunks."""
+        split_sizes = [3, 2, 2]
+        total = sum(split_sizes)
+        x = self.mode.rank_map(lambda r: torch.arange(total, dtype=torch.float) + r)
+        assert_type(x, {"tp": P})
+
+        result = reduce_scatter(x, "tp", src=P, dst=S(0), split_sizes=split_sizes)
+
+        # Each rank r gets the sum of chunk r from all ranks
+        for r in range(self.WORLD_SIZE):
+            start = sum(split_sizes[:r])
+            end = start + split_sizes[r]
+            expected = torch.zeros(split_sizes[r])
+            for src_rank in range(self.WORLD_SIZE):
+                expected += x._local_tensors[src_rank][start:end]
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_reduce_scatter_split_sizes_rejected_for_v(self):
+        """split_sizes should be rejected when dst=V."""
+        x = self.mode.rank_map(
+            lambda r: torch.arange(9, dtype=torch.float).reshape(3, 3) + r
+        )
+        assert_type(x, {"tp": P})
+        with self.assertRaises(ValueError) as ctx:
+            reduce_scatter(x, "tp", src=P, dst=V, split_sizes=[3, 3, 3])
+        self.assertIn("only supported with dst=S(i)", str(ctx.exception))
+
+
 class TestAllGatherMultiDim(LocalTensorTestCase):
     """Test all_gather with different gather dimensions."""
 
