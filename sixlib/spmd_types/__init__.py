@@ -37,6 +37,7 @@ from sixlib.spmd_types.types import (  # noqa: F401
     PartitionSpec,
     PerMeshAxisLocalSpmdType,
     PerMeshAxisSpmdType,
+    PerMeshAxisSpmdTypes,
     R,
     Replicate,
     S,

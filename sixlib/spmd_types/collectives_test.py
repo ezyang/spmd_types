@@ -21,6 +21,7 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
+    SpmdTypeMode,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
 from sixlib.spmd_types.types import SpmdTypeError
@@ -38,7 +39,8 @@ class TestAllReduce(LocalTensorTestCase):
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Run all_reduce
-        result = all_reduce(x, "tp", src=P, dst=R)
+        with SpmdTypeMode():
+            result = all_reduce(x, "tp", src=P, dst=R)
 
         # Check all ranks have the same summed value
         self._assert_all_ranks_equal(
@@ -54,7 +56,8 @@ class TestAllReduce(LocalTensorTestCase):
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        result = all_reduce(x, "tp", src=P, dst=I)
+        with SpmdTypeMode():
+            result = all_reduce(x, "tp", src=P, dst=I)
 
         self._assert_all_ranks_equal(
             result, "all_reduce result should be same on all ranks"
@@ -85,7 +88,8 @@ class TestAllReduce(LocalTensorTestCase):
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
-        result = all_reduce(x, "tp", src=P, dst=R, inplace=True)
+        with SpmdTypeMode():
+            result = all_reduce(x, "tp", src=P, dst=R, inplace=True)
 
         # Check correctness
         self._assert_all_ranks_equal(
@@ -111,7 +115,8 @@ class TestAllReduce(LocalTensorTestCase):
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
-        result = all_reduce(x, "tp", src=P, dst=I, inplace=True)
+        with SpmdTypeMode():
+            result = all_reduce(x, "tp", src=P, dst=I, inplace=True)
 
         # Check correctness
         self._assert_all_ranks_equal(
@@ -133,15 +138,17 @@ class TestAllReduce(LocalTensorTestCase):
         """all_reduce preserves SPMD types on other mesh axes."""
         x = self.mode.rank_map(lambda r: torch.randn(4) + r)
         assert_type(x, {"tp": P, "dp": R})
-        result = all_reduce(x, "tp", src=P, dst=R)
+        with SpmdTypeMode():
+            result = all_reduce(x, "tp", src=P, dst=R)
         self.assertIs(get_axis_local_type(result, "tp"), R)
         self.assertIs(get_axis_local_type(result, "dp"), R)
 
     def test_all_reduce_type_mismatch(self):
         """all_reduce raises SpmdTypeError when input type doesn't match src."""
         x = self._generate_inputs((4,), "tp", R)
-        with self.assertRaises(SpmdTypeError):
-            all_reduce(x, "tp", src=P, dst=R)
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                all_reduce(x, "tp", src=P, dst=R)
 
 
 class TestAllGather(LocalTensorTestCase):
@@ -153,7 +160,8 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=V, dst=R)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=V, dst=R)
 
         # Result should be [0, 1, 2] on all ranks (stack)
         expected = torch.tensor([0.0, 1.0, 2.0])
@@ -167,7 +175,8 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=V, dst=I)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=V, dst=I)
 
         expected = torch.tensor([0.0, 2.0, 4.0])
         self._assert_all_ranks_equal(result)
@@ -181,7 +190,8 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(0), dst=R)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(0), dst=R)
 
         # Result should be concatenated shards
         expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
@@ -213,7 +223,7 @@ class TestReduceScatter(LocalTensorTestCase):
         # Create input with world_size chunks per rank
         # Each rank has [A_r, B_r, C_r] where total length is world_size * chunk_size
         chunk_size = 2
-        x = self.mode.rank_map(
+        x = self.rank_map(
             lambda r: torch.arange(
                 self.WORLD_SIZE * chunk_size, dtype=torch.float
             ).reshape(self.WORLD_SIZE, chunk_size)
@@ -221,7 +231,8 @@ class TestReduceScatter(LocalTensorTestCase):
         )
         assert_type(x, {"tp": P})
 
-        result = reduce_scatter(x, "tp", src=P, dst=V, scatter_dim=0)
+        with SpmdTypeMode():
+            result = reduce_scatter(x, "tp", src=P, dst=V, scatter_dim=0)
 
         # Each rank r gets the sum of chunk r from all ranks
         for r in range(self.WORLD_SIZE):
@@ -229,19 +240,22 @@ class TestReduceScatter(LocalTensorTestCase):
             for src_rank in range(self.WORLD_SIZE):
                 expected += x._local_tensors[src_rank][r]
             torch.testing.assert_close(
-                result._local_tensors[r], expected, msg=f"rank {r}"
+                result._local_tensors[r],
+                expected,
+                msg=f"rank {r}",
             )
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_reduce_scatter_to_shard(self):
         """reduce_scatter: P -> S(i), reduces and scatters."""
         chunk_size = 2
-        x = self.mode.rank_map(
+        x = self.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
         assert_type(x, {"tp": P})
 
-        result = reduce_scatter(x, "tp", src=P, dst=S(0))
+        with SpmdTypeMode():
+            result = reduce_scatter(x, "tp", src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -250,7 +264,9 @@ class TestReduceScatter(LocalTensorTestCase):
                 chunk_end = (r + 1) * chunk_size
                 expected += x._local_tensors[src_rank][chunk_start:chunk_end]
             torch.testing.assert_close(
-                result._local_tensors[r], expected, msg=f"rank {r}"
+                result._local_tensors[r],
+                expected,
+                msg=f"rank {r}",
             )
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
@@ -281,7 +297,8 @@ class TestAllToAll(LocalTensorTestCase):
         )
         assert_type(x, {"tp": V})
 
-        result = all_to_all(x, "tp", src=V, dst=V, split_dim=0, concat_dim=0)
+        with SpmdTypeMode():
+            result = all_to_all(x, "tp", src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
         for r in range(self.WORLD_SIZE):
@@ -293,18 +310,20 @@ class TestAllToAll(LocalTensorTestCase):
 
     def test_all_to_all_shard_to_shard(self):
         """all_to_all: S(i) -> S(j), resharding between dimensions."""
-        # Each rank has a 2D tensor
+        # Each rank has a 2D tensor; dim 1 must be divisible by world_size
+        # for S(0)->S(1) since split_dim=dst.dim=1.
         x = self.mode.rank_map(
-            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+            lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
         assert_type(x, {"tp": V})
 
-        result = all_to_all(x, "tp", src=S(0), dst=S(1))
+        with SpmdTypeMode():
+            result = all_to_all(x, "tp", src=S(0), dst=S(1))
 
-        # Check shapes are correct
+        # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
-            self.assertEqual(result._local_tensors[r].shape[0], 1)
-            self.assertEqual(result._local_tensors[r].shape[1], 6)
+            self.assertEqual(result._local_tensors[r].shape[0], 6)
+            self.assertEqual(result._local_tensors[r].shape[1], 1)
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_all_to_all_invalid_src(self):
@@ -329,12 +348,13 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         """all_gather(R) with split_sizes: S(0) -> R, uneven shards."""
         # World size is 3. Create per-rank shards of sizes [3, 2, 2].
         split_sizes = [3, 2, 2]
-        x = self.mode.rank_map(
+        x = self.rank_map(
             lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
         )
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should be concatenation of all shards on all ranks
         expected = torch.cat(
@@ -351,12 +371,13 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
     def test_all_gather_uneven_shard_to_i(self):
         """all_gather(I) with split_sizes: S(0) -> I, uneven shards."""
         split_sizes = [3, 2, 2]
-        x = self.mode.rank_map(
+        x = self.rank_map(
             lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
         )
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(0), dst=I, split_sizes=split_sizes)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(0), dst=I, split_sizes=split_sizes)
 
         expected = torch.cat(
             [
@@ -373,10 +394,11 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         """all_gather with split_sizes on 2D tensors: S(0) -> R."""
         split_sizes = [2, 3, 1]
         D = 4
-        x = self.mode.rank_map(lambda r: torch.randn(split_sizes[r], D) + r)
+        x = self.mode.rank_map(lambda r: torch.randn(split_sizes[r], D))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should have shape (sum(split_sizes), D) = (6, 4)
         for r in range(self.WORLD_SIZE):
@@ -441,7 +463,8 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(1), dst=R)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(1), dst=R)
 
         # Result should have shape (2, 3) on all ranks (cat along dim 1)
         expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
@@ -456,11 +479,13 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.full((2, 2), float(r)))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=V, dst=R)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=V, dst=R)
 
         # Result should be (3, 2, 2) - stack along dim 0
         expected = torch.stack(
-            [torch.full((2, 2), float(r)) for r in range(self.WORLD_SIZE)], dim=0
+            [torch.full((2, 2), float(r)) for r in range(self.WORLD_SIZE)],
+            dim=0,
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)

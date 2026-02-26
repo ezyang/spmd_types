@@ -31,7 +31,7 @@ class _AllReduce(torch.autograd.Function):
     """all_reduce: P -> R|I.
 
     When dst=R, backward is all_reduce(R): P -> R.
-    When dst=I, backward is reinterpret(I,R): I -> R (no-op).
+    When dst=I, backward is convert(I,R): I -> R (no-op).
     """
 
     @staticmethod
@@ -61,8 +61,8 @@ class _AllReduce(torch.autograd.Function):
             # backward of P -> R is P -> R (same operation)
             grad = all_reduce(grad_out, ctx.axis, src=P, dst=R)
         else:
-            # backward of P -> I: reinterpret(I,R) is identity but sets up autograd for double backward
-            grad = reinterpret(grad_out, ctx.axis, src=I, dst=R)
+            # backward of P -> I: convert(I,R) is identity but sets up autograd for double backward
+            grad = convert(grad_out, ctx.axis, src=I, dst=R)
         return grad, None, None, None
 
 
@@ -106,7 +106,7 @@ def all_reduce(
         Ax + Ay + Az  <=  +Ay
                           +Az
 
-    When ``dst=I``, aka ``all_reduce(I): P -> I``, the backwards is ``reinterpret(I,R): I -> R``::
+    When ``dst=I``, aka ``all_reduce(I): P -> I``, the backwards is ``convert(I,R): I -> R``::
 
         A  <=  A
 
@@ -115,7 +115,7 @@ def all_reduce(
 
     **Why is** ``dst`` **required?** The backward pass differs materially:
     ``all_reduce(R): P -> R`` has backward ``reduce_scatter: P -> V``, while
-    ``all_reduce(I): P -> I`` has backward ``reinterpret(I,R): I -> R``
+    ``all_reduce(I): P -> I`` has backward ``convert(I,R): I -> R``
     (identity).  If a library always produced I and the caller later converted
     ``I -> R``, the backward would miss the reduce-scatter optimization you'd
     get from ``all_reduce(R)`` directly.  For library code that doesn't know
@@ -599,11 +599,12 @@ class _AllToAll(torch.autograd.Function):
                 concat_dim=ctx.split_dim,
             )
         else:
+            # Backward reverses: split on old concat_dim, concat on old split_dim.
             grad = all_to_all(
                 grad_out,
                 ctx.axis,
-                src=Shard(ctx.concat_dim),
-                dst=Shard(ctx.split_dim),
+                src=Shard(ctx.split_dim),
+                dst=Shard(ctx.concat_dim),
             )
         return grad, None, None, None, None
 
@@ -701,24 +702,42 @@ def all_to_all(
     if not (dst is V or isinstance(dst, Shard)):
         raise ValueError(f"all_to_all dst must be V or S(i), got {dst}")
 
-    if isinstance(src, Shard):
+    if isinstance(src, Shard) and isinstance(dst, Shard):
+        # S(i) -> S(j): physically split on new shard dim (j), concat on old (i).
+        # Conceptual spec: concat(xs, i) then chunk(ws, j).
+        if split_dim is not None and split_dim != dst.dim:
+            raise ValueError(
+                f"all_to_all S({src.dim})->S({dst.dim}) got split_dim={split_dim} "
+                f"but expected {dst.dim} (dst dim)."
+            )
+        if concat_dim is not None and concat_dim != src.dim:
+            raise ValueError(
+                f"all_to_all S({src.dim})->S({dst.dim}) got concat_dim={concat_dim} "
+                f"but expected {src.dim} (src dim)."
+            )
+        split_dim = dst.dim
+        concat_dim = src.dim
+    elif isinstance(src, Shard):
         if split_dim is not None and split_dim != src.dim:
             raise ValueError(
                 f"all_to_all got split_dim={split_dim} but src=S({src.dim}); "
                 f"these conflict. Either use src=S({split_dim}) or remove split_dim."
             )
         split_dim = src.dim
-    else:
-        if split_dim is None:
-            split_dim = 0
-    if isinstance(dst, Shard):
+        if concat_dim is None:
+            concat_dim = 0
+    elif isinstance(dst, Shard):
         if concat_dim is not None and concat_dim != dst.dim:
             raise ValueError(
                 f"all_to_all got concat_dim={concat_dim} but dst=S({dst.dim}); "
                 f"these conflict. Either use dst=S({concat_dim}) or remove concat_dim."
             )
         concat_dim = dst.dim
+        if split_dim is None:
+            split_dim = 0
     else:
+        if split_dim is None:
+            split_dim = 0
         if concat_dim is None:
             concat_dim = 0
 
@@ -793,9 +812,7 @@ def redistribute(  # noqa: C901
     if src_base is dst_base:
         if src_is_shard and dst_is_shard and src.dim != dst.dim:
             # S(i) -> S(j): need all_to_all
-            return all_to_all(
-                x, axis, src=src, dst=dst, split_dim=src.dim, concat_dim=dst.dim
-            )
+            return all_to_all(x, axis, src=src, dst=dst)
         return x  # no-op
 
     # Varying/Shard -> Replicate: all_gather

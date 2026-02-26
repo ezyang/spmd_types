@@ -24,7 +24,7 @@ from sixlib.spmd_types._checker import (
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import all_reduce
-from sixlib.spmd_types._test_utils import LocalTensorTestCase
+from sixlib.spmd_types._test_utils import LocalTensorTestCase, SpmdTypeCheckedTestCase
 from sixlib.spmd_types.types import SpmdTypeError
 from torch.distributed._local_tensor import LocalTensorMode
 
@@ -49,7 +49,7 @@ class TestEinsumSingleOperand(unittest.TestCase):
     pass
 
 
-class TestLinearTypePropagation(LocalTensorTestCase):
+class TestLinearTypePropagation(SpmdTypeCheckedTestCase):
     """Test type propagation through F.linear (matmul + optional bias)."""
 
     def test_linear_r_v_gives_v(self):
@@ -157,8 +157,38 @@ class TestLinearTypePropagation(LocalTensorTestCase):
         result = torch.mul(x, 2.0)
         self.assertIs(get_axis_local_type(result, "tp"), P)
 
+    def test_div_i_scalar_gives_i(self):
+        """I / scalar should give I (scalar adopts I type)."""
+        x = self._generate_inputs((4,), "tp", I)
+        result = x / 2.0
+        self.assertIs(get_axis_local_type(result, "tp"), I)
 
-class TestStrictMode(LocalTensorTestCase):
+    def test_add_i_scalar_gives_i(self):
+        """torch.add(I, scalar) should give I (scalar adopts I type)."""
+        x = self._generate_inputs((4,), "tp", I)
+        result = torch.add(x, 1.0)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
+
+    def test_sub_i_scalar_gives_i(self):
+        """torch.sub(I, scalar) should give I (scalar adopts I type)."""
+        x = self._generate_inputs((4,), "tp", I)
+        result = torch.sub(x, 1.0)
+        self.assertIs(get_axis_local_type(result, "tp"), I)
+
+    def test_add_v_scalar_gives_v(self):
+        """torch.add(V, scalar) should give V (scalar adopts V type)."""
+        x = self._generate_inputs((4,), "tp", V)
+        result = torch.add(x, 1.0)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_mul_v_scalar_gives_v(self):
+        """torch.mul(V, scalar) should give V (scalar adopts V type)."""
+        x = self._generate_inputs((4,), "tp", V)
+        result = torch.mul(x, 2.0)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+
+class TestStrictMode(SpmdTypeCheckedTestCase):
     """Test SpmdTypeMode strict mode which errors on unannotated tensors."""
 
     def setUp(self):
@@ -171,14 +201,14 @@ class TestStrictMode(LocalTensorTestCase):
     def test_strict_mixed_annotated_unannotated_fails(self):
         """Strict mode raises when one operand is annotated and the other is not."""
         x = self._generate_inputs((4,), "tp", R)
-        y = self.mode.rank_map(lambda r: torch.randn(4))
+        y = self.rank_map(lambda r: torch.randn(4))
         with self.assertRaises(SpmdTypeError):
             torch.add(x, y)
 
     def test_strict_mixed_cat_fails(self):
         """Strict mode catches mixed typed/untyped tensors inside lists (e.g. torch.cat)."""
         x = self._generate_inputs((4,), "tp", R)
-        y = self.mode.rank_map(lambda r: torch.randn(4))
+        y = self.rank_map(lambda r: torch.randn(4))
         with self.assertRaises(SpmdTypeError):
             torch.cat([x, y])
 
@@ -193,17 +223,17 @@ class TestStrictMode(LocalTensorTestCase):
         """Strict mode catches all-V tensor (canonicalizes to {}) mixed with unannotated."""
         x = self._generate_inputs((4,), "tp", V)
         # x has _spmd_types attr (set to {} after canonicalization)
-        y = self.mode.rank_map(lambda r: torch.randn(4))
+        y = self.rank_map(lambda r: torch.randn(4))
         # y has no _spmd_types attr at all
         with self.assertRaises(SpmdTypeError):
             torch.add(x, y)
 
-    def test_strict_all_unannotated_passes(self):
-        """Strict mode allows operations when no tensors are annotated (no SPMD tracking)."""
-        x = self.mode.rank_map(lambda r: torch.randn(4))
-        y = self.mode.rank_map(lambda r: torch.randn(4))
-        result = torch.add(x, y)  # Should not raise -- no typed tensors
-        self.assertFalse(has_local_type(result))
+    def test_strict_all_unannotated_fails(self):
+        """Strict mode raises when any tensor is unannotated, even if all are."""
+        x = self.rank_map(lambda r: torch.randn(4))
+        y = self.rank_map(lambda r: torch.randn(4))
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, y)
 
     def test_strict_collective_typed_input_passes(self):
         """Strict mode allows collectives when the input tensor is typed."""
@@ -211,11 +241,11 @@ class TestStrictMode(LocalTensorTestCase):
         result = all_reduce(x, "tp", src=P, dst=R)
         self.assertIs(get_axis_local_type(result, "tp"), R)
 
-    def test_strict_collective_untyped_input_passes(self):
-        """Strict mode allows collectives when no tensors are typed at all."""
-        y = self.mode.rank_map(lambda r: torch.randn(4))
-        result = all_reduce(y, "tp", src=P, dst=R)
-        self.assertFalse(has_local_type(result))
+    def test_strict_collective_untyped_input_fails(self):
+        """Strict mode raises when a collective receives an unannotated tensor."""
+        y = self.rank_map(lambda r: torch.randn(4))
+        with self.assertRaises(SpmdTypeError):
+            all_reduce(y, "tp", src=P, dst=R)
 
     def test_nonstrict_mixed_passes(self):
         """Non-strict mode allows mixing annotated and unannotated tensors."""
@@ -224,7 +254,7 @@ class TestStrictMode(LocalTensorTestCase):
         nonstrict.__enter__()
         try:
             x = self._generate_inputs((4,), "tp", R)
-            y = self.mode.rank_map(lambda r: torch.randn(4))
+            y = self.rank_map(lambda r: torch.randn(4))
             result = torch.add(x, y)  # Should not raise
             self.assertIs(get_axis_local_type(result, "tp"), R)
         finally:
@@ -249,7 +279,7 @@ class TestTypeErrorMessages(expecttest.TestCase):
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R]
 Are you missing a collective or a reinterpret/convert call? e.g.,
-  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)""",
+  convert(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
     def test_general_I_V(self):
@@ -261,7 +291,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, V]
 Are you missing a collective or a reinterpret/convert call? e.g.,
-  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  convert(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
@@ -284,7 +314,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
         self.assertExpectedInline(
             str(ctx.exception),
             """\
-Partial type on axis 'tp' can only combine with partial. Found types: [P, R]
+Partial type on axis 'tp' cannot propagate through non-linear ops (non-linear of a partial sum != partial sum of non-linear). Reduce first with all_reduce or reduce_scatter. Found types: [P, R]
 Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
@@ -296,7 +326,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
         self.assertExpectedInline(
             str(ctx.exception),
             """\
-Partial type on axis 'tp' can only combine with partial. Found types: [P, V]
+Partial type on axis 'tp' cannot combine with Varying. Reduce Partial first (all_reduce -> R, or reduce_scatter -> V). Found types: [P, V]
 Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
@@ -308,7 +338,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
         self.assertExpectedInline(
             str(ctx.exception),
             """\
-Partial type on axis 'tp' can only combine with partial. Found types: [R, P, V]
+Partial type on axis 'tp' cannot combine with Varying. Reduce Partial first (all_reduce -> R, or reduce_scatter -> V). Found types: [R, P, V]
 Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
@@ -322,7 +352,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [I, R, V]
 Are you missing a collective or a reinterpret/convert call? e.g.,
-  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  convert(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   reinterpret(tensor, 'tp', src=I, dst=V) on the Invariant operand (no-op forward, all-reduce in backward)""",
         )
 
@@ -333,7 +363,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
         self.assertExpectedInline(
             str(ctx.exception),
             """\
-Partial in multiple factors of multilinear op on axis 'tp' is forbidden. Found types: [P, P]
+Partial in multiple factors of multilinear op on axis 'tp' is forbidden. Reduce all but one factor first. Found types: [P, P]
 Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
@@ -345,7 +375,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
         self.assertExpectedInline(
             str(ctx.exception),
             """\
-Partial type on axis 'tp' can only multiply with Replicate. Found types: [P, V]
+Partial type on axis 'tp' cannot combine with Varying. Reduce Partial first (all_reduce -> R, or reduce_scatter -> V). Found types: [P, V]
 Are you missing a collective or a reinterpret/convert call? e.g.,
   all_reduce(tensor, 'tp', src=P, dst=R) on the Partial operand (all-reduce in forward, all-reduce in backward)""",
         )
@@ -359,7 +389,7 @@ Are you missing a collective or a reinterpret/convert call? e.g.,
             """\
 Invariant type on axis 'tp' cannot mix with other types. Found types: [P, I]
 Are you missing a collective or a reinterpret/convert call? e.g.,
-  reinterpret(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
+  convert(tensor, 'tp', src=I, dst=R) on the Invariant operand (no-op forward, all-reduce in backward)
   all_reduce(tensor, 'tp', src=P, dst=I) on the Partial operand (all-reduce in forward, no-op backward)""",
         )
 
@@ -503,7 +533,7 @@ class TestAssertTypeShardSugar(unittest.TestCase):
             assert_type(x, {"tp": S(0)})
 
 
-class TestOpLinearityRegistry(LocalTensorTestCase):
+class TestOpLinearityRegistry(SpmdTypeCheckedTestCase):
     """Test that the expanded _OP_REGISTRY covers aliases, dunders, and structural ops."""
 
     def test_clone_functional_form(self):
@@ -630,7 +660,7 @@ class TestOpLinearityRegistry(LocalTensorTestCase):
             )
 
 
-class TestAddmmTypeDecomposition(LocalTensorTestCase):
+class TestAddmmTypeDecomposition(SpmdTypeCheckedTestCase):
     """Test type-level decomposition for addmm and related ops.
 
     addmm(self, mat1, mat2) = self + mm(mat1, mat2) decomposes into a sum

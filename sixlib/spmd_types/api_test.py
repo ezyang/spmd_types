@@ -24,6 +24,7 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
+    SpmdTypeMode,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
 
@@ -36,7 +37,8 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {"tp": V})
 
-        result = redistribute(x, "tp", src=V, dst=R)
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=V, dst=R)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
@@ -49,7 +51,8 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {"tp": V})
 
-        result = redistribute(x, "tp", src=V, dst=I)
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=V, dst=I)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
@@ -62,7 +65,8 @@ class TestRedistribute(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", P)
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        result = redistribute(x, "tp", src=P, dst=R)
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=P, dst=R)
 
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
@@ -72,12 +76,13 @@ class TestRedistribute(LocalTensorTestCase):
     def test_redistribute_p_to_s(self):
         """redistribute(P,S(0)) uses reduce_scatter."""
         chunk_size = 2
-        x = self.mode.rank_map(
+        x = self.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
         assert_type(x, {"tp": P})
 
-        result = redistribute(x, "tp", src=P, dst=S(0))
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -86,17 +91,20 @@ class TestRedistribute(LocalTensorTestCase):
                 chunk_end = (r + 1) * chunk_size
                 expected += x._local_tensors[src_rank][chunk_start:chunk_end]
             torch.testing.assert_close(
-                result._local_tensors[r], expected, msg=f"rank {r}"
+                result._local_tensors[r],
+                expected,
+                msg=f"rank {r}",
             )
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
     def test_redistribute_r_to_v_uses_convert(self):
         """redistribute(R,V) delegates to convert."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
-        result = redistribute(x, "tp", src=R, dst=V)
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=R, dst=V)
 
         for r in range(self.WORLD_SIZE):
             expected = base[r]
@@ -111,7 +119,8 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
-        result = redistribute(x, "tp", src=R, dst=P)
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=R, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
@@ -127,17 +136,20 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_shard_to_shard_uses_all_to_all(self):
         """redistribute(S(i),S(j)) with different dims uses all_to_all."""
+        # dim 1 must be divisible by world_size for S(0)->S(1)
+        # since all_to_all splits on dst.dim=1.
         x = self.mode.rank_map(
-            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+            lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
         assert_type(x, {"tp": V})
 
-        result = redistribute(x, "tp", src=S(0), dst=S(1))
+        with SpmdTypeMode():
+            result = redistribute(x, "tp", src=S(0), dst=S(1))
 
-        # Check shapes are correct
+        # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
-            self.assertEqual(result._local_tensors[r].shape[0], 1)
-            self.assertEqual(result._local_tensors[r].shape[1], 6)
+            self.assertEqual(result._local_tensors[r].shape[0], 6)
+            self.assertEqual(result._local_tensors[r].shape[1], 1)
         self.assertIs(get_axis_local_type(result, "tp"), V)
 
 
@@ -184,7 +196,8 @@ class TestShardNegativeDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
         assert_type(x, {"tp": V})
 
-        result = all_gather(x, "tp", src=S(-1), dst=R)
+        with SpmdTypeMode():
+            result = all_gather(x, "tp", src=S(-1), dst=R)
 
         expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
         self._assert_all_ranks_equal(result)
@@ -214,7 +227,7 @@ class TestShardNegativeDim(LocalTensorTestCase):
         # Each rank has shape (2, 3), world_size=3.
         # S(-1) = S(1) on 2D, each rank gets a (2, 1) chunk.
         base = torch.arange(6, dtype=torch.float).reshape(2, 3)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
         result = convert(x, "tp", src=R, dst=S(-1))
@@ -258,7 +271,7 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     def test_backward_reinterpret_i_to_r(self):
         x = self._generate_inputs((4,), "tp", I)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=I, dst=R),
+            lambda x: reinterpret(x, "tp", src=I, dst=R, expert_mode=True),
             x,
             axis="tp",
             src_type=I,

@@ -6,6 +6,7 @@ in a single process using PyTorch's LocalTensorMode.
 """
 
 import unittest
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -15,7 +16,7 @@ from sixlib.spmd_types._checker import (
     SpmdTypeMode,
 )
 from sixlib.spmd_types.types import I, P, R, Shard, V
-from torch.distributed._local_tensor import LocalTensorMode
+from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
@@ -65,16 +66,24 @@ class LocalTensorTestCase(unittest.TestCase):
             dist.destroy_process_group()
 
     def setUp(self):
-        """Enter LocalTensorMode and SpmdTypeMode for each test."""
+        """Enter LocalTensorMode for each test."""
         self.mode = LocalTensorMode(self.WORLD_SIZE)
         self.mode.__enter__()
-        self.spmd_mode = SpmdTypeMode()
-        self.spmd_mode.__enter__()
 
     def tearDown(self):
-        """Exit SpmdTypeMode and LocalTensorMode after each test."""
-        self.spmd_mode.__exit__(None, None, None)
+        """Exit LocalTensorMode after each test."""
         self.mode.__exit__(None, None, None)
+
+    def rank_map(self, cb: Callable[[int], torch.Tensor]) -> LocalTensor:
+        """Create a LocalTensor by running cb(rank) for each rank.
+
+        The result is unannotated; call ``assert_type()`` on it before
+        using it in typed operations.
+
+        Args:
+            cb: A callable taking a rank (int) and returning a tensor.
+        """
+        return self.mode.rank_map(cb)
 
     def _generate_inputs(self, shape, axis, typ):
         """Generate input tensor with the given SPMD type on the given axis.
@@ -90,9 +99,9 @@ class LocalTensorTestCase(unittest.TestCase):
         """
         if typ is R or typ is I:
             base = torch.randn(shape)
-            result = self.mode.rank_map(lambda r: base.clone())
+            result = self.rank_map(lambda r: base.clone())
         else:
-            result = self.mode.rank_map(lambda r: torch.randn(shape) + r)
+            result = self.rank_map(lambda r: torch.randn(shape))
         local_typ = V if isinstance(typ, Shard) else typ
         assert_type(result, {axis: local_typ})
         return result
@@ -147,9 +156,9 @@ class LocalTensorTestCase(unittest.TestCase):
         base = V if isinstance(typ, Shard) else typ
         if base is R or base is I:
             t = torch.randn_like(like_lt._local_tensors[0])
-            result = self.mode.rank_map(lambda r: t.clone())
+            result = self.rank_map(lambda r: t.clone())
         else:
-            result = self.mode.rank_map(
+            result = self.rank_map(
                 lambda r: torch.randn_like(like_lt._local_tensors[r])
             )
         local_typ = V if isinstance(typ, Shard) else typ
@@ -229,3 +238,38 @@ class LocalTensorTestCase(unittest.TestCase):
             torch.tensor(rhs),
             msg=f"Adjoint identity failed: <A*g, dx>={lhs}, <g, Adx>={rhs}",
         )
+
+
+class SpmdTypeCheckedTestCase(LocalTensorTestCase):
+    """LocalTensorTestCase with SpmdTypeMode for testing type inference rules.
+
+    Use this base class when the test needs SpmdTypeMode to intercept torch ops
+    and run type inference (e.g., verifying that matmul(R, V) -> V).  Tests that
+    only exercise explicit SPMD operations (collectives, reinterpret, convert)
+    should use plain LocalTensorTestCase instead.
+    """
+
+    def setUp(self):
+        """Enter LocalTensorMode and SpmdTypeMode for each test."""
+        super().setUp()
+        self.spmd_mode = SpmdTypeMode()
+        self.spmd_mode.__enter__()
+
+    def tearDown(self):
+        """Exit SpmdTypeMode and LocalTensorMode after each test."""
+        self.spmd_mode.__exit__(None, None, None)
+        super().tearDown()
+
+    def rank_map(self, cb: Callable[[int], torch.Tensor]) -> LocalTensor:
+        """Create a LocalTensor by running cb(rank) for each rank.
+
+        Type checking is paused during the callback so that per-rank factory
+        operations (which produce unannotated tensors) don't trigger strict-mode
+        errors.  The result is unannotated; call ``assert_type()`` on it before
+        using it in typed operations.
+
+        Args:
+            cb: A callable taking a rank (int) and returning a tensor.
+        """
+        with self.spmd_mode.disable():
+            return self.mode.rank_map(cb)

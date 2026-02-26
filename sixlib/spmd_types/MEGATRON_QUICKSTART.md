@@ -137,7 +137,7 @@ from our API:
 ```text
 Megatron function                                       spmd_types function
 ---------------------------------------------------------------------------------------------------------
-copy_to_tensor_model_parallel_region(x)                 spmd.reinterpret   (x, tp, src=spmd.I,      dst=spmd.R)
+copy_to_tensor_model_parallel_region(x)                 spmd.convert       (x, tp, src=spmd.I,      dst=spmd.R)
 reduce_from_tensor_model_parallel_region(x)             spmd.all_reduce    (x, tp,                  dst=spmd.I)
 scatter_to_tensor_model_parallel_region(x)              spmd.reduce_scatter(x, tp,                  dst=spmd.S(-1))
 gather_from_tensor_model_parallel_region(x)             spmd.all_gather    (x, tp, src=spmd.S(-1),  dst=spmd.R)
@@ -282,14 +282,14 @@ Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
 R -> V      convert(R,V)            V -> P      convert(V,P)
 R -> P      convert(R,P)            R -> P      convert(R,P)
-I -> R      reinterpret(I,R)        P -> I      all_reduce(I)
+I -> R      convert(I,R)            P -> I      all_reduce(I)
 V -> R      all_gather(R)           P -> V      reduce_scatter()
 V -> V      all_to_all()            V -> V      all_to_all()
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
 V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 ----------------------------------------------------------------------------
-P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
+P -> I      all_reduce(I)           I -> R      convert(I,R)
 V -> I      all_gather(I)           I -> V      convert(I,V)
 I -> V      convert(I,V)            V -> I      all_gather(I)
 ----------------------------------------------------------------------------

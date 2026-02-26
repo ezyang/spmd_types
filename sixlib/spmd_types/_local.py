@@ -56,11 +56,11 @@ class _ReplicateToVarying(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # reinterpret(V,P) is a no-op in forward direction
-        return grad_out, None
+        return reinterpret(grad_out, ctx.axis, src=V, dst=P), None
 
 
 class _ReplicateToInvariant(torch.autograd.Function):
-    """reinterpret(R,I): R -> I, backward is convert(I,P): I -> P."""
+    """convert(R,I): R -> I, backward is convert(I,P): I -> P."""
 
     @staticmethod
     def forward(ctx, x, axis):
@@ -69,22 +69,12 @@ class _ReplicateToInvariant(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is convert(I,P): I -> P
-        # Zero out all but rank 0
-        pg = _get_mesh_axis_group(ctx.axis)
-
-        mode = _get_local_tensor_mode(grad_out)
-        if mode is not None:
-            return mode.tensor_map(
-                grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
-            ), None
-        else:
-            rank = _dist.dist.get_rank(pg)
-            return _replicate_to_partial_fwd(grad_out, rank), None
+        # convert(I,P): I -> P
+        return convert(grad_out, ctx.axis, src=I, dst=P, expert_mode=True), None
 
 
 class _InvariantToReplicate(torch.autograd.Function):
-    """reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I."""
+    """convert(I,R): I -> R, backward is all_reduce(I): P -> I."""
 
     @staticmethod
     def forward(ctx, x, axis):
@@ -109,8 +99,8 @@ class _VaryingToPartial(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is reinterpret(R,V): R -> V (no-op)
-        return grad_out, None
+        # reinterpret(R,V): R -> V
+        return reinterpret(grad_out, ctx.axis, src=R, dst=V, expert_mode=True), None
 
 
 class _ReplicateToPartial(torch.autograd.Function):
@@ -123,8 +113,8 @@ class _ReplicateToPartial(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is reinterpret(R,P): same as forward (no-op)
-        return grad_out, None
+        # reinterpret(R,P): R -> P (self-dual)
+        return reinterpret(grad_out, ctx.axis, src=R, dst=P, expert_mode=True), None
 
 
 def reinterpret(  # noqa: C901
@@ -158,18 +148,8 @@ def reinterpret(  # noqa: C901
 
     **Supported coercions:**
 
-    ``reinterpret(R,I): R -> I``, the backwards is ``convert(I,P): I -> P``::
-
-        def reinterpret_R_I_spec(x: f32[*shape]) -> f32[*shape]:
-            return x
-
-        Forward:
-        A  =>  A
-
-        Backward:
-        +A
-        +0  <=  A
-        +0
+    ``reinterpret(R,I): R -> I`` delegates to ``convert(R,I)``; see ``convert``
+    for the full specification and diagrams.
 
     ``reinterpret(R,V): R -> V``, the backwards is ``reinterpret(V,P): V -> P``::
 
@@ -187,18 +167,8 @@ def reinterpret(  # noqa: C901
         +B  <=  B
         +C      C
 
-    ``reinterpret(I,R): I -> R``, the backwards is ``all_reduce(I): P -> I``::
-
-        def reinterpret_I_R_spec(x: f32[*shape]) -> f32[*shape]:
-            return x
-
-        Forward:
-        A => A
-
-        Backward:
-                          +Ax
-        Ax + Ay + Az  <=  +Ay
-                          +Az
+    ``reinterpret(I,R): I -> R`` delegates to ``convert(I,R)``; see ``convert``
+    for the full specification and diagrams.
 
     ``reinterpret(V,P): V -> P``, the backwards is ``reinterpret(R,V): R -> V``::
 
@@ -277,13 +247,19 @@ def reinterpret(  # noqa: C901
             raise ValueError(
                 "reinterpret(R, I) requires expert_mode=True. "
                 "This is rarely what you want in the forward pass; "
-                "it exists as a backward for convert(I, P)."
+                "it exists as a backward for convert(I, P). "
+                "Prefer convert(R, I) which is the primary API for R<->I transitions."
             )
         if src is R and dst is P:
             raise ValueError(
                 "reinterpret(R, P) requires expert_mode=True. "
                 "This scales the semantic value by the mesh axis size, which is rarely "
                 "intentional. If you want to preserve semantics, use convert(R, P) instead."
+            )
+        if src is I and dst is R:
+            raise ValueError(
+                "reinterpret(I, R) requires expert_mode=True. "
+                "Use convert(I, R) instead, which is the primary API for I<->R transitions."
             )
         if src is R and dst is V:
             raise ValueError(
@@ -296,11 +272,13 @@ def reinterpret(  # noqa: C901
     if src is R and dst is V:
         return _ReplicateToVarying.apply(x, axis)
     elif src is R and dst is I:
-        return _ReplicateToInvariant.apply(x, axis)
+        # Delegate to convert, which is the primary API for I<->R transitions
+        return convert(x, axis, src=R, dst=I, expert_mode=True)
     elif src is R and dst is P:
         return _ReplicateToPartial.apply(x, axis)
     elif src is I and dst is R:
-        return _InvariantToReplicate.apply(x, axis)
+        # Delegate to convert, which is the primary API for I<->R transitions
+        return convert(x, axis, src=I, dst=R)
     elif src is I and dst is V:
         # Composition: I -> R -> V
         return _ReplicateToVarying.apply(_InvariantToReplicate.apply(x, axis), axis)
@@ -343,6 +321,10 @@ def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
         stack: If True, use select (unbind semantics) instead of chunk (shard semantics).
     """
     if stack:
+        # NOTE: In stack semantics, when we do all-gather we create a new dim to stack
+        #       things on, and this one must be the same length as the rank.
+        #       Revisit this if we have other use cases.
+        assert x.shape[split_dim] == world_size
         return x.select(split_dim, rank).contiguous()
     chunks = torch.chunk(x, world_size, dim=split_dim)
     return chunks[rank].contiguous()
@@ -421,29 +403,14 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is convert(V,P): V -> P
-        pg = _get_mesh_axis_group(ctx.axis)
-        world_size = _dist.dist.get_world_size(pg)
-
-        mode = _get_local_tensor_mode(grad_out)
-        if mode is not None:
-            result = mode.tensor_map(
-                grad_out,
-                lambda r, t: _varying_to_partial_fwd(
-                    t, world_size, ctx.split_dim, r, stack=ctx.stack
-                ),
-            )
-            return result, None, None, None
-        else:
-            rank = _dist.dist.get_rank(pg)
-            return (
-                _varying_to_partial_fwd(
-                    grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack
-                ),
-                None,
-                None,
-                None,
-            )
+        # convert(V/S(i),P): V -> P or S(i) -> P
+        src = V if ctx.stack else Shard(ctx.split_dim)
+        return (
+            convert(grad_out, ctx.axis, src=src, dst=P, expert_mode=True),
+            None,
+            None,
+            None,
+        )
 
 
 class _ConvertInvariantToVarying(torch.autograd.Function):
@@ -497,21 +464,12 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is same operation: convert(R,P)
-        pg = _get_mesh_axis_group(ctx.axis)
-
-        mode = _get_local_tensor_mode(grad_out)
-        if mode is not None:
-            return mode.tensor_map(
-                grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
-            ), None
-        else:
-            rank = _dist.dist.get_rank(pg)
-            return _replicate_to_partial_fwd(grad_out, rank), None
+        # convert(R,P): R -> P (self-dual)
+        return convert(grad_out, ctx.axis, src=R, dst=P), None
 
 
 class _ConvertInvariantToPartial(torch.autograd.Function):
-    """convert(I,P): I -> P, backward is reinterpret(R,I): R -> I (no-op)."""
+    """convert(I,P): I -> P, backward is convert(R,I): R -> I (no-op)."""
 
     @staticmethod
     def forward(ctx, x, axis):
@@ -527,8 +485,8 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is reinterpret(R,I): R -> I (no-op)
-        return grad_out, None
+        # convert(R,I): R -> I
+        return convert(grad_out, ctx.axis, src=R, dst=I, expert_mode=True), None
 
 
 class _ConvertVaryingToPartial(torch.autograd.Function):
@@ -556,29 +514,9 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is convert(R,V): R -> V (take local slice)
-        pg = _get_mesh_axis_group(ctx.axis)
-        world_size = _dist.dist.get_world_size(pg)
-
-        mode = _get_local_tensor_mode(grad_out)
-        if mode is not None:
-            result = mode.tensor_map(
-                grad_out,
-                lambda r, t: _replicate_to_varying_fwd(
-                    t, world_size, ctx.split_dim, r, stack=ctx.stack
-                ),
-            )
-            return result, None, None, None
-        else:
-            rank = _dist.dist.get_rank(pg)
-            return (
-                _replicate_to_varying_fwd(
-                    grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack
-                ),
-                None,
-                None,
-                None,
-            )
+        # convert(R,V/S(i)): R -> V or R -> S(i)
+        dst = V if ctx.stack else Shard(ctx.split_dim)
+        return convert(grad_out, ctx.axis, src=R, dst=dst), None, None, None
 
 
 def convert(  # noqa: C901
@@ -606,9 +544,10 @@ def convert(  # noqa: C901
     You cannot convert out of P: the only way to eliminate the pending
     reduction is to do the actual all-reduce.
 
-    For convenience, we also support ``convert(R,I)`` and ``convert(I,R)``,
-    which have the same meaning as ``reinterpret(R,I)`` and
-    ``reinterpret(I,R)``.
+    We also support ``convert(R,I)`` and ``convert(I,R)``.  Since R and I
+    have identical local representations (same data on all ranks), both are
+    no-op forwards that only differ in backward semantics.  ``reinterpret``
+    also accepts R<->I and delegates to ``convert``.
 
     Args:
         x: Input tensor
@@ -619,6 +558,56 @@ def convert(  # noqa: C901
              derived from the shard index.  Plain V always uses dim 0.
 
     **Supported conversions:**
+
+    ``convert(I,R): I -> R``, the backward is ``all_reduce(I): P -> I``
+
+    Input is invariant across ranks; the output is replicate, still holding
+    the same data on every rank.  The only effect is on backward semantics:
+    replicate gradients are partial (each rank contributes independently),
+    while invariant gradients are invariant.
+
+    Two common use cases:
+
+    1. A replicated parameter (I@tp, e.g., norm weights) entering computation
+       where each rank may contribute a different gradient.  The backward
+       all-reduce synchronizes the gradient for the optimizer.
+    2. Megatron ``CopyToModelParallelRegion`` (SP=False only): inter-block
+       activations are I@tp, and this op transitions them to R@tp at the
+       column-parallel linear entry.
+
+    ::
+
+        def convert_I_R_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+        A => A
+
+        Backward:
+                          +Ax
+        Ax + Ay + Az  <=  +Ay
+                          +Az
+
+    ``convert(R,I): R -> I``, the backward is ``convert(I,P): I -> P``
+
+    Input is replicate across ranks; the output is invariant, still holding
+    the same data on every rank.  The only effect is on backward semantics:
+    invariant gradients remain invariant, whereas replicate gradients would
+    be partial.  Rarely needed in forward code (``expert_mode`` required);
+    exists primarily as the backward of ``convert(I,P)``.
+
+    ::
+
+        def convert_R_I_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+        A  =>  A
+
+        Backward:
+        +A
+        +0  <=  A
+        +0
 
     ``convert(R,V): R -> V``, the backward is ``convert(V,P): V -> P``
 
@@ -734,7 +723,7 @@ def convert(  # noqa: C901
     puts the value on only one rank, so the subsequent all-reduce produces
     the correct total.
 
-    ``convert(I,P): I -> P``, the backwards is ``reinterpret(R,I): R -> I``
+    ``convert(I,P): I -> P``, the backwards is ``convert(R,I): R -> I``
 
     Input is invariant across ranks.  The output keeps the same per-rank tensor
     shape, but all ranks except the first are zeroed out, producing a partial
@@ -795,13 +784,14 @@ def convert(  # noqa: C901
         [B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
         [C0, C1]
 
-    Here is a table of permissible converts (``-`` is no-op, ``O`` is
-    supported, ``X`` is when the semantics is the same as reinterpret.)::
+    Here is a table of permissible converts (``-`` is no-op, ``N`` is
+    a no-op forward that only changes backward semantics (R<->I), ``O``
+    is supported.)::
 
                dst
                R I V P
-        src R  - X O O
-            I  X - O O
+        src R  - N O O
+            I  N - O O
             V      - O
             P        -
     """
@@ -832,11 +822,17 @@ def convert(  # noqa: C901
 
     # Gate expert-only coercions
     if not expert_mode:
+        if src_base is R and dst_base is I:
+            raise ValueError(
+                "convert(R, I) requires expert_mode=True. "
+                "This treats a replicate tensor as invariant, which is rarely what you "
+                "want in the forward pass. It exists as a backward for convert(I, P)."
+            )
         if src_base is I and dst_base is P:
             raise ValueError(
                 "convert(I, P) requires expert_mode=True. "
                 "This zeros out all non-rank-0 tensors, which is rarely what you want. "
-                "It exists as a backward for reinterpret(R, I)."
+                "It exists as a backward for convert(R, I)."
             )
         if src_base is V and dst_base is P:
             raise ValueError(
@@ -919,9 +915,9 @@ def invariant_to_replicate(
     x,
     axis: str | ProcessGroup,
 ):
-    """Convenience alias: ``invariant_to_replicate`` is ``reinterpret(I, R)``.
+    """Convenience alias: ``invariant_to_replicate`` is ``convert(I, R)``.
 
-    Reinterprets an invariant tensor as replicated.  The local tensor is
+    Converts an invariant tensor to replicated.  The local tensor is
     unchanged; the only effect is that the backward will perform an
     all-reduce (P -> I) instead of expecting invariant gradients.
 
@@ -939,4 +935,4 @@ def invariant_to_replicate(
         x: Input tensor with I type on the mesh axis
         axis: The mesh axis to operate on (string name or ProcessGroup)
     """
-    return reinterpret(x, axis, src=I, dst=R)
+    return convert(x, axis, src=I, dst=R)

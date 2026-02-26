@@ -19,6 +19,7 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
+    SpmdTypeMode,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
 
@@ -31,7 +32,8 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=R, dst=V, expert_mode=True)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=R, dst=V, expert_mode=True)
 
         # Forward is no-op, values unchanged
         for r in range(self.WORLD_SIZE):
@@ -43,7 +45,8 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=R, dst=I, expert_mode=True)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=R, dst=I, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -54,7 +57,8 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=R, dst=P, expert_mode=True)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=R, dst=P, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -65,7 +69,8 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=I, dst=R)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=I, dst=R, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -76,7 +81,8 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", V)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=V, dst=P)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=V, dst=P)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -105,12 +111,17 @@ class TestReinterpret(LocalTensorTestCase):
         self.assertIn("not supported", str(ctx.exception))
 
     def test_reinterpret_expert_mode_required(self):
-        """reinterpret(R,V), reinterpret(R,I), reinterpret(R,P) require expert_mode."""
+        """reinterpret(R,V), reinterpret(R,I), reinterpret(R,P), reinterpret(I,R) require expert_mode."""
         x = self._generate_inputs((4,), "tp", R)
         for dst in [V, I, P]:
             with self.assertRaises(ValueError) as ctx:
                 reinterpret(x, "tp", src=R, dst=dst)
             self.assertIn("expert_mode", str(ctx.exception))
+        # I -> R also requires expert_mode
+        x_i = self._generate_inputs((4,), "tp", I)
+        with self.assertRaises(ValueError) as ctx:
+            reinterpret(x_i, "tp", src=I, dst=R)
+        self.assertIn("expert_mode", str(ctx.exception))
 
 
 class TestConvert(LocalTensorTestCase):
@@ -118,12 +129,12 @@ class TestConvert(LocalTensorTestCase):
 
     def test_convert_r_to_v(self):
         """convert(R,V): R -> V, slices to local portion. Tests forward and backward."""
-        # Create replicated input shaped for stack semantics
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
-        result = convert(x, "tp", src=R, dst=V)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=R, dst=V)
 
         # Each rank gets its chunk: rank 0 gets [0,1], rank 1 gets [2,3], rank 2 gets [4,5]
         for r in range(self.WORLD_SIZE):
@@ -136,10 +147,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_r_to_shard(self):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
-        result = convert(x, "tp", src=R, dst=S(0))
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=R, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = base[r * 2 : (r + 1) * 2]
@@ -151,10 +163,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_i_to_v(self):
         """convert(I,V): I -> V, slices to local portion. Tests forward and backward."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": I})
 
-        result = convert(x, "tp", src=I, dst=V)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=I, dst=V)
 
         for r in range(self.WORLD_SIZE):
             expected = base[r]
@@ -166,10 +179,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_i_to_shard(self):
         """convert(I,S(i)): I -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": I})
 
-        result = convert(x, "tp", src=I, dst=S(0))
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=I, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = base[r * 2 : (r + 1) * 2]
@@ -181,10 +195,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_r_to_p(self):
         """convert(R,P): R -> P, zeros out non-rank-0. Tests forward and backward."""
         base = torch.tensor([1.0, 2.0, 3.0])
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": R})
 
-        result = convert(x, "tp", src=R, dst=P)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=R, dst=P)
 
         # Rank 0 keeps values, others are zeroed
         torch.testing.assert_close(result._local_tensors[0], base)
@@ -199,10 +214,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_i_to_p(self):
         """convert(I,P): I -> P, zeros out non-rank-0. Tests forward and backward."""
         base = torch.tensor([1.0, 2.0, 3.0])
-        x = self.mode.rank_map(lambda r: base.clone())
+        x = self.rank_map(lambda r: base.clone())
         assert_type(x, {"tp": I})
 
-        result = convert(x, "tp", src=I, dst=P, expert_mode=True)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=I, dst=P, expert_mode=True)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
@@ -216,10 +232,11 @@ class TestConvert(LocalTensorTestCase):
     def test_convert_v_to_p(self):
         """convert(V,P): V -> P, places data in disjoint positions. Tests forward and backward."""
         # Each rank has [r]
-        x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        x = self.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {"tp": V})
 
-        result = convert(x, "tp", src=V, dst=P, expert_mode=True)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=V, dst=P, expert_mode=True)
 
         # Each rank has a tensor of size world_size with its value at its position
         for r in range(self.WORLD_SIZE):
@@ -232,10 +249,11 @@ class TestConvert(LocalTensorTestCase):
 
     def test_convert_shard_to_p(self):
         """convert(S(i),P): S(i) -> P, places data in disjoint positions."""
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x = self.rank_map(lambda r: torch.tensor([float(r)]))
         assert_type(x, {"tp": V})
 
-        result = convert(x, "tp", src=S(0), dst=P, expert_mode=True)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=S(0), dst=P, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(self.WORLD_SIZE)
@@ -257,7 +275,8 @@ class TestConvert(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = convert(x, "tp", src=R, dst=I)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=R, dst=I, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -268,7 +287,8 @@ class TestConvert(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = convert(x, "tp", src=I, dst=R)
+        with SpmdTypeMode():
+            result = convert(x, "tp", src=I, dst=R)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
@@ -282,20 +302,26 @@ class TestConvert(LocalTensorTestCase):
         self.assertIn("not supported", str(ctx.exception))
 
     def test_convert_expert_mode_required(self):
-        """convert(I,P) and convert(V,P) require expert_mode."""
+        """convert(R,I), convert(I,P) and convert(V,P) require expert_mode."""
+        # R -> I requires expert_mode
+        x_r = self._generate_inputs((4,), "tp", R)
+        with self.assertRaises(ValueError) as ctx:
+            convert(x_r, "tp", src=R, dst=I)
+        self.assertIn("expert_mode", str(ctx.exception))
+
         x_i = self._generate_inputs((4,), "tp", I)
         with self.assertRaises(ValueError) as ctx:
             convert(x_i, "tp", src=I, dst=P)
         self.assertIn("expert_mode", str(ctx.exception))
 
-        x_v = self.mode.rank_map(lambda r: torch.tensor(float(r)))
+        x_v = self.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x_v, {"tp": V})
         with self.assertRaises(ValueError) as ctx:
             convert(x_v, "tp", src=V, dst=P)
         self.assertIn("expert_mode", str(ctx.exception))
 
         # S(i) -> P also requires expert_mode (S normalizes to V)
-        x_s = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        x_s = self.rank_map(lambda r: torch.tensor([float(r)]))
         assert_type(x_s, {"tp": V})
         with self.assertRaises(ValueError) as ctx:
             convert(x_s, "tp", src=S(0), dst=P)
@@ -310,7 +336,8 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=I, dst=V)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=I, dst=V)
 
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
@@ -322,7 +349,8 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         x = self._generate_inputs((4,), "tp", I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, "tp", src=I, dst=P)
+        with SpmdTypeMode():
+            result = reinterpret(x, "tp", src=I, dst=P)
 
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):

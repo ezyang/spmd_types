@@ -69,7 +69,7 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   reduce-scatter.)  Notably,
   operations involving invariant tensors correspond directly to Megatron-style
   autograd functions like `CopyToModelParallelRegion`: when you
-  `reinterpret(I,R)` an invariant tensor for use in computation, the backward
+  `convert(I,R)` an invariant tensor for use in computation, the backward
   pass does an all-reduce (`all_reduce(I): P -> I`), synchronizing the
   gradient.  (This is the pattern used when sequence parallelism is off;
   with sequence parallelism, the entry point is `all_gather(R): V->R`
@@ -284,10 +284,10 @@ from one type to another which have different semantics.
 ```text
       \   DST   Replicate           Invariant           Varying             Partial
 SRC    \----------------------------------------------------------------------------------------
-Replicate       -                   reinterpret(R,I)    reinterpret(R,V)    reinterpret(R,P)
+Replicate       -                   convert(R,I)        reinterpret(R,V)    reinterpret(R,P)
                                                         convert(R,V)        convert(R,P)
 
-Invariant       reinterpret(I,R)    -                   reinterpret(I,V)    convert(I,P)
+Invariant       convert(I,R)        -                   reinterpret(I,V)    convert(I,P)
                                                         convert(I,V)
 
 Varying         all_gather(R)       all_gather(I)       all_to_all()        reinterpret(V,P)
@@ -298,7 +298,7 @@ Partial         all_reduce(R)       all_reduce(I)       reduce_scatter()    -
 
 **Intuition for the less obvious transitions:**
 
-* `reinterpret(I,R)`: Mark an invariant tensor as "entering computation" --
+* `convert(I,R)`: Mark an invariant tensor as "entering computation" --
   backward will all-reduce the gradient back to I.  Two common use cases:
   (1) A replicated parameter (I@tp, e.g., norm weights) entering computation
   where each rank may contribute a different gradient; the backward all-reduce
@@ -312,7 +312,7 @@ Partial         all_reduce(R)       all_reduce(I)       reduce_scatter()    -
   savings).  Backward is `convert(I,V)`: each rank keeps only its gradient shard.
 * `all_reduce(I): P -> I`: Reduce partial results when every rank will do the same
   computation on the result (e.g., computing loss after a TP all-reduce).
-  Backward is `reinterpret(I,R)`: identity, since the gradient is already invariant.
+  Backward is `convert(I,R)`: identity, since the gradient is already invariant.
 * `convert(I,V): I -> V`: Shard an invariant value so each rank stores only its
   slice (e.g., FSDP-style parameter sharding).  Backward is `all_gather(I)`.
 * `convert(R,P): R -> P`: Zeros non-rank-0 to create a partial representation.
@@ -333,21 +333,21 @@ reading, we've included the flipped rows explicitly).
 ```text
 Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
-R -> I      reinterpret(R,I)        I -> P      convert(I,P)
+R -> I      convert(R,I)            I -> P      convert(I,P)
 R -> V      reinterpret(R,V)        V -> P      reinterpret(V,P)
             convert(R,V)                        convert(V,P)
 R -> P      reinterpret(R,P)        R -> P      reinterpret(R,P)
             convert(R,P)                        convert(R,P)
-I -> R      reinterpret(I,R)        P -> I      all_reduce(I)
+I -> R      convert(I,R)            P -> I      all_reduce(I)
 I -> V      convert(I,V)            V -> I      all_gather(I)
-I -> P      convert(I,P)            R -> I      reinterpret(R,I)
+I -> P      convert(I,P)            R -> I      convert(R,I)
 V -> R      all_gather(R)           P -> V      reduce_scatter()
 V -> I      all_gather(I)           I -> V      convert(I,V)
 V -> V      all_to_all()            V -> V      all_to_all()
 V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
             convert(V,P)                        convert(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
-P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
+P -> I      all_reduce(I)           I -> R      convert(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
 ```
 
@@ -381,13 +381,13 @@ is `reduce_scatter(): P->V` (backward: all_gather(R)).
 **With SP=False**, inter-block activations are I@tp:
 
 ```text
-I@tp  ->  reinterpret(I,R)  ->  R@tp  ->  column matmul  ->  V@tp
+I@tp  ->  convert(I,R)  ->  R@tp  ->  column matmul  ->  V@tp
   ^                                                            |
   <-  all_reduce(I): P->I  <-  row matmul  <-  ... ops ...  <-
 ```
 
 Here `CopyToModelParallelRegion` (forward: identity, backward:
-all-reduce) is `reinterpret(I,R): I->R`, and
+all-reduce) is `convert(I,R): I->R`, and
 `ReduceFromModelParallelRegion` (forward: all-reduce, backward:
 identity) is `all_reduce(dst=I): P->I`--not `all_reduce(dst=R)`, which
 is self-dual and would have an all-reduce in its backward too.
@@ -424,15 +424,18 @@ The gated operations fall into two categories:
 **Obviously unusual semantics** -- these change the semantic value of the tensor
 in ways that are almost never intentional in forward code:
 
-* `reinterpret(R, I)`: Treats a replicate tensor as invariant.  This is the
-  backward of `convert(I, P)` but has no natural forward use case, since
-  compute typically happens on R, not I.
+* `convert(R, I)`, `reinterpret(R, I)`, and `reinterpret(I, R)`: Treats a
+  replicate tensor as invariant (R->I) or vice versa (I->R).  R->I is the
+  backward of `convert(I, P)` and has no natural forward use case, since
+  compute typically happens on R, not I.  I->R is gated because users should
+  call `convert(I, R)` directly (which is not gated) rather than going
+  through `reinterpret`.
 * `reinterpret(R, P)`: Treats a replicate value as partial, which scales its
   semantic value by the mesh axis size.  If you want to preserve semantics,
   use `convert(R, P)` instead.
 * `convert(I, P)`: Zeros out all non-rank-0 tensors to create a partial
   representation of an invariant value.  This is the backward of
-  `reinterpret(R, I)`.
+  `convert(R, I)`.
 
 **Legitimate backwards, unlikely forwards** -- these are used as backward passes
 for common operations, but are unlikely to be called directly in forward code:
@@ -453,7 +456,7 @@ To summarize, the type transitions available in forward code without
 `expert_mode` are:
 
 ```text
-I <---> R          reinterpret (both directions)
+I <---> R          convert (both directions)
 R <---> V          convert(R,V) / all_gather(V,R)
 P  ---> R          all_reduce
 P  ---> V          reduce_scatter

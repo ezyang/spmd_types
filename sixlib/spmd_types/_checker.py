@@ -9,9 +9,10 @@ This module provides:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import auto, Enum
-from typing import Callable
+from typing import Callable, overload
 
 import torch
 import torch.overrides
@@ -32,11 +33,42 @@ from sixlib.spmd_types.types import (
     PartitionSpec,
     PerMeshAxisLocalSpmdType,
     PerMeshAxisSpmdType,
+    PerMeshAxisSpmdTypes,
     R,
     Shard,
     SpmdTypeError,
     V,
 )
+
+# =============================================================================
+# Scalar Sentinel
+# =============================================================================
+
+
+class _ScalarType:
+    """Sentinel for Python scalars in SPMD type inference.
+
+    A Python scalar is the same value on all ranks and carries no gradient.
+    It is compatible with both R and I -- analogous to how Python scalars are
+    "weak" in dtype promotion and do not determine the specific dtype.
+
+    _Scalar participates in linearity validation (P + scalar is affine, not
+    linear) but does not influence the inferred output type (R vs I).
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "Scalar"
+
+
+_Scalar = _ScalarType()
+
 
 # =============================================================================
 # Fix Suggestion Engine
@@ -58,7 +90,7 @@ _FIX_CANDIDATES: list[
     (
         I,
         R,
-        "reinterpret(tensor, {axis_arg}, src=I, dst=R)",
+        "convert(tensor, {axis_arg}, src=I, dst=R)",
         "no-op forward, all-reduce in backward",
     ),
     (
@@ -226,6 +258,12 @@ def _validate_and_canonicalize(type: LocalSpmdType) -> LocalSpmdType:
     """
     for axis, typ in type.items():
         if not isinstance(typ, PerMeshAxisLocalSpmdType):
+            if typ is _Scalar:
+                raise TypeError(
+                    f"_Scalar sentinel on axis {format_axis(axis)} must not be stored "
+                    f"on a tensor. _Scalar is internal to type inference; it should "
+                    f"be filtered out by infer_output_type before reaching a tensor."
+                )
             if isinstance(typ, Shard):
                 raise TypeError(
                     f"Shard type {typ!r} on axis {format_axis(axis)} cannot be stored "
@@ -278,9 +316,24 @@ def _set_local_type(tensor: torch.Tensor, type: LocalSpmdType) -> torch.Tensor:
     return tensor
 
 
-def assert_type(  # noqa: C901
+@overload
+def assert_type(
     tensor: torch.Tensor,
     type: LocalSpmdType,
+    partition_spec: PartitionSpec | None = ...,
+) -> torch.Tensor: ...
+
+
+@overload
+def assert_type(
+    tensor: torch.Tensor,
+    type: PerMeshAxisSpmdTypes,
+) -> torch.Tensor: ...
+
+
+def assert_type(  # noqa: C901
+    tensor: torch.Tensor,
+    type: PerMeshAxisSpmdTypes,
     partition_spec: PartitionSpec | None = None,
 ) -> torch.Tensor:
     """
@@ -389,7 +442,7 @@ def assert_type(  # noqa: C901
     return tensor
 
 
-def assert_local_type(tensor: torch.Tensor, type: LocalSpmdType) -> torch.Tensor:
+def assert_local_type(tensor: torch.Tensor, type: PerMeshAxisSpmdTypes) -> torch.Tensor:
     """Deprecated: use ``assert_type`` instead."""
     return assert_type(tensor, type)
 
@@ -460,60 +513,75 @@ def _infer_local_type_for_axis_raw(  # noqa: C901
             return P
         raise ValueError(f"No types provided for axis {format_axis(axis)}")
 
-    # Check type compatibility and infer output type
     type_set = set(axis_types)
 
-    if len(type_set) == 1:
-        inferred_type = axis_types[0]
-        if inferred_type is P:
-            if linearity is OpLinearity.NONLINEAR:
-                raise SpmdTypeError(
-                    f"Partial type on axis {format_axis(axis)} cannot propagate through "
-                    f"non-linear ops. Use all_reduce or reduce_scatter first. "
-                    f"Found types: {axis_types}"
-                )
-            elif linearity is OpLinearity.MULTILINEAR:
-                p_count = sum(1 for t in axis_types if t is P)
-                if p_count > 1:
-                    raise SpmdTypeError(
-                        f"Partial in multiple factors of multilinear op on axis "
-                        f"{format_axis(axis)} is forbidden. "
-                        f"Found types: {axis_types}"
-                    )
-                # Single P -> P (unary multilinear is fine)
-            # LINEAR: all-P -> P, pass through
-    elif type_set == {R, V}:
-        # Mixed replicate/varying -> varying
+    # Check type compatibility and infer output type.
+    #
+    # _Scalar is compatible with R, I, and V (adopts the tensor type).
+    # With P it depends on linearity: P * scalar is valid (MULTILINEAR,
+    # scaling preserves partial-sum), but P + scalar is affine (LINEAR,
+    # the constant gets summed N times across ranks).
+    #
+    #   {R}, {R, _Scalar} -> R           {I}, {I, _Scalar} -> I
+    #   {V}, {V, _Scalar}, {R, V, ...} -> V
+    #   {P} -> P (linearity checks)
+    #   {P, _Scalar} -> MULTILINEAR: P, LINEAR: error (affine)
+    #   {P, R, ...} -> MULTILINEAR single-P: P, else: error
+
+    if type_set <= {R, _Scalar}:
+        inferred_type = R
+    elif type_set <= {I, _Scalar}:
+        inferred_type = I
+    elif type_set <= {R, V, _Scalar}:
         inferred_type = V
-    elif I in type_set and len(type_set) > 1:
+    elif I in type_set:
         raise SpmdTypeError(
             f"Invariant type on axis {format_axis(axis)} cannot mix with other types. "
             f"Found types: {axis_types}"
         )
     elif P in type_set:
-        # P mixed with non-P types
-        if linearity is OpLinearity.MULTILINEAR:
-            p_count = sum(1 for t in axis_types if t is P)
-            non_p = type_set - {P}
-            if p_count > 1:
-                raise SpmdTypeError(
-                    f"Partial in multiple factors of multilinear op on axis "
-                    f"{format_axis(axis)} is forbidden. "
-                    f"Found types: {axis_types}"
-                )
-            if non_p == {R}:
-                inferred_type = P  # P in one factor, R in others -> P
-            else:
-                raise SpmdTypeError(
-                    f"Partial type on axis {format_axis(axis)} can only multiply with "
-                    f"Replicate. Found types: {axis_types}"
-                )
-        else:
-            # NONLINEAR and LINEAR both reject P mixed with non-P
+        # All P-related inference is handled here.
+        non_p = type_set - {P, _Scalar}  # real non-P tensor types
+        has_scalar = _Scalar in type_set
+        p_count = sum(1 for t in axis_types if t is P)
+
+        # P + V is always invalid regardless of linearity.
+        if non_p - {R}:
             raise SpmdTypeError(
-                f"Partial type on axis {format_axis(axis)} can only combine with partial. "
+                f"Partial type on axis {format_axis(axis)} cannot combine with "
+                f"Varying. Reduce Partial first (all_reduce -> R, or "
+                f"reduce_scatter -> V). Found types: {axis_types}"
+            )
+
+        assert type_set <= {P, R, _Scalar}, type_set
+        if linearity is OpLinearity.NONLINEAR:
+            raise SpmdTypeError(
+                f"Partial type on axis {format_axis(axis)} cannot propagate "
+                f"through non-linear ops (non-linear of a partial sum != "
+                f"partial sum of non-linear). Reduce first with all_reduce "
+                f"or reduce_scatter. Found types: {axis_types}"
+            )
+        if linearity is OpLinearity.LINEAR and (non_p or has_scalar):
+            # P + R is invalid: R contributes the same value N times.
+            # P + scalar is affine: the constant gets summed N times.
+            raise SpmdTypeError(
+                f"Partial type on axis {format_axis(axis)} in a linear op "
+                f"requires all operands to be Partial (sum of partial sums "
+                f"is a partial sum, but adding a Replicate or scalar value "
+                f"makes the result affine -- the non-partial term gets "
+                f"summed N times across ranks). "
                 f"Found types: {axis_types}"
             )
+        if linearity is OpLinearity.MULTILINEAR and p_count > 1:
+            raise SpmdTypeError(
+                f"Partial in multiple factors of multilinear op on axis "
+                f"{format_axis(axis)} is forbidden. Reduce all but one "
+                f"factor first. Found types: {axis_types}"
+            )
+        # Valid cases that reach here:
+        # - LINEAR, all-P: sum of partial sums is still partial
+        # - MULTILINEAR, single P with R|scalar: scaling preserves partial
+        inferred_type = P
     else:
         raise SpmdTypeError(
             f"Incompatible types on axis {format_axis(axis)}: {axis_types}"
@@ -934,8 +1002,8 @@ def _iter_tensor_args(args: tuple, kwargs: dict):
                     yield item
 
 
-def _check_all_typed(args: tuple, kwargs: dict) -> None:
-    """Raise ``SpmdTypeError`` if typed and untyped tensors are mixed.
+def _check_all_typed(func, args: tuple, kwargs: dict) -> None:  # noqa: C901
+    """Raise ``SpmdTypeError`` if any operand is unannotated.
 
     Called once at the top of the regular-op path in strict mode so that
     ``_collect_tensor_types`` itself stays simple and unconditional.
@@ -945,22 +1013,44 @@ def _check_all_typed(args: tuple, kwargs: dict) -> None:
     ``{}`` but should still count as typed.
 
     Args:
+        func: The torch function being called.
         args: Positional arguments to the torch operation.
         kwargs: Keyword arguments to the torch operation.
     """
-    has_typed = False
-    has_untyped = False
-    for t in _iter_tensor_args(args, kwargs):
-        if has_local_type(t):
-            has_typed = True
-        else:
-            has_untyped = True
-        if has_typed and has_untyped:
-            raise SpmdTypeError(
-                "Strict mode: operation mixes tensors with SPMD type annotations "
-                "and tensors without. All tensor operands must be annotated. "
-                "Use SpmdTypeMode(strict=False) if you want partial type checking."
-            )
+    untyped: list[str] = []
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            if not has_local_type(arg):
+                untyped.append(
+                    f"args[{i}] (shape={tuple(arg.shape)}, dtype={arg.dtype})"
+                )
+        elif isinstance(arg, (list, tuple)):
+            for j, item in enumerate(arg):
+                if isinstance(item, torch.Tensor) and not has_local_type(item):
+                    untyped.append(
+                        f"args[{i}][{j}] (shape={tuple(item.shape)}, dtype={item.dtype})"
+                    )
+    for key, v in kwargs.items():
+        if isinstance(v, torch.Tensor):
+            if not has_local_type(v):
+                untyped.append(
+                    f"kwargs[{key!r}] (shape={tuple(v.shape)}, dtype={v.dtype})"
+                )
+        elif isinstance(v, (list, tuple)):
+            for j, item in enumerate(v):
+                if isinstance(item, torch.Tensor) and not has_local_type(item):
+                    untyped.append(
+                        f"kwargs[{key!r}][{j}] (shape={tuple(item.shape)}, dtype={item.dtype})"
+                    )
+    if untyped:
+        func_name = getattr(func, "__name__", repr(func))
+        listing = "\n  ".join(untyped)
+        raise SpmdTypeError(
+            f"Strict mode: {len(untyped)} unannotated tensor(s) "
+            f"in operation {func_name}:\n  {listing}\n"
+            f"All tensor operands must be annotated. "
+            f"Use SpmdTypeMode(strict=False) if you want partial type checking."
+        )
 
 
 def _is_numeric_scalar(val: object) -> bool:
@@ -971,15 +1061,18 @@ def _is_numeric_scalar(val: object) -> bool:
 def _collect_input_types(  # noqa: C901
     args: tuple, kwargs: dict, spec: _OpSpec | None = None
 ) -> list[LocalSpmdType]:
-    """Collect SPMD types from tensor args and (for LINEAR ops) scalar args.
+    """Collect SPMD types from tensor args and scalar args.
 
-    For LINEAR ops with a spec, numeric scalars at declared tensor-input
-    positions are included as Replicate on all known mesh axes.  For other ops
-    (MULTILINEAR, NONLINEAR, or no spec), only tensor types are collected and
-    scalars are ignored.
+    When a spec is available, numeric scalars at declared tensor-input
+    positions are included with _Scalar on all known mesh axes.  Without a
+    spec we cannot distinguish scalar operands from non-tensor parameters
+    (like ``dim``), so only tensor types are collected.
 
-    TODO: A Python scalar is ambiguous between R and V.  We conservatively
-    assume R for now; revisit later.
+    A Python scalar is the same value on all ranks and carries no gradient.
+    Rather than eagerly picking R or I, we assign _Scalar -- a typeless
+    sentinel analogous to "weak" scalars in dtype promotion.  The inference
+    engine filters _Scalar when determining the output type, so scalars
+    never force a choice between R and I.
 
     Args:
         args: Positional arguments to the torch operation.
@@ -991,12 +1084,15 @@ def _collect_input_types(  # noqa: C901
         if has_local_type(t):
             result.append(get_local_type(t))
 
-    if result and spec is not None and spec.linearity is OpLinearity.LINEAR:
+    # _Scalar is typeless (doesn't force R vs I), so it is safe to collect
+    # for all linearities -- the old LINEAR-only gate was only needed when
+    # scalars were eagerly assigned R.
+    if result and spec is not None:
         all_axes: set[DeviceMeshAxis] = set()
         for typ in result:
             all_axes.update(typ.keys())
         if all_axes:
-            scalar_type: LocalSpmdType = {axis: R for axis in all_axes}
+            scalar_type: LocalSpmdType = {axis: _Scalar for axis in all_axes}
 
             def _check(val: object) -> None:
                 if _is_numeric_scalar(val):
@@ -1180,9 +1276,29 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
     def __init__(self, strict: bool = True):
         super().__init__()
         self.strict = strict
+        self._disabled = False
+
+    @contextmanager
+    def disable(self):
+        """Temporarily disable type checking.
+
+        Use this to run operations that should not be type-checked,
+        such as per-rank callbacks in rank_map or value assertions
+        on internal tensor data.
+        """
+        old = self._disabled
+        self._disabled = True
+        try:
+            yield
+        finally:
+            self._disabled = old
 
     def __torch_function__(self, func, types, args=(), kwargs=None):  # noqa: C901
         kwargs = kwargs or {}
+
+        # Paused: run without type checking.
+        if self._disabled:
+            return func(*args, **kwargs)
 
         # Autograd bookkeeping -- not tensor math, skip type inference.
         if func in _AUTOGRAD_PASSTHROUGH:
@@ -1200,7 +1316,7 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         # Strict mode: all tensor operands must be annotated (applies to both
         # SPMD collectives and regular torch ops).
         if self.strict:
-            _check_all_typed(args, kwargs)
+            _check_all_typed(func, args, kwargs)
 
         if func in _SPMD_FUNCTION_DEFAULTS:
             # Special spmd collective/reinterpret/collect

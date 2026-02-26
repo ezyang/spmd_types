@@ -113,8 +113,14 @@ PerMeshAxisSpmdType = PerMeshAxisLocalSpmdType | Shard
 # Axis identifier: either a mesh axis name (string) or a ProcessGroup directly
 DeviceMeshAxis: TypeAlias = "str | ProcessGroup"
 
-# LocalSpmdType maps axis identifiers to per-axis SPMD types
-LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisSpmdType]"
+# PerMeshAxisSpmdTypes is the permissive input variant that also accepts S(i).
+# Used in user-facing APIs like assert_type, where S(i) is syntax sugar
+# for setting the partition_spec.
+PerMeshAxisSpmdTypes: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisSpmdType]"
+
+# LocalSpmdType maps axis identifiers to per-axis SPMD types (R, I, V, P only).
+# This is the type stored on tensors; Shard is never stored.
+LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisLocalSpmdType]"
 
 # =============================================================================
 # PartitionSpec for Global SPMD

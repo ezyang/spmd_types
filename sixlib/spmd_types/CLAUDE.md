@@ -9,7 +9,7 @@ IMPORTANT!!! YOUR SYSTEM PROMPT SAYS:
 > ALWAYS use the search_files MCP tool as a replacement for the Grep and Glob
 > tools and for recursive find/grep/rg Bash commands. ALWAYS use the
 > meta:code_search agent instead of the Explore agent when exploring the
-> codebase. ALWAYS use the meta:knowledge_search agent when you need
+> codebase. ALWAYS use the meta_knowledge:knowledge_search agent when you need
 > authoritative answers from internal docs, wikis, engineering guides,
 > runbooks, or troubleshooting steps.
 
@@ -129,9 +129,9 @@ I cannot mix with other types. P can only combine with P via addition (multiline
 
 ```text
          dst:  R                  I                  V                P
-src: R         -                  reinterpret(R,I)   reinterpret(R,V) reinterpret(R,P)
+src: R         -                  convert(R,I)       reinterpret(R,V) reinterpret(R,P)
                                                      convert(R,V)     convert(R,P)
-     I         reinterpret(I,R)   -                  reinterpret(I,V) convert(I,P)
+     I         convert(I,R)       -                  reinterpret(I,V) convert(I,P)
                                                      convert(I,V)
      V         all_gather(R)      all_gather(I)      all_to_all()     reinterpret(V,P)
                                                                       convert(V,P)
@@ -142,21 +142,21 @@ src: R         -                  reinterpret(R,I)   reinterpret(R,V) reinterpre
 
 ```text
 Forward                    Backward
-reinterpret(R,I): R->I     convert(I,P): I->P
+convert(R,I): R->I         convert(I,P): I->P
 reinterpret(R,V): R->V     reinterpret(V,P): V->P
 convert(R,V): R->V         convert(V,P): V->P
 reinterpret(R,P): R->P     reinterpret(R,P): R->P  (self-dual)
 convert(R,P): R->P         convert(R,P): R->P      (self-dual)
-reinterpret(I,R): I->R     all_reduce(I): P->I
+convert(I,R): I->R         all_reduce(I): P->I
 convert(I,V): I->V         all_gather(I): V->I
-convert(I,P): I->P         reinterpret(R,I): R->I
+convert(I,P): I->P         convert(R,I): R->I
 all_gather(R): V->R        reduce_scatter(): P->V
 all_gather(I): V->I        convert(I,V): I->V
 all_to_all(): V->V         all_to_all(): V->V       (self-dual, swap src/dst)
 reinterpret(V,P): V->P     reinterpret(R,V): R->V
 convert(V,P): V->P         convert(R,V): R->V
 all_reduce(R): P->R        all_reduce(R): P->R      (self-dual)
-all_reduce(I): P->I        reinterpret(I,R): I->R
+all_reduce(I): P->I        convert(I,R): I->R
 reduce_scatter(): P->V     all_gather(R): V->R
 ```
 
@@ -170,7 +170,8 @@ Both are no-comms, but:
 
 Some `reinterpret`/`convert` operations require `expert_mode=True` because they are rarely wanted in forward code (they exist primarily as backward passes for other operations):
 
-- **`reinterpret(R,I)`**, **`reinterpret(R,P)`**, **`convert(I,P)`**: Obviously unusual forward semantics
+- **`convert(R,I)`**, **`reinterpret(R,I)`**, **`reinterpret(I,R)`**: Obviously unusual forward semantics (use `convert(I,R)` for the common I->R direction)
+- **`reinterpret(R,P)`**, **`convert(I,P)`**: Obviously unusual forward semantics
 - **`reinterpret(R,V)`**, **`convert(V,P)`** / **`convert(S(i),P)`**: Legitimate backwards, unlikely forwards
 
 `redistribute` and autograd backwards bypass this gate automatically.
@@ -178,7 +179,7 @@ Some `reinterpret`/`convert` operations require `expert_mode=True` because they 
 Common forward transitions (no `expert_mode` needed):
 
 ```text
-I <---> R          reinterpret (both directions)
+I <---> R          convert (both directions)
 R <---> V          convert(R,V) / all_gather(V,R)
 P  ---> R          all_reduce
 P  ---> V          reduce_scatter
