@@ -23,7 +23,8 @@ from sixlib.spmd_types._collectives import (
     redistribute,
     reduce_scatter,
 )
-from sixlib.spmd_types._local import convert, reinterpret
+from sixlib.spmd_types._local import convert, invariant_to_replicate, reinterpret
+from sixlib.spmd_types._scalar import _unwrap_args, Scalar
 from sixlib.spmd_types.types import (
     DeviceMeshAxis,
     format_axis,
@@ -48,9 +49,20 @@ from sixlib.spmd_types.types import (
 class _ScalarType:
     """Sentinel for Python scalars in SPMD type inference.
 
-    A Python scalar is the same value on all ranks and carries no gradient.
-    It is compatible with both R and I -- analogous to how Python scalars are
-    "weak" in dtype promotion and do not determine the specific dtype.
+    We assume a Python scalar is the same value on all ranks and carries no
+    gradient.  This assumption can be wrong: a rank-dependent scalar (e.g.
+    ``rank / world_size``) is really Varying, and a scalar that is the sum of
+    per-rank contributions is really Partial.  We choose to assume Replicate
+    anyway because (1) the vast majority of scalars in practice *are* the same
+    on every rank, and (2) requiring users to annotate every literal ``2.0``
+    or ``eps`` would be extremely noisy for little safety gain.  A future
+    improvement could add an explicit wrapper (e.g. ``Varying(scalar)``) for
+    the rare rank-dependent case; until then Dynamo tracing with SymInt offers
+    partial safety.
+
+    Given the assumption, _Scalar is compatible with both R and I -- analogous
+    to how Python scalars are "weak" in dtype promotion and do not determine
+    the specific dtype.
 
     _Scalar participates in linearity validation (P + scalar is affine, not
     linear) but does not influence the inferred output type (R vs I).
@@ -239,16 +251,12 @@ def _format_error_with_suggestions(
 _LOCAL_TYPE_ATTR = "_local_type"
 
 
-def _validate_and_canonicalize(type: LocalSpmdType) -> LocalSpmdType:
-    """Validate and canonicalize a LocalSpmdType.
+def _validate(type: LocalSpmdType) -> LocalSpmdType:
+    """Validate a LocalSpmdType.
 
     Validates that all values are valid local SPMD types (R, I, V, or P).
     Shard types are not valid local SPMD types -- they are used as arguments to
     collective operations but must not be stored on tensors.
-
-    Canonicalizes by removing V entries: omitted mesh axes default to Varying,
-    so explicit V entries are redundant.  Stripping them ensures that
-    ``{"tp": R, "dp": V}`` and ``{"tp": R}`` compare as equal.
 
     Args:
         type: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types.
@@ -274,29 +282,29 @@ def _validate_and_canonicalize(type: LocalSpmdType) -> LocalSpmdType:
                 f"Expected PerMeshAxisLocalSpmdType (R, I, V, or P) on axis "
                 f"{format_axis(axis)}, got {typ!r}"
             )
-    return {axis: typ for axis, typ in type.items() if typ is not V}
+    return dict(type)
 
 
-def has_local_type(tensor: torch.Tensor) -> bool:
-    """Return True if the tensor has SPMD type annotations.
+def has_local_type(value: torch.Tensor | Scalar) -> bool:
+    """Return True if the tensor or Scalar has SPMD type annotations.
 
     Args:
-        tensor: The tensor to check for SPMD type annotations.
+        value: The tensor or Scalar to check for SPMD type annotations.
     """
-    return hasattr(tensor, _LOCAL_TYPE_ATTR)
+    return hasattr(value, _LOCAL_TYPE_ATTR)
 
 
-def get_local_type(tensor: torch.Tensor) -> LocalSpmdType:
-    """Get the SPMD types stored on a tensor.
+def get_local_type(value: torch.Tensor | Scalar) -> LocalSpmdType:
+    """Get the SPMD types stored on a tensor or Scalar.
 
     Args:
-        tensor: The tensor to retrieve SPMD type annotations from.
+        value: The tensor or Scalar to retrieve SPMD type annotations from.
 
     Raises:
-        AttributeError: If the tensor has no SPMD type annotations.
+        AttributeError: If the object has no SPMD type annotations.
             Use ``has_local_type`` to check first.
     """
-    result = getattr(tensor, _LOCAL_TYPE_ATTR, None)
+    result = getattr(value, _LOCAL_TYPE_ATTR, None)
     if result is None:
         raise AttributeError(
             "Tensor has no SPMD type annotations. "
@@ -312,7 +320,7 @@ def _set_local_type(tensor: torch.Tensor, type: LocalSpmdType) -> torch.Tensor:
         tensor: The tensor to annotate with an SPMD type.
         type: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types.
     """
-    setattr(tensor, _LOCAL_TYPE_ATTR, _validate_and_canonicalize(type))
+    setattr(tensor, _LOCAL_TYPE_ATTR, _validate(type))
     return tensor
 
 
@@ -407,7 +415,9 @@ def assert_type(  # noqa: C901
                     f"to specify the sharding order."
                 )
             dim_to_axes[resolved_dim] = axis
-        # S(i) axes are implicitly V -- omitted from local_type is fine
+        # S(i) axes are implicitly V -- store V explicitly
+        for axis in shard_entries:
+            local_type[axis] = V
 
     # Validate partition_spec
     if partition_spec is not None:
@@ -428,12 +438,14 @@ def assert_type(  # noqa: C901
                         f"partition_spec (implying Varying/Shard) but is "
                         f"specified as {axis_type} in type."
                     )
+                # partition_spec axes are implicitly V -- store V explicitly
+                local_type.setdefault(axis, V)
 
-    canonical = _validate_and_canonicalize(local_type)
+    canonical = _validate(local_type)
     if not has_local_type(tensor):
         return _set_local_type(tensor, canonical)
 
-    # existing is already canonical (_set_local_type canonicalizes on store)
+    # existing is already validated (_set_local_type validates on store)
     existing = get_local_type(tensor)
     if existing != canonical:
         raise AssertionError(
@@ -452,11 +464,9 @@ def get_axis_local_type(
 ) -> PerMeshAxisLocalSpmdType:
     """Get the SPMD type for a specific mesh axis.
 
-    Returns V (Varying) if the axis is not explicitly stored, since omitted
-    axes default to Varying.
-
     Raises:
-        ValueError: If the tensor has no SPMD type annotations.
+        ValueError: If the tensor has no SPMD type annotations, or if the
+            axis is not present in the tensor's SPMD type dict.
 
     Args:
         tensor: The tensor to query.
@@ -467,7 +477,13 @@ def get_axis_local_type(
             "get_axis_local_type: tensor has no SPMD type annotations. "
             "Use has_local_type() to check first, or assert_type() to annotate."
         )
-    return get_local_type(tensor).get(axis, V)
+    local_type = get_local_type(tensor)
+    if axis not in local_type:
+        raise ValueError(
+            f"Axis {format_axis(axis)} not found in tensor's SPMD type. "
+            f"Tensor has axes: {set(local_type.keys())}"
+        )
+    return local_type[axis]
 
 
 # =============================================================================
@@ -682,7 +698,14 @@ def infer_output_type(
     for axis in all_axes:
         axis_types = []
         for typ in input_types_list:
-            axis_types.append(typ.get(axis, V))
+            if axis not in typ:
+                raise SpmdTypeError(
+                    f"Operand missing axis {format_axis(axis)}. "
+                    f"Operand has axes {set(typ.keys())}, "
+                    f"but the union of all operand axes is {all_axes}. "
+                    f"All operands must be annotated on the same set of mesh axes."
+                )
+            axis_types.append(typ[axis])
 
         output_type[axis] = infer_local_type_for_axis(
             axis, axis_types, out_partial=axis in out_partial_axes, linearity=linearity
@@ -976,41 +999,70 @@ _DECOMP_TYPE_RULES: dict[Callable, Callable[..., LocalSpmdType]] = {
 }
 
 
+_SCALAR_TYPES = (int, float, complex, bool, str, type(None))
+_LEAF_TYPES = (torch.Tensor, *_SCALAR_TYPES)
+
+
+def _iter_tensors_in(val: object):
+    """Yield tensors from *val*, fast-pathing common leaf/flat cases.
+
+    Direct tensors and flat list/tuple of tensors are handled without pytree.
+    Anything else (nested containers, custom pytree-registered types) falls
+    back to ``torch.utils._pytree.tree_flatten``.
+    """
+    if isinstance(val, torch.Tensor):
+        yield val
+        return
+    if isinstance(val, (list, tuple)):
+        if all(isinstance(item, _LEAF_TYPES) for item in val):
+            # Fast path: flat list/tuple of tensors and scalar leaves.
+            for item in val:
+                if isinstance(item, torch.Tensor):
+                    yield item
+            return
+        # Unknown or nested types present -- flatten via pytree to handle
+        # nested containers and custom pytree-registered types.
+        flat, _ = torch.utils._pytree.tree_flatten(val)
+        for item in flat:
+            if isinstance(item, torch.Tensor):
+                yield item
+        return
+    if isinstance(val, _SCALAR_TYPES):
+        return
+    # Unknown type -- fall back to pytree.
+    flat, _ = torch.utils._pytree.tree_flatten(val)
+    for item in flat:
+        if isinstance(item, torch.Tensor):
+            yield item
+
+
 def _iter_tensor_args(args: tuple, kwargs: dict):
     """Yield all tensor arguments from args and kwargs.
 
-    Flattens one level of list/tuple in both positional args and kwargs values
-    (for ops like torch.cat/stack that accept tensor lists).
+    Handles direct tensors and flat list/tuple of tensors (common cases) with
+    a fast path, and falls back to pytree flattening for arbitrary nesting.
 
     Args:
         args: Positional arguments to the torch operation.
         kwargs: Keyword arguments to the torch operation.
     """
     for arg in args:
-        if isinstance(arg, torch.Tensor):
-            yield arg
-        elif isinstance(arg, (list, tuple)):
-            for item in arg:
-                if isinstance(item, torch.Tensor):
-                    yield item
-    for v in kwargs.values():
-        if isinstance(v, torch.Tensor):
-            yield v
-        elif isinstance(v, (list, tuple)):
-            for item in v:
-                if isinstance(item, torch.Tensor):
-                    yield item
+        yield from _iter_tensors_in(arg)
+    for key, v in kwargs.items():
+        if key == "out":
+            continue
+        yield from _iter_tensors_in(v)
 
 
-def _check_all_typed(func, args: tuple, kwargs: dict) -> None:  # noqa: C901
+def _check_all_typed(func, args: tuple, kwargs: dict) -> None:
     """Raise ``SpmdTypeError`` if any operand is unannotated.
 
     Called once at the top of the regular-op path in strict mode so that
     ``_collect_tensor_types`` itself stays simple and unconditional.
 
     Uses ``has_local_type`` rather than truthiness of the types dict because
-    ``_validate_and_canonicalize`` strips V entries -- a tensor annotated as all-V stores
-    ``{}`` but should still count as typed.
+    a tensor's type dict is an implementation detail -- ``has_local_type`` is
+    the canonical way to check whether a tensor has been annotated.
 
     Args:
         func: The torch function being called.
@@ -1019,29 +1071,17 @@ def _check_all_typed(func, args: tuple, kwargs: dict) -> None:  # noqa: C901
     """
     untyped: list[str] = []
     for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            if not has_local_type(arg):
-                untyped.append(
-                    f"args[{i}] (shape={tuple(arg.shape)}, dtype={arg.dtype})"
-                )
-        elif isinstance(arg, (list, tuple)):
-            for j, item in enumerate(arg):
-                if isinstance(item, torch.Tensor) and not has_local_type(item):
-                    untyped.append(
-                        f"args[{i}][{j}] (shape={tuple(item.shape)}, dtype={item.dtype})"
-                    )
+        for t in _iter_tensors_in(arg):
+            if not has_local_type(t):
+                untyped.append(f"args[{i}] (shape={tuple(t.shape)}, dtype={t.dtype})")
     for key, v in kwargs.items():
-        if isinstance(v, torch.Tensor):
-            if not has_local_type(v):
+        if key == "out":
+            continue
+        for t in _iter_tensors_in(v):
+            if not has_local_type(t):
                 untyped.append(
-                    f"kwargs[{key!r}] (shape={tuple(v.shape)}, dtype={v.dtype})"
+                    f"kwargs[{key!r}] (shape={tuple(t.shape)}, dtype={t.dtype})"
                 )
-        elif isinstance(v, (list, tuple)):
-            for j, item in enumerate(v):
-                if isinstance(item, torch.Tensor) and not has_local_type(item):
-                    untyped.append(
-                        f"kwargs[{key!r}][{j}] (shape={tuple(item.shape)}, dtype={item.dtype})"
-                    )
     if untyped:
         func_name = getattr(func, "__name__", repr(func))
         listing = "\n  ".join(untyped)
@@ -1068,8 +1108,8 @@ def _collect_input_types(  # noqa: C901
     spec we cannot distinguish scalar operands from non-tensor parameters
     (like ``dim``), so only tensor types are collected.
 
-    A Python scalar is the same value on all ranks and carries no gradient.
-    Rather than eagerly picking R or I, we assign _Scalar -- a typeless
+    We assume a Python scalar is the same value on all ranks and carries no
+    gradient.  Rather than eagerly picking R or I, we assign _Scalar -- a typeless
     sentinel analogous to "weak" scalars in dtype promotion.  The inference
     engine filters _Scalar when determining the output type, so scalars
     never force a choice between R and I.
@@ -1095,11 +1135,16 @@ def _collect_input_types(  # noqa: C901
             scalar_type: LocalSpmdType = {axis: _Scalar for axis in all_axes}
 
             def _check(val: object) -> None:
-                if _is_numeric_scalar(val):
+                if isinstance(val, Scalar):
+                    # Scalar wrapper: use its exact SPMD type.
+                    result.append(get_local_type(val))
+                elif _is_numeric_scalar(val):
                     result.append(scalar_type)
                 elif isinstance(val, (list, tuple)):
                     for item in val:
-                        if _is_numeric_scalar(item):
+                        if isinstance(item, Scalar):
+                            result.append(get_local_type(item))
+                        elif _is_numeric_scalar(item):
                             result.append(scalar_type)
 
             for i in spec.tensor_args:
@@ -1235,6 +1280,7 @@ _SPMD_FUNCTION_DEFAULTS: dict[Callable, dict[str, PerMeshAxisSpmdType | None]] =
     redistribute: {"src": None, "dst": None},
     reinterpret: {"src": None, "dst": None},
     convert: {"src": None, "dst": None},
+    invariant_to_replicate: {"src": I, "dst": R},
 }
 
 
@@ -1242,13 +1288,43 @@ _SPMD_FUNCTION_DEFAULTS: dict[Callable, dict[str, PerMeshAxisSpmdType | None]] =
 # TorchFunctionMode for SPMD Type Tracking
 # =============================================================================
 
-# Functions that are autograd/metadata bookkeeping, not tensor math.
-# These go through __torch_function__ but should not trigger type inference.
-_AUTOGRAD_PASSTHROUGH = {
+# Functions that are not tensor math -- autograd bookkeeping, metadata queries,
+# etc.  These go through __torch_function__ but should not trigger type
+# inference or strict-mode annotation checks.
+#
+# This set is intentionally exhaustive: any function that reaches
+# __torch_function__ and is NOT in this set will be type-checked.  This
+# ensures that unrecognized operations (e.g. raw torch.distributed
+# collectives) are caught rather than silently bypassing the checker.
+#
+# Note: property accesses like .shape/.ndim are handled by the __get__
+# check in __torch_function__, and .stride() is in PyTorch's
+# get_ignored_functions() so it never reaches __torch_function__ at all.
+_PASSTHROUGH = {
+    # Autograd bookkeeping
+    # TODO: Actually, backward probably can support type checking; in
+    # particular we could put annotations on all of the resulting grad
+    # tensors based on the typing of the leaf tensor.
     torch.Tensor.backward,
     torch.Tensor.requires_grad_,
     torch.Tensor.retain_grad,
+    # Metadata queries (return non-tensor values)
+    torch.Tensor.dim,
+    torch.Tensor.element_size,
+    torch.Tensor.is_complex,
+    torch.Tensor.is_contiguous,
+    torch.Tensor.is_floating_point,
+    torch.Tensor.nelement,
+    torch.Tensor.numel,
+    torch.Tensor.size,
+    torch.Tensor.untyped_storage,
+    torch.numel,
 }
+
+
+# Import shared state from _state module to avoid circular dependencies
+import sixlib.spmd_types._state as _state  # noqa: E402
+from sixlib.spmd_types._state import is_type_checking  # noqa: E402, F401
 
 
 class SpmdTypeMode(torch.overrides.TorchFunctionMode):
@@ -1288,10 +1364,22 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         """
         old = self._disabled
         self._disabled = True
+        if not old:
+            _state._spmd_type_mode_active -= 1
         try:
             yield
         finally:
             self._disabled = old
+            if not old:
+                _state._spmd_type_mode_active += 1
+
+    def __enter__(self):
+        _state._spmd_type_mode_active += 1
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _state._spmd_type_mode_active -= 1
+        return super().__exit__(exc_type, exc_val, exc_tb)
 
     def __torch_function__(self, func, types, args=(), kwargs=None):  # noqa: C901
         kwargs = kwargs or {}
@@ -1300,13 +1388,18 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         if self._disabled:
             return func(*args, **kwargs)
 
-        # Autograd bookkeeping -- not tensor math, skip type inference.
-        if func in _AUTOGRAD_PASSTHROUGH:
-            return func(*args, **kwargs)
-
         # Property access (e.g. .grad, .data, .shape) -- not tensor math.
         if getattr(func, "__name__", None) == "__get__":
             return func(*args, **kwargs)
+
+        # Autograd bookkeeping, metadata queries -- not tensor math.
+        if func in _PASSTHROUGH:
+            return func(*args, **kwargs)
+
+        # Unwrap Scalar objects to raw values for the actual function call,
+        # but keep the original args for type collection.
+        original_args, original_kwargs = args, kwargs
+        args, kwargs = _unwrap_args(args, kwargs)
 
         # Run the function first (catches runtime errors before type errors).
         # This means collectives execute before type checking, but that's fine:
@@ -1350,8 +1443,11 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
                 _set_local_type(result, output_type)
         else:
             # Regular torch op: propagate types according to non-comms rules
+            # Use original_args/original_kwargs so Scalar types are collected.
             spec = _OP_REGISTRY.get(func)
-            input_types_list = _collect_input_types(args, kwargs, spec)
+            input_types_list = _collect_input_types(
+                original_args, original_kwargs, spec
+            )
             if input_types_list:
                 # Check for type-level decomposition first.
                 decomp_rule = _DECOMP_TYPE_RULES.get(func)
@@ -1369,5 +1465,8 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
                         input_types_list, linearity=linearity
                     )
                 _set_result_type(result, output_type)
+                out = original_kwargs.get("out")
+                if out is not None:
+                    _set_result_type(out, output_type)
 
         return result

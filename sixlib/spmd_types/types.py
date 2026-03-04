@@ -4,6 +4,7 @@ SPMD type definitions for distributed tensor expressions.
 This module provides:
 - Per-mesh-axis local SPMD types (R, I, V, P, S)
 - PartitionSpec for global SPMD
+- TensorSharding for module boundary contracts
 - Type aliases
 """
 
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, TypeAlias
+from typing import Any, Sequence, TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -149,6 +150,83 @@ class PartitionSpec(tuple):
 
 
 GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"
+
+# =============================================================================
+# TensorSharding for Module Boundary Contracts
+# =============================================================================
+
+# Sharding for one tensor axis.
+# * None: replicated;
+# * str: the device mesh axis name, e.g., "fsdp" or "tp";
+# * Sequence[str]: multiple device mesh axis names, e.g., ("fsdp", "cp").
+DimSharding = None | str | Sequence[str]
+
+
+class _PytreeTuple:
+    """Tuple-like values that are treated as leaves of a PyTree.
+
+    The purpose of this class is to allow ``TensorSharding``s to be treated as
+    tree leaves (e.g., for compat with ``tree.map``).
+    """
+
+    def __init__(self, *values) -> None:
+        self._values = tuple(values)
+
+    def __repr__(self) -> str:
+        pr = repr(self._values)[1:-1]
+        return f"{type(self).__name__}({pr})"
+
+    def __getitem__(self, i):
+        return self._values[i]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, self.__class__):
+            return self._values == other._values
+        elif isinstance(other, tuple):
+            return self._values == other
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self._values)
+
+    def __add__(self, other):
+        if isinstance(other, (self.__class__, tuple)):
+            return self.__class__(*self, *other)
+        raise NotImplementedError(type(other))
+
+    def __radd__(self, other):
+        if isinstance(other, (self.__class__, tuple)):
+            return self.__class__(*other, *self)
+        raise NotImplementedError(type(other))
+
+    def index(self, value):
+        return self._values.index(value)
+
+    def count(self, value):
+        return self._values.count(value)
+
+
+class TensorSharding(_PytreeTuple):
+    """A tuple of ``DimSharding``s describing the sharding for a Tensor.
+
+    Each element maps one tensor dimension to zero, one, or multiple mesh axis
+    names.  For example::
+
+        TensorSharding("fsdp", "tp")   # dim 0 on fsdp, dim 1 on tp
+        TensorSharding(None, "tp")     # dim 0 replicated, dim 1 on tp
+        TensorSharding(("fsdp", "cp")) # dim 0 on both fsdp and cp
+
+    Its length must be less than or equal to the number of Tensor axes.
+    """
+
+    def __init__(self, *dim_shardings: DimSharding) -> None:
+        super().__init__(*dim_shardings)
 
 
 class SpmdTypeError(RuntimeError):

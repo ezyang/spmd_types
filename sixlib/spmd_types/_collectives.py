@@ -167,69 +167,107 @@ def all_reduce(
 # =============================================================================
 
 
-class _AllGather(torch.autograd.Function):
-    """all_gather: V -> R|I.
+class _AllGatherStack(torch.autograd.Function):
+    """all_gather with stack semantics: V -> R|I.
 
-    When dst=R, backward is reduce_scatter: P -> V.
+    When dst=R, backward is reduce_scatter(V): P -> V.
     When dst=I, backward is convert(I,V): I -> V.
     """
 
     @staticmethod
-    def forward(ctx, x, axis, dst, gather_dim, stack, split_sizes):
+    def forward(ctx, x, axis, dst, gather_dim):
         ctx.axis = axis
         ctx.dst = dst
         ctx.gather_dim = gather_dim
-        ctx.stack = stack
-        ctx.split_sizes = split_sizes
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
-        if split_sizes is None:
-            gathered = [torch.empty_like(x) for _ in range(world_size)]
-            _dist.dist.all_gather(gathered, x, group=pg)
-            if stack:
-                return torch.stack(gathered, dim=gather_dim)
-            return torch.cat(gathered, dim=gather_dim)
-        else:
-            ctx.rank = _dist.dist.get_rank(pg)
-            gathered = []
-            for s in split_sizes:
-                shape = list(x.shape)
-                shape[gather_dim] = s
-                gathered.append(torch.empty(shape, dtype=x.dtype, device=x.device))
-            _dist.dist.all_gather(gathered, x, group=pg)
-            return torch.cat(gathered, dim=gather_dim)
+        gathered = [torch.empty_like(x) for _ in range(world_size)]
+        _dist.dist.all_gather(gathered, x, group=pg)
+        return torch.stack(gathered, dim=gather_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
-        if ctx.split_sizes is None:
-            dst_type = V if ctx.stack else Shard(ctx.gather_dim)
-            if ctx.dst is R:
-                # backward is reduce_scatter: P -> V
-                grad = reduce_scatter(
-                    grad_out, ctx.axis, src=P, dst=dst_type, scatter_dim=ctx.gather_dim
-                )
-            else:
-                # backward is convert(I,V): I -> V
-                grad = convert(grad_out, ctx.axis, src=I, dst=dst_type)
-            return grad, None, None, None, None, None
-
+        if ctx.dst is R:
+            grad = reduce_scatter(
+                grad_out, ctx.axis, src=P, dst=V, scatter_dim=ctx.gather_dim
+            )
         else:
-            if ctx.dst is R:
-                # backward is reduce_scatter: P -> V
-                output = reduce_scatter(
-                    grad_out,
-                    ctx.axis,
-                    src=P,
-                    dst=Shard(ctx.gather_dim),
-                    split_sizes=ctx.split_sizes,
-                )
-            else:
-                # backward is convert(I,V): I -> V
-                chunks = list(
-                    torch.split(grad_out, list(ctx.split_sizes), dim=ctx.gather_dim)
-                )
-                output = chunks[ctx.rank].contiguous()
-            return output, None, None, None, None, None
+            grad = convert(grad_out, ctx.axis, src=I, dst=V)
+        return grad, None, None, None
+
+
+class _AllGatherShard(torch.autograd.Function):
+    """all_gather with shard semantics: S(i) -> R|I.
+
+    When dst=R, backward is reduce_scatter(S(i)): P -> S(i).
+    When dst=I, backward is convert(I,S(i)): I -> S(i).
+    """
+
+    @staticmethod
+    def forward(ctx, x, axis, dst, gather_dim):
+        ctx.axis = axis
+        ctx.dst = dst
+        ctx.gather_dim = gather_dim
+        pg = _get_mesh_axis_group(axis)
+        world_size = _dist.dist.get_world_size(pg)
+        gathered = [torch.empty_like(x) for _ in range(world_size)]
+        _dist.dist.all_gather(gathered, x, group=pg)
+        return torch.cat(gathered, dim=gather_dim)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if ctx.dst is R:
+            grad = reduce_scatter(
+                grad_out,
+                ctx.axis,
+                src=P,
+                dst=Shard(ctx.gather_dim),
+                scatter_dim=ctx.gather_dim,
+            )
+        else:
+            grad = convert(grad_out, ctx.axis, src=I, dst=Shard(ctx.gather_dim))
+        return grad, None, None, None
+
+
+class _AllGatherUneven(torch.autograd.Function):
+    """all_gather with uneven split_sizes: S(i) -> R|I.
+
+    When dst=R, backward is reduce_scatter(S(i)): P -> S(i) with split_sizes.
+    When dst=I, backward is manual split and select rank's chunk.
+    """
+
+    @staticmethod
+    def forward(ctx, x, axis, dst, gather_dim, split_sizes):
+        ctx.axis = axis
+        ctx.dst = dst
+        ctx.gather_dim = gather_dim
+        ctx.split_sizes = split_sizes
+        pg = _get_mesh_axis_group(axis)
+        ctx.rank = _dist.dist.get_rank(pg)
+        gathered = []
+        for s in split_sizes:
+            shape = list(x.shape)
+            shape[gather_dim] = s
+            gathered.append(torch.empty(shape, dtype=x.dtype, device=x.device))
+        _dist.dist.all_gather(gathered, x, group=pg)
+        return torch.cat(gathered, dim=gather_dim)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if ctx.dst is R:
+            output = reduce_scatter(
+                grad_out,
+                ctx.axis,
+                src=P,
+                dst=Shard(ctx.gather_dim),
+                split_sizes=ctx.split_sizes,
+            )
+        else:
+            chunks = list(
+                torch.split(grad_out, list(ctx.split_sizes), dim=ctx.gather_dim)
+            )
+            output = chunks[ctx.rank].contiguous()
+        return output, None, None, None, None
 
 
 def all_gather(
@@ -350,7 +388,11 @@ def all_gather(
     gather_dim = src.dim if isinstance(src, Shard) else 0
     stack = src is V
     if dst is R or dst is I:
-        return _AllGather.apply(x, axis, dst, gather_dim, stack, split_sizes)
+        if split_sizes is not None:
+            return _AllGatherUneven.apply(x, axis, dst, gather_dim, split_sizes)
+        if stack:
+            return _AllGatherStack.apply(x, axis, dst, gather_dim)
+        return _AllGatherShard.apply(x, axis, dst, gather_dim)
     else:
         raise ValueError(f"all_gather dst must be R or I, got {dst}")
 
@@ -360,79 +402,94 @@ def all_gather(
 # =============================================================================
 
 
-class _ReduceScatter(torch.autograd.Function):
-    """reduce_scatter: P -> V, backward is all_gather(R): V -> R."""
+class _ReduceScatterStack(torch.autograd.Function):
+    """reduce_scatter with stack semantics: P -> V, backward is all_gather(V,R): V -> R."""
 
     @staticmethod
-    def forward(ctx, x, axis, scatter_dim, stack, split_sizes):
+    def forward(ctx, x, axis, scatter_dim):
         ctx.axis = axis
         ctx.scatter_dim = scatter_dim
-        ctx.stack = stack
-        ctx.split_sizes = split_sizes
         pg = _get_mesh_axis_group(axis)
-        world_size = _dist.dist.get_world_size(pg)
-
-        if stack:
-            assert split_sizes is None
-            # x stacked on dim 0: shape[0] == world_size
-            result = x.new_empty([1] + list(x.shape[1:]))
-            _dist.dist.reduce_scatter_tensor(
-                result, x, op=_dist.dist.ReduceOp.SUM, group=pg
-            )
-            return result.squeeze(0)
-        elif split_sizes is not None:
-            assert stack is False
-            ctx.rank = _dist.dist.get_rank(pg)
-            x_list = list(torch.split(x, list(split_sizes), dim=scatter_dim))
-            output = torch.empty_like(x_list[ctx.rank])
-            _dist.dist.reduce_scatter(
-                output, x_list, op=_dist.dist.ReduceOp.SUM, group=pg
-            )
-            return output
-        else:
-            # reduce_scatter_tensor always scatters along dim 0, so we
-            # movedim before/after when scatter_dim != 0.
-            needs_permute = scatter_dim != 0
-            if needs_permute:
-                x = x.movedim(scatter_dim, 0).contiguous()
-
-            output_shape = list(x.shape)
-            output_shape[0] //= world_size
-            result = x.new_empty(output_shape)
-            _dist.dist.reduce_scatter_tensor(
-                result, x, op=_dist.dist.ReduceOp.SUM, group=pg
-            )
-
-            if needs_permute:
-                result = result.movedim(0, scatter_dim)
-            return result
+        # x stacked on dim 0: shape[0] == world_size
+        result = x.new_empty([1] + list(x.shape[1:]))
+        _dist.dist.reduce_scatter_tensor(
+            result, x, op=_dist.dist.ReduceOp.SUM, group=pg
+        )
+        return result.squeeze(0)
 
     @staticmethod
     def backward(ctx, grad_out):
-        if ctx.split_sizes is None:
-            # backward is all_gather(R): V -> R
-            src_type = V if ctx.stack else Shard(ctx.scatter_dim)
-            return (
-                all_gather(grad_out, ctx.axis, src=src_type, dst=R),
-                None,
-                None,
-                None,
-                None,
-            )
-        else:
-            return (
-                all_gather(
-                    grad_out,
-                    ctx.axis,
-                    src=Shard(ctx.scatter_dim),
-                    dst=R,
-                    split_sizes=ctx.split_sizes,
-                ),
-                None,
-                None,
-                None,
-                None,
-            )
+        return (
+            all_gather(grad_out, ctx.axis, src=V, dst=R),
+            None,
+            None,
+        )
+
+
+class _ReduceScatterShard(torch.autograd.Function):
+    """reduce_scatter with shard semantics: P -> S(i), backward is all_gather(S(i),R): S(i) -> R."""
+
+    @staticmethod
+    def forward(ctx, x, axis, scatter_dim):
+        ctx.axis = axis
+        ctx.scatter_dim = scatter_dim
+        pg = _get_mesh_axis_group(axis)
+        world_size = _dist.dist.get_world_size(pg)
+        # reduce_scatter_tensor always scatters along dim 0, so we
+        # movedim before/after when scatter_dim != 0.
+        needs_permute = scatter_dim != 0
+        if needs_permute:
+            x = x.movedim(scatter_dim, 0).contiguous()
+
+        output_shape = list(x.shape)
+        output_shape[0] //= world_size
+        result = x.new_empty(output_shape)
+        _dist.dist.reduce_scatter_tensor(
+            result, x, op=_dist.dist.ReduceOp.SUM, group=pg
+        )
+
+        if needs_permute:
+            result = result.movedim(0, scatter_dim)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return (
+            all_gather(grad_out, ctx.axis, src=Shard(ctx.scatter_dim), dst=R),
+            None,
+            None,
+        )
+
+
+class _ReduceScatterUneven(torch.autograd.Function):
+    """reduce_scatter with uneven split_sizes: P -> S(i), backward is all_gather(S(i),R) with split_sizes."""
+
+    @staticmethod
+    def forward(ctx, x, axis, scatter_dim, split_sizes):
+        ctx.axis = axis
+        ctx.scatter_dim = scatter_dim
+        ctx.split_sizes = split_sizes
+        pg = _get_mesh_axis_group(axis)
+        ctx.rank = _dist.dist.get_rank(pg)
+        x_list = list(torch.split(x, list(split_sizes), dim=scatter_dim))
+        output = torch.empty_like(x_list[ctx.rank])
+        _dist.dist.reduce_scatter(output, x_list, op=_dist.dist.ReduceOp.SUM, group=pg)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return (
+            all_gather(
+                grad_out,
+                ctx.axis,
+                src=Shard(ctx.scatter_dim),
+                dst=R,
+                split_sizes=ctx.split_sizes,
+            ),
+            None,
+            None,
+            None,
+        )
 
 
 def reduce_scatter(
@@ -548,8 +605,12 @@ def reduce_scatter(
         if scatter_dim is None:
             scatter_dim = 0
 
-    stack = dst is V
-    return _ReduceScatter.apply(x, axis, scatter_dim, stack, split_sizes)
+    if dst is V:
+        return _ReduceScatterStack.apply(x, axis, scatter_dim)
+    elif split_sizes is not None:
+        return _ReduceScatterUneven.apply(x, axis, scatter_dim, split_sizes)
+    else:
+        return _ReduceScatterShard.apply(x, axis, scatter_dim)
 
 
 # =============================================================================
@@ -557,56 +618,67 @@ def reduce_scatter(
 # =============================================================================
 
 
-class _AllToAll(torch.autograd.Function):
-    """all_to_all: V -> V, backward is all_to_all: V -> V."""
+class _AllToAllStack(torch.autograd.Function):
+    """all_to_all with stack semantics: V -> V, backward is all_to_all(V,V) with swapped dims."""
 
     @staticmethod
-    def forward(ctx, x, axis, split_dim, concat_dim, stack):
+    def forward(ctx, x, axis, split_dim, concat_dim):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.concat_dim = concat_dim
-        ctx.stack = stack
+        pg = _get_mesh_axis_group(axis)
+        input_chunks = list(torch.unbind(x, dim=split_dim))
+        output_chunks = [
+            torch.empty_like(input_chunks[0]) for _ in range(len(input_chunks))
+        ]
+        _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
+        return torch.stack(output_chunks, dim=concat_dim)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad = all_to_all(
+            grad_out,
+            ctx.axis,
+            src=V,
+            dst=V,
+            split_dim=ctx.concat_dim,
+            concat_dim=ctx.split_dim,
+        )
+        return grad, None, None, None
+
+
+class _AllToAllShard(torch.autograd.Function):
+    """all_to_all with shard semantics: S(i) -> S(j), backward is all_to_all(S(j),S(i))."""
+
+    @staticmethod
+    def forward(ctx, x, axis, split_dim, concat_dim):
+        ctx.axis = axis
+        ctx.split_dim = split_dim
+        ctx.concat_dim = concat_dim
         pg = _get_mesh_axis_group(axis)
         world_size = _dist.dist.get_world_size(pg)
-        # Split input
-        if stack:
-            input_chunks = list(torch.unbind(x, dim=split_dim))
-        else:
-            # TODO: support uneven splits by accepting explicit input/output
-            # sizes, like the underlying dist.all_to_all collective supports.
-            if x.shape[split_dim] % world_size != 0:
-                raise ValueError(
-                    f"all_to_all: tensor dimension {split_dim} (size {x.shape[split_dim]}) "
-                    f"is not evenly divisible by world_size ({world_size})"
-                )
-            input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
+        # TODO: support uneven splits by accepting explicit input/output
+        # sizes, like the underlying dist.all_to_all collective supports.
+        if x.shape[split_dim] % world_size != 0:
+            raise ValueError(
+                f"all_to_all: tensor dimension {split_dim} (size {x.shape[split_dim]}) "
+                f"is not evenly divisible by world_size ({world_size})"
+            )
+        input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
-        if stack:
-            return torch.stack(output_chunks, dim=concat_dim)
         return torch.cat(output_chunks, dim=concat_dim)
 
     @staticmethod
     def backward(ctx, grad_out):
-        # backward is also all_to_all (transpose back: swap src/dst and dims)
-        if ctx.stack:
-            grad = all_to_all(
-                grad_out,
-                ctx.axis,
-                src=V,
-                dst=V,
-                split_dim=ctx.concat_dim,
-                concat_dim=ctx.split_dim,
-            )
-        else:
-            # Backward reverses: split on old concat_dim, concat on old split_dim.
-            grad = all_to_all(
-                grad_out,
-                ctx.axis,
-                src=Shard(ctx.split_dim),
-                dst=Shard(ctx.concat_dim),
-            )
-        return grad, None, None, None, None
+        # Backward reverses: split on old concat_dim, concat on old split_dim.
+        grad = all_to_all(
+            grad_out,
+            ctx.axis,
+            src=Shard(ctx.split_dim),
+            dst=Shard(ctx.concat_dim),
+        )
+        return grad, None, None, None
 
 
 def all_to_all(
@@ -741,8 +813,10 @@ def all_to_all(
         if concat_dim is None:
             concat_dim = 0
 
-    stack = src is V and dst is V
-    return _AllToAll.apply(x, axis, split_dim, concat_dim, stack)
+    if src is V and dst is V:
+        return _AllToAllStack.apply(x, axis, split_dim, concat_dim)
+    else:
+        return _AllToAllShard.apply(x, axis, split_dim, concat_dim)
 
 
 # =============================================================================

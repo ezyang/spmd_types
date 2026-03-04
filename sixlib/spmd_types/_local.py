@@ -935,4 +935,11 @@ def invariant_to_replicate(
         x: Input tensor with I type on the mesh axis
         axis: The mesh axis to operate on (string name or ProcessGroup)
     """
-    return convert(x, axis, src=I, dst=R)
+    # Directly call the autograd function rather than going through
+    # convert(), so that callers (e.g. copy_to_tensor_model_parallel_region)
+    # can read straight through to the actual work without needing to match
+    # src/dst and trace into reinterpret's dispatch table.  This duplicates
+    # the I->R case from reinterpret() intentionally for readability.
+    if has_torch_function_unary(x):
+        return handle_torch_function(invariant_to_replicate, (x,), x, axis)
+    return _InvariantToReplicate.apply(x, axis)

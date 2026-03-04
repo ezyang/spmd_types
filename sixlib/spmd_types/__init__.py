@@ -1,10 +1,14 @@
 # spmd_types package
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 # Collectives and operations
 from sixlib.spmd_types._checker import (  # noqa: F401
     assert_local_type,
     assert_type,
+    is_type_checking,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (  # noqa: F401
@@ -26,9 +30,11 @@ from sixlib.spmd_types._mesh import (  # noqa: F401
     get_mesh,
     set_mesh,
 )
+from sixlib.spmd_types._scalar import Scalar  # noqa: F401
 
 # Types
 from sixlib.spmd_types.types import (  # noqa: F401
+    DimSharding,
     I,
     Invariant,
     LocalSpmdType,
@@ -43,6 +49,33 @@ from sixlib.spmd_types.types import (  # noqa: F401
     S,
     Shard,
     SpmdTypeError,
+    TensorSharding,
     V,
     Varying,
 )
+
+
+class _SpmdTypesModule(ModuleType):
+    """Module wrapper that provides TYPE_CHECKING as a dynamic attribute.
+
+    Accessing ``sixlib.spmd_types.TYPE_CHECKING`` returns True when a
+    SpmdTypeMode context is active and False otherwise.  This uses the
+    sys.modules replacement trick (same pattern as torch._dynamo.config)
+    so that a simple attribute read works like a function call.
+    """
+
+    @property
+    def TYPE_CHECKING(self) -> bool:
+        return is_type_checking()
+
+
+# Replace this module in sys.modules so that attribute access on the
+# module object goes through _SpmdTypesModule.__getattr__ / properties.
+_self = sys.modules[__name__]
+_obj = _SpmdTypesModule(__name__)
+_obj.__dict__.update(_self.__dict__)
+_obj.__file__ = _self.__file__
+_obj.__package__ = _self.__package__
+_obj.__path__ = _self.__path__  # type: ignore[attr-defined]
+_obj.__spec__ = _self.__spec__
+sys.modules[__name__] = _obj

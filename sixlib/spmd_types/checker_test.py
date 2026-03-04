@@ -13,6 +13,7 @@ from sixlib.spmd_types import (
     P,
     R,
     S,
+    Scalar,
     V,
 )
 from sixlib.spmd_types._checker import (
@@ -53,11 +54,7 @@ class TestLinearTypePropagation(SpmdTypeCheckedTestCase):
     """Test type propagation through F.linear (matmul + optional bias)."""
 
     def test_linear_r_v_gives_v(self):
-        """F.linear with R weight and V input should give V output, not R.
-
-        Regression: V is canonicalized to {} so its type was silently dropped
-        during per-axis type collection, making the output R instead of V.
-        """
+        """F.linear with R weight and V input should give V output, not R."""
         inp = self._generate_inputs((2, 4), "tp", V)
         weight = self._generate_inputs((3, 4), "tp", R)
         result = torch.nn.functional.linear(inp, weight)
@@ -220,9 +217,9 @@ class TestStrictMode(SpmdTypeCheckedTestCase):
         self.assertIs(get_axis_local_type(result, "tp"), R)
 
     def test_strict_all_v_annotated_mixed_with_unannotated_fails(self):
-        """Strict mode catches all-V tensor (canonicalizes to {}) mixed with unannotated."""
+        """Strict mode catches all-V tensor mixed with unannotated."""
         x = self._generate_inputs((4,), "tp", V)
-        # x has _spmd_types attr (set to {} after canonicalization)
+        # x has _spmd_types attr (set to {"tp": V})
         y = self.rank_map(lambda r: torch.randn(4))
         # y has no _spmd_types attr at all
         with self.assertRaises(SpmdTypeError):
@@ -247,6 +244,24 @@ class TestStrictMode(SpmdTypeCheckedTestCase):
         with self.assertRaises(SpmdTypeError):
             all_reduce(y, "tp", src=P, dst=R)
 
+    def test_strict_out_kwarg_unannotated_passes(self):
+        """Strict mode allows unannotated out= tensor (it's just a pre-allocated destination)."""
+        a = self._generate_inputs((4,), "tp", R)
+        b = self._generate_inputs((4,), "tp", R)
+        c = self.rank_map(lambda r: torch.empty(4))  # unannotated
+        self.assertFalse(has_local_type(c))
+        torch.add(a, b, out=c)  # should NOT raise
+        # out= tensor gets the inferred type
+        self.assertIs(get_axis_local_type(c, "tp"), R)
+
+    def test_strict_out_kwarg_inputs_still_checked(self):
+        """Strict mode still checks actual input operands even when out= is present."""
+        a = self.rank_map(lambda r: torch.randn(4))  # unannotated input
+        b = self._generate_inputs((4,), "tp", R)
+        c = self.rank_map(lambda r: torch.empty(4))
+        with self.assertRaises(SpmdTypeError):
+            torch.add(a, b, out=c)
+
     def test_nonstrict_mixed_passes(self):
         """Non-strict mode allows mixing annotated and unannotated tensors."""
         self.spmd_mode.__exit__(None, None, None)
@@ -266,8 +281,7 @@ class TestTypeErrorMessages(expecttest.TestCase):
     """Test that type errors include actionable fix suggestions.
 
     Tests call infer_local_type_for_axis directly rather than going through
-    torch ops, because V (Varying) is canonicalized away in the type tracker
-    and cannot appear in collected types.
+    torch ops to test specific axis-type combinations in isolation.
     """
 
     def test_general_I_R(self):
@@ -834,6 +848,83 @@ class TestAddmmTypeDecomposition(SpmdTypeCheckedTestCase):
         x = self._generate_inputs((2, 3), "tp", P)
         result = torch.mean(x)
         self.assertIs(get_axis_local_type(result, "tp"), P)
+
+
+class TestScalarWrapper(SpmdTypeCheckedTestCase):
+    """Test the Scalar wrapper for annotating Python scalars with SPMD types."""
+
+    def test_scalar_has_local_type(self):
+        """has_local_type(Scalar(1.0, {tp: R})) is True."""
+        s = Scalar(1.0, {"tp": R})
+        self.assertTrue(has_local_type(s))
+
+    def test_scalar_get_local_type(self):
+        """get_local_type returns the stored type."""
+        s = Scalar(1.0, {"tp": R})
+        self.assertEqual(get_axis_local_type(s, "tp"), R)
+
+    def test_add_r_scalar_v(self):
+        """torch.add(R, Scalar(V)) -> V.
+
+        With a plain 1.0, R + scalar -> R. With Scalar(1.0, {tp: V}),
+        R + V -> V. This catches rank-dependent scalars.
+        """
+        x = self._generate_inputs((4,), "tp", R)
+        s = Scalar(1.0, {"tp": V})
+        result = torch.add(x, s)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_add_v_scalar_v(self):
+        """torch.add(V, Scalar(V)) -> V."""
+        x = self._generate_inputs((4,), "tp", V)
+        s = Scalar(1.0, {"tp": V})
+        result = torch.add(x, s)
+        self.assertIs(get_axis_local_type(result, "tp"), V)
+
+    def test_mul_p_scalar_r(self):
+        """torch.mul(P, Scalar(R)) -> P (multilinear)."""
+        x = self._generate_inputs((4,), "tp", P)
+        s = Scalar(2.0, {"tp": R})
+        result = torch.mul(x, s)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
+
+    def test_add_p_scalar_p(self):
+        """torch.add(P, Scalar(P)) -> P (linear)."""
+        x = self._generate_inputs((4,), "tp", P)
+        s = Scalar(1.0, {"tp": P})
+        result = torch.add(x, s)
+        self.assertIs(get_axis_local_type(result, "tp"), P)
+
+    def test_add_r_scalar_p_error(self):
+        """torch.add(R, Scalar(P)) -> SpmdTypeError (P+R is affine).
+
+        With a plain 1.0, R + scalar -> R. With Scalar(local_sum, {tp: P}),
+        R + P is invalid (affine, not linear).
+        """
+        x = self._generate_inputs((4,), "tp", R)
+        s = Scalar(1.0, {"tp": P})
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, s)
+
+    def test_add_i_scalar_v_error(self):
+        """torch.add(I, Scalar(V)) -> SpmdTypeError (I can't mix)."""
+        x = self._generate_inputs((4,), "tp", I)
+        s = Scalar(1.0, {"tp": V})
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, s)
+
+    def test_scalar_without_type_mode(self):
+        """Scalar unwraps and computes without SpmdTypeMode."""
+        # Exit the SpmdTypeMode to test Scalar outside type checking.
+        self.spmd_mode.__exit__(None, None, None)
+        try:
+            x = torch.tensor([1.0, 2.0, 3.0])
+            s = Scalar(2.0, {"tp": V})
+            result = torch.mul(x, s)
+            expected = torch.tensor([2.0, 4.0, 6.0])
+            torch.testing.assert_close(result, expected)
+        finally:
+            self.spmd_mode.__enter__()
 
 
 if __name__ == "__main__":
