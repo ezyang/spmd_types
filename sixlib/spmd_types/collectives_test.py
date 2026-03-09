@@ -7,6 +7,7 @@ Covers: _collectives.py
 import unittest
 
 import torch
+import torch.distributed as dist
 from sixlib.spmd_types import (
     all_gather,
     all_reduce,
@@ -33,14 +34,14 @@ class TestAllReduce(LocalTensorTestCase):
     def test_all_reduce_p_to_r(self):
         """all_reduce(R): P -> R, sums across ranks. Tests forward and backward."""
         # Create "partial" input - different values per rank that need summing
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
 
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Run all_reduce
         with SpmdTypeMode():
-            result = all_reduce(x, "tp", src=P, dst=R)
+            result = all_reduce(x, self.pg, src=P, dst=R)
 
         # Check all ranks have the same summed value
         self._assert_all_ranks_equal(
@@ -48,48 +49,48 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_reduce_p_to_i(self):
         """all_reduce(I): P -> I, sums across ranks. Tests forward and backward."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         with SpmdTypeMode():
-            result = all_reduce(x, "tp", src=P, dst=I)
+            result = all_reduce(x, self.pg, src=P, dst=I)
 
         self._assert_all_ranks_equal(
             result, "all_reduce result should be same on all ranks"
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_all_reduce_invalid_src(self):
         """all_reduce only accepts partial src."""
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         with self.assertRaises(ValueError) as ctx:
-            all_reduce(x, "tp", src=R, dst=R)
+            all_reduce(x, self.pg, src=R, dst=R)
         self.assertIn("must be P", str(ctx.exception))
 
     def test_all_reduce_invalid_dst(self):
         """all_reduce only accepts replicate or invariant dst."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(ValueError) as ctx:
-            all_reduce(x, "tp", src=P, dst=V)
+            all_reduce(x, self.pg, src=P, dst=V)
         self.assertIn("must be R or I", str(ctx.exception))
 
     def test_all_reduce_p_to_r_inplace(self):
         """all_reduce(R, inplace=True): P -> R in-place. Result shares storage with input."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
         with SpmdTypeMode():
-            result = all_reduce(x, "tp", src=P, dst=R, inplace=True)
+            result = all_reduce(x, self.pg, src=P, dst=R, inplace=True)
 
         # Check correctness
         self._assert_all_ranks_equal(
@@ -97,7 +98,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
         # Check in-place: returned tensor shares storage with input
         for r in range(self.WORLD_SIZE):
@@ -109,14 +110,14 @@ class TestAllReduce(LocalTensorTestCase):
 
     def test_all_reduce_p_to_i_inplace(self):
         """all_reduce(I, inplace=True): P -> I in-place. Result shares storage with input."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
         with SpmdTypeMode():
-            result = all_reduce(x, "tp", src=P, dst=I, inplace=True)
+            result = all_reduce(x, self.pg, src=P, dst=I, inplace=True)
 
         # Check correctness
         self._assert_all_ranks_equal(
@@ -124,7 +125,7 @@ class TestAllReduce(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
         # Check in-place: returned tensor shares storage with input
         for r in range(self.WORLD_SIZE):
@@ -137,18 +138,19 @@ class TestAllReduce(LocalTensorTestCase):
     def test_all_reduce_preserves_other_axes(self):
         """all_reduce preserves SPMD types on other mesh axes."""
         x = self.mode.rank_map(lambda r: torch.randn(4) + r)
-        assert_type(x, {"tp": P, "dp": R})
+        dp = dist.new_group()
+        assert_type(x, {self.pg: P, dp: R})
         with SpmdTypeMode():
-            result = all_reduce(x, "tp", src=P, dst=R)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
-        self.assertIs(get_axis_local_type(result, "dp"), R)
+            result = all_reduce(x, self.pg, src=P, dst=R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
+        self.assertIs(get_axis_local_type(result, dp), R)
 
     def test_all_reduce_type_mismatch(self):
         """all_reduce raises SpmdTypeError when input type doesn't match src."""
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         with SpmdTypeMode():
             with self.assertRaises(SpmdTypeError):
-                all_reduce(x, "tp", src=P, dst=R)
+                all_reduce(x, self.pg, src=P, dst=R)
 
 
 class TestAllGather(LocalTensorTestCase):
@@ -158,60 +160,60 @@ class TestAllGather(LocalTensorTestCase):
         """all_gather(R): V -> R, gathers shards from all ranks."""
         # Create varying input - different per rank
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=V, dst=R)
+            result = all_gather(x, self.pg, src=V, dst=R)
 
         # Result should be [0, 1, 2] on all ranks (stack)
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_gather_v_to_i(self):
         """all_gather(I): V -> I, gathers shards from all ranks."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=V, dst=I)
+            result = all_gather(x, self.pg, src=V, dst=I)
 
         expected = torch.tensor([0.0, 2.0, 4.0])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_all_gather_shard_to_r(self):
         """all_gather(R): S(i) -> R, gathers shards from all ranks."""
         # Create sharded input on dim 0
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(0), dst=R)
+            result = all_gather(x, self.pg, src=S(0), dst=R)
 
         # Result should be concatenated shards
         expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_gather_invalid_src(self):
         """all_gather only accepts V or S(i) src."""
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         with self.assertRaises(ValueError) as ctx:
-            all_gather(x, "tp", src=R, dst=R)
+            all_gather(x, self.pg, src=R, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
     def test_all_gather_invalid_dst(self):
         """all_gather only accepts replicate or invariant dst."""
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         with self.assertRaises(ValueError) as ctx:
-            all_gather(x, "tp", src=V, dst=P)
+            all_gather(x, self.pg, src=V, dst=P)
         self.assertIn("must be R or I", str(ctx.exception))
 
 
@@ -229,10 +231,10 @@ class TestReduceScatter(LocalTensorTestCase):
             ).reshape(self.WORLD_SIZE, chunk_size)
             + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
         with SpmdTypeMode():
-            result = reduce_scatter(x, "tp", src=P, dst=V, scatter_dim=0)
+            result = reduce_scatter(x, self.pg, src=P, dst=V, scatter_dim=0)
 
         # Each rank r gets the sum of chunk r from all ranks
         for r in range(self.WORLD_SIZE):
@@ -244,7 +246,7 @@ class TestReduceScatter(LocalTensorTestCase):
                 expected,
                 msg=f"rank {r}",
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_reduce_scatter_to_shard(self):
         """reduce_scatter: P -> S(i), reduces and scatters."""
@@ -252,10 +254,10 @@ class TestReduceScatter(LocalTensorTestCase):
         x = self.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
         with SpmdTypeMode():
-            result = reduce_scatter(x, "tp", src=P, dst=S(0))
+            result = reduce_scatter(x, self.pg, src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -268,20 +270,20 @@ class TestReduceScatter(LocalTensorTestCase):
                 expected,
                 msg=f"rank {r}",
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_reduce_scatter_invalid_src(self):
         """reduce_scatter only accepts P (or V, which is auto-reinterpreted) src."""
-        x = self._generate_inputs((6,), "tp", R)
+        x = self._generate_inputs((6,), self.pg, R)
         with self.assertRaises(ValueError) as ctx:
-            reduce_scatter(x, "tp", src=R, dst=V)
+            reduce_scatter(x, self.pg, src=R, dst=V)
         self.assertIn("must be P", str(ctx.exception))
 
     def test_reduce_scatter_invalid_dst(self):
         """reduce_scatter only accepts V or S(i) dst."""
-        x = self._generate_inputs((6,), "tp", P)
+        x = self._generate_inputs((6,), self.pg, P)
         with self.assertRaises(ValueError) as ctx:
-            reduce_scatter(x, "tp", src=P, dst=R)
+            reduce_scatter(x, self.pg, src=P, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
 
@@ -295,10 +297,10 @@ class TestAllToAll(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)])
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_to_all(x, "tp", src=V, dst=V, split_dim=0, concat_dim=0)
+            result = all_to_all(x, self.pg, src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
         for r in range(self.WORLD_SIZE):
@@ -306,7 +308,7 @@ class TestAllToAll(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_all_to_all_shard_to_shard(self):
         """all_to_all: S(i) -> S(j), resharding between dimensions."""
@@ -315,30 +317,53 @@ class TestAllToAll(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_to_all(x, "tp", src=S(0), dst=S(1))
+            result = all_to_all(x, self.pg, src=S(0), dst=S(1))
 
         # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 6)
             self.assertEqual(result._local_tensors[r].shape[1], 1)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_all_to_all_invalid_src(self):
         """all_to_all only accepts V or S(i) src."""
-        x = self._generate_inputs((6,), "tp", R)
+        x = self._generate_inputs((6,), self.pg, R)
         with self.assertRaises(ValueError) as ctx:
-            all_to_all(x, "tp", src=R, dst=V)
+            all_to_all(x, self.pg, src=R, dst=V)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
     def test_all_to_all_invalid_dst(self):
         """all_to_all only accepts V or S(i) dst."""
-        x = self._generate_inputs((6,), "tp", V)
+        x = self._generate_inputs((6,), self.pg, V)
         with self.assertRaises(ValueError) as ctx:
-            all_to_all(x, "tp", src=V, dst=R)
+            all_to_all(x, self.pg, src=V, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
+
+    def test_all_to_all_v_v_backward(self):
+        """all_to_all(V, V) backward satisfies the adjoint identity."""
+        x = self._generate_inputs((self.WORLD_SIZE,), self.pg, V)
+        self.spmd_gradcheck(
+            lambda t: all_to_all(t, self.pg, src=V, dst=V, split_dim=0, concat_dim=0),
+            x,
+            self.pg,
+            V,
+            V,
+        )
+
+    def test_all_to_all_shard_backward(self):
+        """all_to_all(S(0), S(1)) backward satisfies the adjoint identity."""
+        # Each rank has a 2D tensor; both dims divisible by WORLD_SIZE.
+        x = self._generate_inputs((self.WORLD_SIZE, self.WORLD_SIZE), self.pg, V)
+        self.spmd_gradcheck(
+            lambda t: all_to_all(t, self.pg, src=S(0), dst=S(1)),
+            x,
+            self.pg,
+            V,  # S(0) is V at the base level
+            V,  # S(1) is V at the base level
+        )
 
 
 class TestAllGatherUnevenShard(LocalTensorTestCase):
@@ -351,10 +376,10 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         x = self.rank_map(
             lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+            result = all_gather(x, self.pg, src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should be concatenation of all shards on all ranks
         expected = torch.cat(
@@ -366,7 +391,7 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_gather_uneven_shard_to_i(self):
         """all_gather(I) with split_sizes: S(0) -> I, uneven shards."""
@@ -374,10 +399,10 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         x = self.rank_map(
             lambda r: torch.arange(split_sizes[r], dtype=torch.float) + r * 10
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(0), dst=I, split_sizes=split_sizes)
+            result = all_gather(x, self.pg, src=S(0), dst=I, split_sizes=split_sizes)
 
         expected = torch.cat(
             [
@@ -388,30 +413,30 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_all_gather_uneven_shard_2d(self):
         """all_gather with split_sizes on 2D tensors: S(0) -> R."""
         split_sizes = [2, 3, 1]
         D = 4
         x = self.mode.rank_map(lambda r: torch.randn(split_sizes[r], D))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(0), dst=R, split_sizes=split_sizes)
+            result = all_gather(x, self.pg, src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should have shape (sum(split_sizes), D) = (6, 4)
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape, (6, D))
         self._assert_all_ranks_equal(result)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_gather_split_sizes_rejected_for_v(self):
         """split_sizes should be rejected when src=V."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
         with self.assertRaises(ValueError) as ctx:
-            all_gather(x, "tp", src=V, dst=R, split_sizes=[1, 1, 1])
+            all_gather(x, self.pg, src=V, dst=R, split_sizes=[1, 1, 1])
         self.assertIn("only supported with src=S(i)", str(ctx.exception))
 
 
@@ -427,9 +452,9 @@ class TestReduceScatterUnevenShard(LocalTensorTestCase):
         split_sizes = [3, 2, 2]
         total = sum(split_sizes)
         x = self.mode.rank_map(lambda r: torch.arange(total, dtype=torch.float) + r)
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
-        result = reduce_scatter(x, "tp", src=P, dst=S(0), split_sizes=split_sizes)
+        result = reduce_scatter(x, self.pg, src=P, dst=S(0), split_sizes=split_sizes)
 
         # Each rank r gets the sum of chunk r from all ranks
         for r in range(self.WORLD_SIZE):
@@ -441,16 +466,16 @@ class TestReduceScatterUnevenShard(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_reduce_scatter_split_sizes_rejected_for_v(self):
         """split_sizes should be rejected when dst=V."""
         x = self.mode.rank_map(
             lambda r: torch.arange(9, dtype=torch.float).reshape(3, 3) + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
         with self.assertRaises(ValueError) as ctx:
-            reduce_scatter(x, "tp", src=P, dst=V, split_sizes=[3, 3, 3])
+            reduce_scatter(x, self.pg, src=P, dst=V, split_sizes=[3, 3, 3])
         self.assertIn("only supported with dst=S(i)", str(ctx.exception))
 
 
@@ -461,26 +486,26 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         """all_gather with S(1) concatenates on dim 1."""
         # Each rank has shape (2, 1)
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(1), dst=R)
+            result = all_gather(x, self.pg, src=S(1), dst=R)
 
         # Result should have shape (2, 3) on all ranks (cat along dim 1)
         expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_all_gather_2d_tensors(self):
         """all_gather with 2D varying tensors."""
         # Each rank has a 2x2 matrix
         x = self.mode.rank_map(lambda r: torch.full((2, 2), float(r)))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=V, dst=R)
+            result = all_gather(x, self.pg, src=V, dst=R)
 
         # Result should be (3, 2, 2) - stack along dim 0
         expected = torch.stack(
@@ -489,7 +514,7 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
 
 class TestAllToAllMultiDim(LocalTensorTestCase):
@@ -501,9 +526,9 @@ class TestAllToAllMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
-        result = all_to_all(x, "tp", split_dim=0, concat_dim=0)
+        result = all_to_all(x, self.pg, split_dim=0, concat_dim=0)
 
         # After all_to_all:
         # Rank 0 gets [0th row from rank 0, 0th row from rank 1, 0th row from rank 2]
@@ -511,6 +536,247 @@ class TestAllToAllMultiDim(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             result_tensor = result._local_tensors[r]
             self.assertEqual(result_tensor.shape, (3, 2))
+
+
+class TestRawDistCollective(LocalTensorTestCase):
+    """Test type checking of raw torch.distributed collectives."""
+
+    def test_raw_all_gather_into_tensor_v_to_r(self):
+        """all_gather_into_tensor with V input and R output passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.pg: R})
+
+        with SpmdTypeMode():
+            dist.all_gather_into_tensor(output, x, group=pg)
+
+        # Output retains its R annotation
+        self.assertIs(get_axis_local_type(output, self.pg), R)
+
+    def test_raw_all_gather_into_tensor_v_to_i(self):
+        """all_gather_into_tensor with V input and I output passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.pg: I})
+
+        with SpmdTypeMode():
+            dist.all_gather_into_tensor(output, x, group=pg)
+
+        self.assertIs(get_axis_local_type(output, self.pg), I)
+
+    def test_raw_all_gather_into_tensor_wrong_input_type(self):
+        """all_gather_into_tensor with R input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0, 2.0]))
+        assert_type(x, {self.pg: R})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.pg: R})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_gather_into_tensor(output, x, group=pg)
+
+    def test_raw_all_gather_into_tensor_wrong_output_type(self):
+        """all_gather_into_tensor with V output raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.pg: V})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_gather_into_tensor(output, x, group=pg)
+
+    # -----------------------------------------------------------------
+    # all_reduce: P -> R (in-place)
+    # -----------------------------------------------------------------
+
+    def test_raw_all_reduce_p_to_r(self):
+        """all_reduce with P input mutates type to R."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {pg: P})
+
+        with SpmdTypeMode():
+            dist.all_reduce(x, group=pg)
+
+        # Type mutated in-place from P to R
+        self.assertIs(get_axis_local_type(x, pg), R)
+
+    def test_raw_all_reduce_wrong_input_type(self):
+        """all_reduce with R input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0, 2.0]))
+        assert_type(x, {pg: R})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_reduce(x, group=pg)
+
+    def test_raw_all_reduce_wrong_input_type_v(self):
+        """all_reduce with V input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        assert_type(x, {pg: V})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_reduce(x, group=pg)
+
+    # -----------------------------------------------------------------
+    # reduce_scatter_tensor: P -> V
+    # -----------------------------------------------------------------
+
+    def test_raw_reduce_scatter_tensor_p_to_v(self):
+        """reduce_scatter_tensor with P input and V output passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)] * self.WORLD_SIZE))
+        assert_type(x, {pg: P})
+        output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
+        assert_type(output, {pg: V})
+
+        with SpmdTypeMode():
+            dist.reduce_scatter_tensor(output, x, group=pg)
+
+        self.assertIs(get_axis_local_type(output, pg), V)
+
+    def test_raw_reduce_scatter_tensor_wrong_input_type(self):
+        """reduce_scatter_tensor with R input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0] * self.WORLD_SIZE))
+        assert_type(x, {pg: R})
+        output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
+        assert_type(output, {pg: V})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.reduce_scatter_tensor(output, x, group=pg)
+
+    def test_raw_reduce_scatter_tensor_wrong_output_type(self):
+        """reduce_scatter_tensor with R output raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)] * self.WORLD_SIZE))
+        assert_type(x, {pg: P})
+        output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
+        assert_type(output, {pg: R})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.reduce_scatter_tensor(output, x, group=pg)
+
+    # -----------------------------------------------------------------
+    # all_to_all_single: V -> V
+    # -----------------------------------------------------------------
+
+    def test_raw_all_to_all_single_v_to_v(self):
+        """all_to_all_single with V input and V output passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)] * self.WORLD_SIZE))
+        assert_type(x, {pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
+        assert_type(output, {pg: V})
+
+        with SpmdTypeMode():
+            dist.all_to_all_single(output, x, group=pg)
+
+        self.assertIs(get_axis_local_type(output, pg), V)
+
+    def test_raw_all_to_all_single_wrong_input_type(self):
+        """all_to_all_single with R input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0] * self.WORLD_SIZE))
+        assert_type(x, {pg: R})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
+        assert_type(output, {pg: V})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_to_all_single(output, x, group=pg)
+
+    def test_raw_all_to_all_single_wrong_output_type(self):
+        """all_to_all_single with R output raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)] * self.WORLD_SIZE))
+        assert_type(x, {pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
+        assert_type(output, {pg: R})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_to_all_single(output, x, group=pg)
+
+    # -----------------------------------------------------------------
+    # all_gather (list-based): V -> R|I
+    # -----------------------------------------------------------------
+
+    def test_raw_all_gather_v_to_r(self):
+        """all_gather with V input and R output tensors passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {pg: V})
+        tensor_list = [
+            self.mode.rank_map(lambda r: torch.empty(2)) for _ in range(self.WORLD_SIZE)
+        ]
+        for t in tensor_list:
+            assert_type(t, {pg: R})
+
+        with SpmdTypeMode():
+            dist.all_gather(tensor_list, x, group=pg)
+
+        for t in tensor_list:
+            self.assertIs(get_axis_local_type(t, pg), R)
+
+    def test_raw_all_gather_v_to_i(self):
+        """all_gather with V input and I output tensors passes."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {pg: V})
+        tensor_list = [
+            self.mode.rank_map(lambda r: torch.empty(2)) for _ in range(self.WORLD_SIZE)
+        ]
+        for t in tensor_list:
+            assert_type(t, {pg: I})
+
+        with SpmdTypeMode():
+            dist.all_gather(tensor_list, x, group=pg)
+
+        for t in tensor_list:
+            self.assertIs(get_axis_local_type(t, pg), I)
+
+    def test_raw_all_gather_wrong_input_type(self):
+        """all_gather with R input raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0, 2.0]))
+        assert_type(x, {pg: R})
+        tensor_list = [
+            self.mode.rank_map(lambda r: torch.empty(2)) for _ in range(self.WORLD_SIZE)
+        ]
+        for t in tensor_list:
+            assert_type(t, {pg: R})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_gather(tensor_list, x, group=pg)
+
+    def test_raw_all_gather_wrong_output_type(self):
+        """all_gather with V output tensors raises SpmdTypeError."""
+        pg = self.pg
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {pg: V})
+        tensor_list = [
+            self.mode.rank_map(lambda r: torch.empty(2)) for _ in range(self.WORLD_SIZE)
+        ]
+        for t in tensor_list:
+            assert_type(t, {pg: V})
+
+        with SpmdTypeMode():
+            with self.assertRaises(SpmdTypeError):
+                dist.all_gather(tensor_list, x, group=pg)
 
 
 if __name__ == "__main__":

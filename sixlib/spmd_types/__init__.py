@@ -9,6 +9,7 @@ from sixlib.spmd_types._checker import (  # noqa: F401
     assert_local_type,
     assert_type,
     is_type_checking,
+    mutate_type,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (  # noqa: F401
@@ -20,15 +21,15 @@ from sixlib.spmd_types._collectives import (  # noqa: F401
     unshard,
 )
 from sixlib.spmd_types._dist import set_dist  # noqa: F401
+from sixlib.spmd_types._dtensor import (  # noqa: F401
+    spmd_redistribute,
+    spmd_type_to_dtensor_placement,
+)
 from sixlib.spmd_types._local import (  # noqa: F401
     convert,
     invariant_to_replicate,
     reinterpret,
     shard,
-)
-from sixlib.spmd_types._mesh import (  # noqa: F401
-    get_mesh,
-    set_mesh,
 )
 from sixlib.spmd_types._scalar import Scalar  # noqa: F401
 

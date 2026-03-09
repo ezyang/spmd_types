@@ -7,7 +7,6 @@ from typing import List, Optional, TYPE_CHECKING
 import torch
 from sixlib.spmd_types import _dist
 from sixlib.spmd_types._local import convert, reinterpret
-from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
     _canonicalize_shard,
     I,
@@ -38,7 +37,7 @@ class _AllReduce(torch.autograd.Function):
     def forward(ctx, x, axis, dst, inplace):
         ctx.axis = axis
         ctx.dst = dst
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         # TODO: check if contiguous assertion is really necessary
         assert x.is_contiguous(), "all_reduce input must be contiguous"
         # TODO: check if world_size == 1 short-circuit is really necessary
@@ -68,7 +67,7 @@ class _AllReduce(torch.autograd.Function):
 
 def all_reduce(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType,
@@ -89,7 +88,7 @@ def all_reduce(
 
     Args:
         x: Input tensor with P or V type on the mesh axis
-        axis: The mesh axis to reduce over (string name or ProcessGroup)
+        axis: The mesh axis to reduce over (ProcessGroup)
         src: Source type (P or V; if V, automatically reinterpreted as P first)
         dst: Destination type (R or I)
         inplace: If True, perform the all-reduce in-place on the input tensor
@@ -179,7 +178,7 @@ class _AllGatherStack(torch.autograd.Function):
         ctx.axis = axis
         ctx.dst = dst
         ctx.gather_dim = gather_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
         gathered = [torch.empty_like(x) for _ in range(world_size)]
         _dist.dist.all_gather(gathered, x, group=pg)
@@ -208,7 +207,7 @@ class _AllGatherShard(torch.autograd.Function):
         ctx.axis = axis
         ctx.dst = dst
         ctx.gather_dim = gather_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
         gathered = [torch.empty_like(x) for _ in range(world_size)]
         _dist.dist.all_gather(gathered, x, group=pg)
@@ -242,7 +241,7 @@ class _AllGatherUneven(torch.autograd.Function):
         ctx.dst = dst
         ctx.gather_dim = gather_dim
         ctx.split_sizes = split_sizes
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         ctx.rank = _dist.dist.get_rank(pg)
         gathered = []
         for s in split_sizes:
@@ -272,7 +271,7 @@ class _AllGatherUneven(torch.autograd.Function):
 
 def all_gather(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType,
@@ -311,7 +310,7 @@ def all_gather(
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
-        axis: The mesh axis to gather over (string name or ProcessGroup)
+        axis: The mesh axis to gather over (ProcessGroup)
         src: Source type (V or S(i)). When V, stacks on dim 0. When S(i), concatenates on dim i.
         dst: Destination type (R or I)
         split_sizes: Per-rank sizes for uneven gathering.
@@ -409,7 +408,7 @@ class _ReduceScatterStack(torch.autograd.Function):
     def forward(ctx, x, axis, scatter_dim):
         ctx.axis = axis
         ctx.scatter_dim = scatter_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         # x stacked on dim 0: shape[0] == world_size
         result = x.new_empty([1] + list(x.shape[1:]))
         _dist.dist.reduce_scatter_tensor(
@@ -433,7 +432,7 @@ class _ReduceScatterShard(torch.autograd.Function):
     def forward(ctx, x, axis, scatter_dim):
         ctx.axis = axis
         ctx.scatter_dim = scatter_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
         # reduce_scatter_tensor always scatters along dim 0, so we
         # movedim before/after when scatter_dim != 0.
@@ -469,7 +468,7 @@ class _ReduceScatterUneven(torch.autograd.Function):
         ctx.axis = axis
         ctx.scatter_dim = scatter_dim
         ctx.split_sizes = split_sizes
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         ctx.rank = _dist.dist.get_rank(pg)
         x_list = list(torch.split(x, list(split_sizes), dim=scatter_dim))
         output = torch.empty_like(x_list[ctx.rank])
@@ -494,7 +493,7 @@ class _ReduceScatterUneven(torch.autograd.Function):
 
 def reduce_scatter(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType = V,
@@ -532,7 +531,7 @@ def reduce_scatter(
 
     Args:
         x: Input tensor with P type on the mesh axis
-        axis: The mesh axis to reduce-scatter over (string name or ProcessGroup)
+        axis: The mesh axis to reduce-scatter over (ProcessGroup)
         src: Source type (must be P)
         dst: Destination type (V or S(i))
         scatter_dim: The tensor dimension to scatter along. Defaults to 0 when
@@ -626,7 +625,7 @@ class _AllToAllStack(torch.autograd.Function):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.concat_dim = concat_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         input_chunks = list(torch.unbind(x, dim=split_dim))
         output_chunks = [
             torch.empty_like(input_chunks[0]) for _ in range(len(input_chunks))
@@ -655,7 +654,7 @@ class _AllToAllShard(torch.autograd.Function):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.concat_dim = concat_dim
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
         # TODO: support uneven splits by accepting explicit input/output
         # sizes, like the underlying dist.all_to_all collective supports.
@@ -664,7 +663,9 @@ class _AllToAllShard(torch.autograd.Function):
                 f"all_to_all: tensor dimension {split_dim} (size {x.shape[split_dim]}) "
                 f"is not evenly divisible by world_size ({world_size})"
             )
-        input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
+        input_chunks = [
+            c.contiguous() for c in torch.chunk(x, world_size, dim=split_dim)
+        ]
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
         return torch.cat(output_chunks, dim=concat_dim)
@@ -683,7 +684,7 @@ class _AllToAllShard(torch.autograd.Function):
 
 def all_to_all(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType = V,
@@ -726,7 +727,7 @@ def all_to_all(
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
-        axis: The mesh axis to transpose with (string name or ProcessGroup)
+        axis: The mesh axis to transpose with (ProcessGroup)
         src: Source type (V or S(i))
         dst: Destination type (V or S(j))
         split_dim: The tensor dimension to split along. Defaults to 0 when
@@ -826,7 +827,7 @@ def all_to_all(
 
 def redistribute(  # noqa: C901
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -853,7 +854,7 @@ def redistribute(  # noqa: C901
 
     Args:
         x: Input tensor
-        axis: The mesh axis to operate on (string name or ProcessGroup)
+        axis: The mesh axis to operate on (ProcessGroup)
         src: Source local SPMD type
         dst: Destination local SPMD type
     """
@@ -931,7 +932,7 @@ def redistribute(  # noqa: C901
 
 def unshard(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -943,7 +944,7 @@ def unshard(
 
     Args:
         x: Input tensor with S(i) type on the mesh axis
-        axis: The mesh axis to gather over (string name or ProcessGroup)
+        axis: The mesh axis to gather over (ProcessGroup)
         src: Source shard type, must be S(i)
         dst: Destination type (R or I)
     """

@@ -1,13 +1,12 @@
 """
 Tests for SPMD type hierarchy (R, I, V, P, S) and PartitionSpec.
 
-Covers: types.py, _mesh.py (mesh setup).
+Covers: types.py.
 """
 
 import unittest
 
 from sixlib.spmd_types import (
-    get_mesh,
     I,
     Invariant,
     P,
@@ -17,7 +16,6 @@ from sixlib.spmd_types import (
     R,
     Replicate,
     S,
-    set_mesh,
     V,
     Varying,
 )
@@ -125,21 +123,6 @@ class TestPartitionSpec(unittest.TestCase):
 
         ps = PartitionSpec(("dp", "tp"), "ep")
         self.assertEqual(repr(ps), "PartitionSpec(('dp', 'tp'), 'ep')")
-
-
-class TestMeshSetup(unittest.TestCase):
-    """Test mesh setup functions."""
-
-    def test_set_and_get_mesh(self):
-        """Test set_mesh and get_mesh."""
-        original = get_mesh()
-
-        fake_mesh = object()
-        set_mesh(fake_mesh)
-        self.assertIs(get_mesh(), fake_mesh)
-
-        # Restore
-        set_mesh(original)
 
 
 if __name__ == "__main__":

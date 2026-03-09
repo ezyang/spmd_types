@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from sixlib.spmd_types import _dist
-from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
     _canonicalize_shard,
     I,
@@ -119,7 +118,7 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 def reinterpret(  # noqa: C901
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -142,7 +141,7 @@ def reinterpret(  # noqa: C901
 
     Args:
         x: Input tensor
-        axis: The mesh axis to operate on (string name or ProcessGroup)
+        axis: The mesh axis to operate on (ProcessGroup)
         src: Source local SPMD type (R, I, V, P)
         dst: Destination local SPMD type (R, I, V, P)
 
@@ -384,7 +383,7 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.stack = stack
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
 
         mode = _get_local_tensor_mode(x)
@@ -421,7 +420,7 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.stack = stack
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
 
         mode = _get_local_tensor_mode(x)
@@ -453,7 +452,7 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, axis):
         ctx.axis = axis
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
@@ -474,7 +473,7 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, axis):
         ctx.axis = axis
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
@@ -497,7 +496,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         ctx.axis = axis
         ctx.split_dim = split_dim
         ctx.stack = stack
-        pg = _get_mesh_axis_group(axis)
+        pg = axis
         world_size = _dist.dist.get_world_size(pg)
 
         mode = _get_local_tensor_mode(x)
@@ -521,7 +520,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
 
 def convert(  # noqa: C901
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -551,7 +550,7 @@ def convert(  # noqa: C901
 
     Args:
         x: Input tensor
-        axis: The mesh axis to operate on (string name or ProcessGroup)
+        axis: The mesh axis to operate on (ProcessGroup)
         src: Source local SPMD type (R, I, V, P, or S(i))
         dst: Destination local SPMD type (R, I, V, P, or S(i)).
              When src or dst is S(i), the split/concat dimension is
@@ -890,7 +889,7 @@ def convert(  # noqa: C901
 
 def shard(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -902,7 +901,7 @@ def shard(
 
     Args:
         x: Input tensor
-        axis: The mesh axis to operate on (string name or ProcessGroup)
+        axis: The mesh axis to operate on (ProcessGroup)
         src: Source local SPMD type (R or I)
         dst: Destination shard type, must be S(i)
     """
@@ -913,7 +912,7 @@ def shard(
 
 def invariant_to_replicate(
     x,
-    axis: str | ProcessGroup,
+    axis: ProcessGroup,
 ):
     """Convenience alias: ``invariant_to_replicate`` is ``convert(I, R)``.
 
@@ -933,7 +932,7 @@ def invariant_to_replicate(
 
     Args:
         x: Input tensor with I type on the mesh axis
-        axis: The mesh axis to operate on (string name or ProcessGroup)
+        axis: The mesh axis to operate on (ProcessGroup)
     """
     # Directly call the autograd function rather than going through
     # convert(), so that callers (e.g. copy_to_tensor_model_parallel_region)

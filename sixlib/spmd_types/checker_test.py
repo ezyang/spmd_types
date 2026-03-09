@@ -21,6 +21,7 @@ from sixlib.spmd_types._checker import (
     get_axis_local_type,
     has_local_type,
     infer_local_type_for_axis,
+    mutate_type,
     OpLinearity,
     SpmdTypeMode,
 )
@@ -55,134 +56,134 @@ class TestLinearTypePropagation(SpmdTypeCheckedTestCase):
 
     def test_linear_r_v_gives_v(self):
         """F.linear with R weight and V input should give V output, not R."""
-        inp = self._generate_inputs((2, 4), "tp", V)
-        weight = self._generate_inputs((3, 4), "tp", R)
+        inp = self._generate_inputs((2, 4), self.pg, V)
+        weight = self._generate_inputs((3, 4), self.pg, R)
         result = torch.nn.functional.linear(inp, weight)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_matmul_r_v_gives_v(self):
         """torch.matmul with R and V should give V output."""
-        x = self._generate_inputs((2, 4), "tp", R)
-        y = self._generate_inputs((4, 3), "tp", V)
+        x = self._generate_inputs((2, 4), self.pg, R)
+        y = self._generate_inputs((4, 3), self.pg, V)
         result = torch.matmul(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_add_r_v_gives_v(self):
         """torch.add with R and V should give V output."""
-        x = self._generate_inputs((4,), "tp", R)
-        y = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, V)
         result = torch.add(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_add_p_p_gives_p(self):
         """torch.add with P and P should give P (addition is linear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         result = torch.add(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_sub_p_p_gives_p(self):
         """torch.sub with P and P should give P (subtraction is linear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         result = torch.sub(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_matmul_p_rejected(self):
         """torch.matmul with all-P is rejected (matmul is not linear in this sense)."""
-        x = self._generate_inputs((2, 4), "tp", P)
-        y = self._generate_inputs((4, 3), "tp", P)
+        x = self._generate_inputs((2, 4), self.pg, P)
+        y = self._generate_inputs((4, 3), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.matmul(x, y)
 
     def test_mul_p_r_gives_p(self):
         """torch.mul with P and R should give P (multilinear: P in one factor, R in other)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, R)
         result = torch.mul(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_cat_p_p_gives_p(self):
         """torch.cat with P and P should give P (cat is linear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         result = torch.cat([x, y])
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_matmul_p_r_gives_p(self):
         """torch.matmul with P and R should give P (multilinear: P in one factor)."""
-        x = self._generate_inputs((2, 4), "tp", P)
-        y = self._generate_inputs((4, 3), "tp", R)
+        x = self._generate_inputs((2, 4), self.pg, P)
+        y = self._generate_inputs((4, 3), self.pg, R)
         result = torch.matmul(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_add_p_r_rejected(self):
         """torch.add with mixed P and R is still rejected."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.add(x, y)
 
     def test_add_p_scalar_rejected(self):
         """torch.add(P, scalar) is affine, not linear -- must be rejected."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.add(x, 1.0)
 
     def test_sub_p_scalar_rejected(self):
         """torch.sub(P, scalar) is affine -- must be rejected."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.sub(x, 1.0)
 
     def test_add_p_int_scalar_rejected(self):
         """torch.add(P, int_scalar) is also affine -- must be rejected."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.add(x, 1)
 
     def test_cat_p_with_dim_arg_allowed(self):
         """torch.cat([P, P], 0) -- dim is not a tensor input, should be allowed."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         result = torch.cat([x, y], 0)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_mul_p_scalar_allowed(self):
         """torch.mul(P, scalar) -- multilinear, scalar ignored, P propagates."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         result = torch.mul(x, 2.0)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_div_i_scalar_gives_i(self):
         """I / scalar should give I (scalar adopts I type)."""
-        x = self._generate_inputs((4,), "tp", I)
+        x = self._generate_inputs((4,), self.pg, I)
         result = x / 2.0
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_add_i_scalar_gives_i(self):
         """torch.add(I, scalar) should give I (scalar adopts I type)."""
-        x = self._generate_inputs((4,), "tp", I)
+        x = self._generate_inputs((4,), self.pg, I)
         result = torch.add(x, 1.0)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_sub_i_scalar_gives_i(self):
         """torch.sub(I, scalar) should give I (scalar adopts I type)."""
-        x = self._generate_inputs((4,), "tp", I)
+        x = self._generate_inputs((4,), self.pg, I)
         result = torch.sub(x, 1.0)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_add_v_scalar_gives_v(self):
         """torch.add(V, scalar) should give V (scalar adopts V type)."""
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         result = torch.add(x, 1.0)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_mul_v_scalar_gives_v(self):
         """torch.mul(V, scalar) should give V (scalar adopts V type)."""
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         result = torch.mul(x, 2.0)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
 
 class TestStrictMode(SpmdTypeCheckedTestCase):
@@ -192,34 +193,34 @@ class TestStrictMode(SpmdTypeCheckedTestCase):
         """Enter LocalTensorMode and strict SpmdTypeMode for each test."""
         self.mode = LocalTensorMode(self.WORLD_SIZE)
         self.mode.__enter__()
-        self.spmd_mode = SpmdTypeMode(strict=True)
+        self.spmd_mode = SpmdTypeMode(strict_mode="strict")
         self.spmd_mode.__enter__()
 
     def test_strict_mixed_annotated_unannotated_fails(self):
         """Strict mode raises when one operand is annotated and the other is not."""
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         y = self.rank_map(lambda r: torch.randn(4))
         with self.assertRaises(SpmdTypeError):
             torch.add(x, y)
 
     def test_strict_mixed_cat_fails(self):
         """Strict mode catches mixed typed/untyped tensors inside lists (e.g. torch.cat)."""
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         y = self.rank_map(lambda r: torch.randn(4))
         with self.assertRaises(SpmdTypeError):
             torch.cat([x, y])
 
     def test_strict_all_annotated_passes(self):
         """Strict mode allows operations when all tensors are annotated."""
-        x = self._generate_inputs((4,), "tp", R)
-        y = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, R)
         result = torch.add(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_strict_all_v_annotated_mixed_with_unannotated_fails(self):
         """Strict mode catches all-V tensor mixed with unannotated."""
-        x = self._generate_inputs((4,), "tp", V)
-        # x has _spmd_types attr (set to {"tp": V})
+        x = self._generate_inputs((4,), self.pg, V)
+        # x has _spmd_types attr (set to {self.pg: V})
         y = self.rank_map(lambda r: torch.randn(4))
         # y has no _spmd_types attr at all
         with self.assertRaises(SpmdTypeError):
@@ -234,47 +235,243 @@ class TestStrictMode(SpmdTypeCheckedTestCase):
 
     def test_strict_collective_typed_input_passes(self):
         """Strict mode allows collectives when the input tensor is typed."""
-        x = self._generate_inputs((4,), "tp", P)
-        result = all_reduce(x, "tp", src=P, dst=R)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        x = self._generate_inputs((4,), self.pg, P)
+        result = all_reduce(x, self.pg, src=P, dst=R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_strict_collective_untyped_input_fails(self):
         """Strict mode raises when a collective receives an unannotated tensor."""
         y = self.rank_map(lambda r: torch.randn(4))
         with self.assertRaises(SpmdTypeError):
-            all_reduce(y, "tp", src=P, dst=R)
+            all_reduce(y, self.pg, src=P, dst=R)
 
     def test_strict_out_kwarg_unannotated_passes(self):
         """Strict mode allows unannotated out= tensor (it's just a pre-allocated destination)."""
-        a = self._generate_inputs((4,), "tp", R)
-        b = self._generate_inputs((4,), "tp", R)
+        a = self._generate_inputs((4,), self.pg, R)
+        b = self._generate_inputs((4,), self.pg, R)
         c = self.rank_map(lambda r: torch.empty(4))  # unannotated
         self.assertFalse(has_local_type(c))
         torch.add(a, b, out=c)  # should NOT raise
         # out= tensor gets the inferred type
-        self.assertIs(get_axis_local_type(c, "tp"), R)
+        self.assertIs(get_axis_local_type(c, self.pg), R)
 
     def test_strict_out_kwarg_inputs_still_checked(self):
         """Strict mode still checks actual input operands even when out= is present."""
         a = self.rank_map(lambda r: torch.randn(4))  # unannotated input
-        b = self._generate_inputs((4,), "tp", R)
+        b = self._generate_inputs((4,), self.pg, R)
         c = self.rank_map(lambda r: torch.empty(4))
         with self.assertRaises(SpmdTypeError):
             torch.add(a, b, out=c)
 
     def test_nonstrict_mixed_passes(self):
-        """Non-strict mode allows mixing annotated and unannotated tensors."""
+        """Non-strict mode skips type inference when inputs are mixed."""
         self.spmd_mode.__exit__(None, None, None)
-        nonstrict = SpmdTypeMode(strict=False)
+        nonstrict = SpmdTypeMode(strict_mode="permissive")
         nonstrict.__enter__()
         try:
-            x = self._generate_inputs((4,), "tp", R)
+            x = self._generate_inputs((4,), self.pg, R)
             y = self.rank_map(lambda r: torch.randn(4))
             result = torch.add(x, y)  # Should not raise
-            self.assertIs(get_axis_local_type(result, "tp"), R)
+            # Result is untyped: inferring from partial inputs could produce
+            # incorrect types (e.g., R when a hidden V would make it V).
+            self.assertFalse(has_local_type(result))
         finally:
             nonstrict.__exit__(None, None, None)
             self.spmd_mode.__enter__()
+
+
+class TestFactoryTensors(LocalTensorTestCase):
+    """Test factory tensor propagation in strict mode.
+
+    Factory tensors are created by ops with no typed tensor inputs (e.g.,
+    torch.zeros, torch.ones).  They carry a factory marker that propagates
+    through operations on other factory tensors, deferring the real type
+    annotation until the tensor meets a real-typed tensor.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.spmd_mode = SpmdTypeMode(strict_mode="strict")
+        self.spmd_mode.__enter__()
+
+    def tearDown(self):
+        self.spmd_mode.__exit__(None, None, None)
+        super().tearDown()
+
+    def test_factory_creates_factory_tensor(self):
+        """A factory op in strict mode marks the result as factory."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        z = torch.zeros(4)
+        self.assertTrue(is_factory(z))
+        self.assertFalse(has_local_type(z))
+
+    def test_factory_propagates_through_ops(self):
+        """Ops on factory tensors produce factory results."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        a = torch.zeros(4)
+        b = torch.ones(4)
+        c = a + b
+        self.assertTrue(is_factory(c))
+        self.assertFalse(has_local_type(c))
+
+    def test_factory_meets_typed_raises(self):
+        """Mixing a factory tensor with a typed tensor raises."""
+        x = self._generate_inputs((4,), self.pg, R)
+        z = torch.zeros(4)
+        with self.assertRaises(SpmdTypeError):
+            torch.add(x, z)
+
+    def test_factory_annotated_then_used(self):
+        """assert_type on a factory tensor clears the marker and sets the type."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        z = torch.zeros(4)
+        self.assertTrue(is_factory(z))
+        assert_type(z, {self.pg: R})
+        self.assertFalse(is_factory(z))
+        self.assertTrue(has_local_type(z))
+        self.assertIs(get_axis_local_type(z, self.pg), R)
+
+    def test_factory_annotated_combines_with_typed(self):
+        """Once annotated, a former factory tensor combines with typed tensors."""
+        x = self._generate_inputs((4,), self.pg, R)
+        z = torch.zeros(4)
+        assert_type(z, {self.pg: R})
+        result = torch.add(x, z)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
+
+    def test_truly_untyped_still_errors(self):
+        """Truly untyped tensors (created outside the mode) still error."""
+        a = self.rank_map(lambda r: torch.randn(4))
+        b = self.rank_map(lambda r: torch.randn(4))
+        with self.assertRaises(SpmdTypeError):
+            torch.add(a, b)
+
+    def test_factory_error_message_says_factory(self):
+        """Error message distinguishes factory from unannotated tensors."""
+        x = self._generate_inputs((4,), self.pg, R)
+        z = torch.zeros(4)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            torch.add(x, z)
+        self.assertIn("factory", str(ctx.exception))
+
+    def test_strict_factory_mode_errors_at_creation(self):
+        """strict_factory=True errors immediately on factory creation."""
+        self.spmd_mode.__exit__(None, None, None)
+        strict_factory_mode = SpmdTypeMode(strict_mode="strict_factory")
+        strict_factory_mode.__enter__()
+        try:
+            with self.assertRaises(SpmdTypeError) as ctx:
+                torch.zeros(4)
+            self.assertIn("Strict factory mode", str(ctx.exception))
+        finally:
+            strict_factory_mode.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
+
+    def test_factory_chain_then_annotate(self):
+        """A chain of factory ops produces factory, then assert_type works."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        a = torch.zeros(4)
+        b = torch.ones(4)
+        c = a + b
+        d = c * 2.0
+        self.assertTrue(is_factory(d))
+        assert_type(d, {self.pg: V})
+        self.assertFalse(is_factory(d))
+        self.assertIs(get_axis_local_type(d, self.pg), V)
+
+    def test_nonstrict_factory_propagates(self):
+        """Factory propagates in non-strict mode too."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        self.spmd_mode.__exit__(None, None, None)
+        nonstrict = SpmdTypeMode(strict_mode="permissive")
+        nonstrict.__enter__()
+        try:
+            z = torch.zeros(4)
+            self.assertTrue(is_factory(z))
+            w = z + torch.ones(4)
+            self.assertTrue(is_factory(w))
+        finally:
+            nonstrict.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
+
+    def test_nonstrict_factory_plus_typed_no_error(self):
+        """Non-strict skips inference when factory is mixed with typed."""
+        self.spmd_mode.__exit__(None, None, None)
+        nonstrict = SpmdTypeMode(strict_mode="permissive")
+        nonstrict.__enter__()
+        try:
+            x = self._generate_inputs((4,), self.pg, R)
+            z = torch.zeros(4)
+            result = torch.add(x, z)  # Should not raise
+            # Result is untyped: partial inputs could produce wrong types.
+            self.assertFalse(has_local_type(result))
+        finally:
+            nonstrict.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
+
+    def test_nonstrict_truly_untyped_not_promoted_to_factory(self):
+        """In non-strict mode, truly untyped tensors must not become factory."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        self.spmd_mode.__exit__(None, None, None)
+        # Create tensor outside any SpmdTypeMode -- truly untyped.
+        a = torch.randn(4)
+        nonstrict = SpmdTypeMode(strict_mode="permissive")
+        nonstrict.__enter__()
+        try:
+            self.assertFalse(is_factory(a))
+            self.assertFalse(has_local_type(a))
+            # Op on truly untyped input: result stays truly untyped.
+            b = a + 1.0
+            self.assertFalse(is_factory(b))
+            self.assertFalse(has_local_type(b))
+        finally:
+            nonstrict.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
+
+    def test_nonstrict_factory_plus_truly_untyped_stays_untyped(self):
+        """In non-strict mode, factory + truly untyped must not produce factory."""
+        from sixlib.spmd_types._type_attr import is_factory
+
+        self.spmd_mode.__exit__(None, None, None)
+        # Create tensor outside any SpmdTypeMode -- truly untyped.
+        a = torch.randn(4)
+        nonstrict = SpmdTypeMode(strict_mode="permissive")
+        nonstrict.__enter__()
+        try:
+            z = torch.zeros(4)  # factory (created inside mode)
+            self.assertTrue(is_factory(z))
+            self.assertFalse(is_factory(a))
+            result = a + z
+            # Truly untyped contaminates: result must not be factory.
+            self.assertFalse(is_factory(result))
+            self.assertFalse(has_local_type(result))
+        finally:
+            nonstrict.__exit__(None, None, None)
+            self.spmd_mode.__enter__()
+
+    def test_factory_spmd_collective_raises(self):
+        """Passing a factory tensor to an SPMD collective raises."""
+        z = torch.zeros(4)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            all_reduce(z, self.pg, dst=R)
+        self.assertIn("factory", str(ctx.exception))
+
+    def test_factory_raw_collective_raises(self):
+        """Passing a factory tensor to a raw dist collective raises."""
+        import torch.distributed as dist
+
+        pg = self.pg
+        z = torch.zeros(4)
+        output = torch.empty(self.WORLD_SIZE * 4)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            dist.all_gather_into_tensor(output, z, group=pg)
+        self.assertIn("factory", str(ctx.exception))
 
 
 class TestTypeErrorMessages(expecttest.TestCase):
@@ -552,21 +749,21 @@ class TestOpLinearityRegistry(SpmdTypeCheckedTestCase):
 
     def test_clone_functional_form(self):
         """torch.clone(P) should give P (functional form, not just Tensor.clone)."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         result = torch.clone(x)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_concat_aliases(self):
         """torch.concat and torch.concatenate should propagate P like torch.cat."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         for fn in [torch.concat, torch.concatenate]:
             result = fn([x, y])
-            self.assertIs(get_axis_local_type(result, "tp"), P)
+            self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_structural_ops_preserve_p(self):
         """Structural ops (reshape, view, transpose, etc.) should preserve P."""
-        x = self._generate_inputs((2, 3), "tp", P)
+        x = self._generate_inputs((2, 3), self.pg, P)
         # NB: contiguous is registered but untestable here -- LocalTensorMode
         # decomposes it to per-rank calls that bypass SpmdTypeMode.
         ops = [
@@ -582,29 +779,29 @@ class TestOpLinearityRegistry(SpmdTypeCheckedTestCase):
         for name, op in ops:
             result = op(x)
             self.assertIs(
-                get_axis_local_type(result, "tp"),
+                get_axis_local_type(result, self.pg),
                 P,
                 f"{name} did not preserve P type",
             )
 
     def test_neg_preserves_p(self):
         """torch.neg(P) and -P (unary neg operator) should both give P."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         result_func = torch.neg(x)
-        self.assertIs(get_axis_local_type(result_func, "tp"), P)
+        self.assertIs(get_axis_local_type(result_func, self.pg), P)
         result_op = -x
-        self.assertIs(get_axis_local_type(result_op, "tp"), P)
+        self.assertIs(get_axis_local_type(result_op, self.pg), P)
 
     def test_operator_add_p_p(self):
         """P + P via the + operator should give P."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         result = x + y
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_split_chunk_unbind_preserve_p(self):
         """Multi-output ops (split, chunk, unbind) should propagate P."""
-        x = self._generate_inputs((6,), "tp", P)
+        x = self._generate_inputs((6,), self.pg, P)
         for name, fn in [
             ("split", lambda t: torch.split(t, 3)),
             ("chunk", lambda t: torch.chunk(t, 2)),
@@ -613,45 +810,45 @@ class TestOpLinearityRegistry(SpmdTypeCheckedTestCase):
             results = fn(x)
             for i, r in enumerate(results):
                 self.assertIs(
-                    get_axis_local_type(r, "tp"),
+                    get_axis_local_type(r, self.pg),
                     P,
                     f"{name}[{i}] did not preserve P type",
                 )
 
     def test_inplace_add_preserves_p(self):
         """P.add_(P) should give P."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         x.add_(y)
-        self.assertIs(get_axis_local_type(x, "tp"), P)
+        self.assertIs(get_axis_local_type(x, self.pg), P)
 
     def test_div_p_r_gives_p(self):
         """torch.div(P, R) should give P (linear in numerator when denominator is fixed)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, R)
         result = torch.div(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_div_r_p_rejected(self):
         """torch.div(R, P) should raise (P in denominator is not linear)."""
-        x = self._generate_inputs((4,), "tp", R)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.div(x, y)
 
     def test_div_p_p_rejected(self):
         """torch.div(P, P) should raise (P in denominator is not linear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        y = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.div(x, y)
 
     def test_div_r_v_gives_v(self):
         """torch.div(R, V) should give V (normal non-P path, no fixed_args filtering)."""
-        x = self._generate_inputs((4,), "tp", R)
-        y = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, V)
         result = torch.div(x, y)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_all_registered_ops_are_callable(self):
         """Every key in _OP_REGISTRY should be a callable (no stale references)."""
@@ -686,168 +883,168 @@ class TestAddmmTypeDecomposition(SpmdTypeCheckedTestCase):
 
     def test_addmm_P_R_R_rejected(self):
         """addmm(P, R, R) must error: R@R=R, then P+R is invalid."""
-        self_t = self._generate_inputs((2, 3), "tp", P)
-        mat1 = self._generate_inputs((2, 4), "tp", R)
-        mat2 = self._generate_inputs((4, 3), "tp", R)
+        self_t = self._generate_inputs((2, 3), self.pg, P)
+        mat1 = self._generate_inputs((2, 4), self.pg, R)
+        mat2 = self._generate_inputs((4, 3), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.addmm(self_t, mat1, mat2)
 
     def test_addmm_R_P_R_rejected(self):
         """addmm(R, P, R) must error: P@R=P, then P+R is invalid."""
-        self_t = self._generate_inputs((2, 3), "tp", R)
-        mat1 = self._generate_inputs((2, 4), "tp", P)
-        mat2 = self._generate_inputs((4, 3), "tp", R)
+        self_t = self._generate_inputs((2, 3), self.pg, R)
+        mat1 = self._generate_inputs((2, 4), self.pg, P)
+        mat2 = self._generate_inputs((4, 3), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.addmm(self_t, mat1, mat2)
 
     def test_addmm_R_R_P_rejected(self):
         """addmm(R, R, P) must error: R@P=P, then P+R is invalid."""
-        self_t = self._generate_inputs((2, 3), "tp", R)
-        mat1 = self._generate_inputs((2, 4), "tp", R)
-        mat2 = self._generate_inputs((4, 3), "tp", P)
+        self_t = self._generate_inputs((2, 3), self.pg, R)
+        mat1 = self._generate_inputs((2, 4), self.pg, R)
+        mat2 = self._generate_inputs((4, 3), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.addmm(self_t, mat1, mat2)
 
     def test_addmm_P_P_R_gives_P(self):
         """addmm(P, P, R): mm(P,R)=P, then P+P=P."""
-        self_t = self._generate_inputs((2, 3), "tp", P)
-        mat1 = self._generate_inputs((2, 4), "tp", P)
-        mat2 = self._generate_inputs((4, 3), "tp", R)
+        self_t = self._generate_inputs((2, 3), self.pg, P)
+        mat1 = self._generate_inputs((2, 4), self.pg, P)
+        mat2 = self._generate_inputs((4, 3), self.pg, R)
         result = torch.addmm(self_t, mat1, mat2)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_addmm_P_R_P_gives_P(self):
         """addmm(P, R, P): mm(R,P)=P, then P+P=P."""
-        self_t = self._generate_inputs((2, 3), "tp", P)
-        mat1 = self._generate_inputs((2, 4), "tp", R)
-        mat2 = self._generate_inputs((4, 3), "tp", P)
+        self_t = self._generate_inputs((2, 3), self.pg, P)
+        mat1 = self._generate_inputs((2, 4), self.pg, R)
+        mat2 = self._generate_inputs((4, 3), self.pg, P)
         result = torch.addmm(self_t, mat1, mat2)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_addmm_R_R_R_gives_R(self):
         """addmm(R, R, R) -> R (no change from before)."""
-        self_t = self._generate_inputs((2, 3), "tp", R)
-        mat1 = self._generate_inputs((2, 4), "tp", R)
-        mat2 = self._generate_inputs((4, 3), "tp", R)
+        self_t = self._generate_inputs((2, 3), self.pg, R)
+        mat1 = self._generate_inputs((2, 4), self.pg, R)
+        mat2 = self._generate_inputs((4, 3), self.pg, R)
         result = torch.addmm(self_t, mat1, mat2)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_addmm_V_R_R_gives_V(self):
         """addmm(V, R, R): mm(R,R)=R, then V+R=V."""
-        self_t = self._generate_inputs((2, 3), "tp", V)
-        mat1 = self._generate_inputs((2, 4), "tp", R)
-        mat2 = self._generate_inputs((4, 3), "tp", R)
+        self_t = self._generate_inputs((2, 3), self.pg, V)
+        mat1 = self._generate_inputs((2, 4), self.pg, R)
+        mat2 = self._generate_inputs((4, 3), self.pg, R)
         result = torch.addmm(self_t, mat1, mat2)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_addmm_R_P_P_rejected(self):
         """addmm(R, P, P): mm(P,P) is invalid (two P factors in multilinear)."""
-        self_t = self._generate_inputs((2, 3), "tp", R)
-        mat1 = self._generate_inputs((2, 4), "tp", P)
-        mat2 = self._generate_inputs((4, 3), "tp", P)
+        self_t = self._generate_inputs((2, 3), self.pg, R)
+        mat1 = self._generate_inputs((2, 4), self.pg, P)
+        mat2 = self._generate_inputs((4, 3), self.pg, P)
         with self.assertRaises(SpmdTypeError):
             torch.addmm(self_t, mat1, mat2)
 
     def test_addmm_V_V_V_gives_V(self):
         """addmm(V, V, V): mm(V,V)=V, then V+V=V."""
-        self_t = self._generate_inputs((2, 3), "tp", V)
-        mat1 = self._generate_inputs((2, 4), "tp", V)
-        mat2 = self._generate_inputs((4, 3), "tp", V)
+        self_t = self._generate_inputs((2, 3), self.pg, V)
+        mat1 = self._generate_inputs((2, 4), self.pg, V)
+        mat2 = self._generate_inputs((4, 3), self.pg, V)
         result = torch.addmm(self_t, mat1, mat2)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     # --- addmv ---
 
     def test_addmv_P_R_R_rejected(self):
         """addmv(P, R, R) must error."""
-        self_t = self._generate_inputs((3,), "tp", P)
-        mat = self._generate_inputs((3, 4), "tp", R)
-        vec = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3,), self.pg, P)
+        mat = self._generate_inputs((3, 4), self.pg, R)
+        vec = self._generate_inputs((4,), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.addmv(self_t, mat, vec)
 
     def test_addmv_P_P_R_gives_P(self):
         """addmv(P, P, R): mv(P,R)=P, then P+P=P."""
-        self_t = self._generate_inputs((3,), "tp", P)
-        mat = self._generate_inputs((3, 4), "tp", P)
-        vec = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3,), self.pg, P)
+        mat = self._generate_inputs((3, 4), self.pg, P)
+        vec = self._generate_inputs((4,), self.pg, R)
         result = torch.addmv(self_t, mat, vec)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_addmv_R_R_R_gives_R(self):
         """addmv(R, R, R) -> R."""
-        self_t = self._generate_inputs((3,), "tp", R)
-        mat = self._generate_inputs((3, 4), "tp", R)
-        vec = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3,), self.pg, R)
+        mat = self._generate_inputs((3, 4), self.pg, R)
+        vec = self._generate_inputs((4,), self.pg, R)
         result = torch.addmv(self_t, mat, vec)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     # --- baddbmm ---
 
     def test_baddbmm_P_R_R_rejected(self):
         """baddbmm(P, R, R) must error."""
-        self_t = self._generate_inputs((2, 3, 5), "tp", P)
-        batch1 = self._generate_inputs((2, 3, 4), "tp", R)
-        batch2 = self._generate_inputs((2, 4, 5), "tp", R)
+        self_t = self._generate_inputs((2, 3, 5), self.pg, P)
+        batch1 = self._generate_inputs((2, 3, 4), self.pg, R)
+        batch2 = self._generate_inputs((2, 4, 5), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.baddbmm(self_t, batch1, batch2)
 
     def test_baddbmm_P_P_R_gives_P(self):
         """baddbmm(P, P, R): bmm(P,R)=P, then P+P=P."""
-        self_t = self._generate_inputs((2, 3, 5), "tp", P)
-        batch1 = self._generate_inputs((2, 3, 4), "tp", P)
-        batch2 = self._generate_inputs((2, 4, 5), "tp", R)
+        self_t = self._generate_inputs((2, 3, 5), self.pg, P)
+        batch1 = self._generate_inputs((2, 3, 4), self.pg, P)
+        batch2 = self._generate_inputs((2, 4, 5), self.pg, R)
         result = torch.baddbmm(self_t, batch1, batch2)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_baddbmm_R_R_R_gives_R(self):
         """baddbmm(R, R, R) -> R."""
-        self_t = self._generate_inputs((2, 3, 5), "tp", R)
-        batch1 = self._generate_inputs((2, 3, 4), "tp", R)
-        batch2 = self._generate_inputs((2, 4, 5), "tp", R)
+        self_t = self._generate_inputs((2, 3, 5), self.pg, R)
+        batch1 = self._generate_inputs((2, 3, 4), self.pg, R)
+        batch2 = self._generate_inputs((2, 4, 5), self.pg, R)
         result = torch.baddbmm(self_t, batch1, batch2)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     # --- addr ---
 
     def test_addr_P_R_R_rejected(self):
         """addr(P, R, R) must error."""
-        self_t = self._generate_inputs((3, 4), "tp", P)
-        vec1 = self._generate_inputs((3,), "tp", R)
-        vec2 = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3, 4), self.pg, P)
+        vec1 = self._generate_inputs((3,), self.pg, R)
+        vec2 = self._generate_inputs((4,), self.pg, R)
         with self.assertRaises(SpmdTypeError):
             torch.addr(self_t, vec1, vec2)
 
     def test_addr_P_P_R_gives_P(self):
         """addr(P, P, R): outer(P,R)=P, then P+P=P."""
-        self_t = self._generate_inputs((3, 4), "tp", P)
-        vec1 = self._generate_inputs((3,), "tp", P)
-        vec2 = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3, 4), self.pg, P)
+        vec1 = self._generate_inputs((3,), self.pg, P)
+        vec2 = self._generate_inputs((4,), self.pg, R)
         result = torch.addr(self_t, vec1, vec2)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_addr_R_R_R_gives_R(self):
         """addr(R, R, R) -> R."""
-        self_t = self._generate_inputs((3, 4), "tp", R)
-        vec1 = self._generate_inputs((3,), "tp", R)
-        vec2 = self._generate_inputs((4,), "tp", R)
+        self_t = self._generate_inputs((3, 4), self.pg, R)
+        vec1 = self._generate_inputs((3,), self.pg, R)
+        vec2 = self._generate_inputs((4,), self.pg, R)
         result = torch.addr(self_t, vec1, vec2)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     # --- sum/mean (LINEAR reductions) ---
 
     def test_sum_P_gives_P(self):
         """torch.sum(P) -> P (sum is linear)."""
-        x = self._generate_inputs((2, 3), "tp", P)
+        x = self._generate_inputs((2, 3), self.pg, P)
         result = torch.sum(x)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_mean_P_gives_P(self):
         """torch.mean(P) -> P (mean is linear)."""
         # randn already produces float32 so torch.mean works directly
-        x = self._generate_inputs((2, 3), "tp", P)
+        x = self._generate_inputs((2, 3), self.pg, P)
         result = torch.mean(x)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
 
 class TestScalarWrapper(SpmdTypeCheckedTestCase):
@@ -869,31 +1066,31 @@ class TestScalarWrapper(SpmdTypeCheckedTestCase):
         With a plain 1.0, R + scalar -> R. With Scalar(1.0, {tp: V}),
         R + V -> V. This catches rank-dependent scalars.
         """
-        x = self._generate_inputs((4,), "tp", R)
-        s = Scalar(1.0, {"tp": V})
+        x = self._generate_inputs((4,), self.pg, R)
+        s = Scalar(1.0, {self.pg: V})
         result = torch.add(x, s)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_add_v_scalar_v(self):
         """torch.add(V, Scalar(V)) -> V."""
-        x = self._generate_inputs((4,), "tp", V)
-        s = Scalar(1.0, {"tp": V})
+        x = self._generate_inputs((4,), self.pg, V)
+        s = Scalar(1.0, {self.pg: V})
         result = torch.add(x, s)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_mul_p_scalar_r(self):
         """torch.mul(P, Scalar(R)) -> P (multilinear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        s = Scalar(2.0, {"tp": R})
+        x = self._generate_inputs((4,), self.pg, P)
+        s = Scalar(2.0, {self.pg: R})
         result = torch.mul(x, s)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_add_p_scalar_p(self):
         """torch.add(P, Scalar(P)) -> P (linear)."""
-        x = self._generate_inputs((4,), "tp", P)
-        s = Scalar(1.0, {"tp": P})
+        x = self._generate_inputs((4,), self.pg, P)
+        s = Scalar(1.0, {self.pg: P})
         result = torch.add(x, s)
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_add_r_scalar_p_error(self):
         """torch.add(R, Scalar(P)) -> SpmdTypeError (P+R is affine).
@@ -901,15 +1098,15 @@ class TestScalarWrapper(SpmdTypeCheckedTestCase):
         With a plain 1.0, R + scalar -> R. With Scalar(local_sum, {tp: P}),
         R + P is invalid (affine, not linear).
         """
-        x = self._generate_inputs((4,), "tp", R)
-        s = Scalar(1.0, {"tp": P})
+        x = self._generate_inputs((4,), self.pg, R)
+        s = Scalar(1.0, {self.pg: P})
         with self.assertRaises(SpmdTypeError):
             torch.add(x, s)
 
     def test_add_i_scalar_v_error(self):
         """torch.add(I, Scalar(V)) -> SpmdTypeError (I can't mix)."""
-        x = self._generate_inputs((4,), "tp", I)
-        s = Scalar(1.0, {"tp": V})
+        x = self._generate_inputs((4,), self.pg, I)
+        s = Scalar(1.0, {self.pg: V})
         with self.assertRaises(SpmdTypeError):
             torch.add(x, s)
 
@@ -925,6 +1122,178 @@ class TestScalarWrapper(SpmdTypeCheckedTestCase):
             torch.testing.assert_close(result, expected)
         finally:
             self.spmd_mode.__enter__()
+
+
+class TestMutationTypeChecking(SpmdTypeCheckedTestCase):
+    """Test that in-place/out operations validate SPMD type consistency.
+
+    Mutating operations (trailing underscore, out= kwarg, result-is-input
+    identity) must not silently change a tensor's SPMD type. For example,
+    x.add_(y) where x=R and y=V would infer V output, but since x is R
+    and is being mutated, this is an error.
+    """
+
+    # --- In-place ops that preserve type (should pass) ---
+
+    def test_inplace_add_r_r_ok(self):
+        """R.add_(R) -> R: type preserved, no error."""
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, R)
+        x.add_(y)
+        self.assertIs(get_axis_local_type(x, self.pg), R)
+
+    def test_inplace_add_v_v_ok(self):
+        """V.add_(V) -> V: type preserved, no error."""
+        x = self._generate_inputs((4,), self.pg, V)
+        y = self._generate_inputs((4,), self.pg, V)
+        x.add_(y)
+        self.assertIs(get_axis_local_type(x, self.pg), V)
+
+    def test_inplace_add_v_r_ok(self):
+        """V.add_(R) -> V: output is V, self is V, type preserved."""
+        x = self._generate_inputs((4,), self.pg, V)
+        y = self._generate_inputs((4,), self.pg, R)
+        x.add_(y)
+        self.assertIs(get_axis_local_type(x, self.pg), V)
+
+    def test_inplace_mul_v_scalar_ok(self):
+        """V.mul_(2.0) -> V: type preserved."""
+        x = self._generate_inputs((4,), self.pg, V)
+        x.mul_(2.0)
+        self.assertIs(get_axis_local_type(x, self.pg), V)
+
+    def test_inplace_neg_r_ok(self):
+        """R.neg_() -> R: type preserved."""
+        x = self._generate_inputs((4,), self.pg, R)
+        x.neg_()
+        self.assertIs(get_axis_local_type(x, self.pg), R)
+
+    # --- In-place ops that would change type (should error) ---
+
+    def test_inplace_add_r_v_rejected(self):
+        """R.add_(V): output would be V but self is R. Error."""
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, V)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            x.add_(y)
+        self.assertIn("in-place/out", str(ctx.exception))
+
+    def test_inplace_mul_r_v_rejected(self):
+        """R.mul_(V): output would be V but self is R. Error."""
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, V)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            x.mul_(y)
+        self.assertIn("in-place/out", str(ctx.exception))
+
+    def test_iadd_r_v_rejected(self):
+        """R += V via __iadd__: should also be caught."""
+        x = self._generate_inputs((4,), self.pg, R)
+        y = self._generate_inputs((4,), self.pg, V)
+        with self.assertRaises(SpmdTypeError):
+            x += y
+
+    # --- out= kwarg ops ---
+
+    def test_out_kwarg_matching_type_ok(self):
+        """torch.add(R, R, out=R_tensor): output R matches out tensor R."""
+        a = self._generate_inputs((4,), self.pg, R)
+        b = self._generate_inputs((4,), self.pg, R)
+        c = self._generate_inputs((4,), self.pg, R)
+        torch.add(a, b, out=c)
+        self.assertIs(get_axis_local_type(c, self.pg), R)
+
+    def test_out_kwarg_type_mismatch_rejected(self):
+        """torch.add(R, V, out=R_tensor): output V but out is R. Error."""
+        a = self._generate_inputs((4,), self.pg, R)
+        b = self._generate_inputs((4,), self.pg, V)
+        c = self._generate_inputs((4,), self.pg, R)
+        with self.assertRaises(SpmdTypeError) as ctx:
+            torch.add(a, b, out=c)
+        self.assertIn("in-place/out", str(ctx.exception))
+
+    def test_out_kwarg_untyped_ok(self):
+        """torch.add(R, R, out=untyped): untyped out tensor is fine."""
+        a = self._generate_inputs((4,), self.pg, R)
+        b = self._generate_inputs((4,), self.pg, R)
+        c = self.rank_map(lambda r: torch.empty(4))
+        torch.add(a, b, out=c)
+        self.assertIs(get_axis_local_type(c, self.pg), R)
+
+    def test_out_kwarg_v_output_into_v_ok(self):
+        """torch.add(R, V, out=V_tensor): output V, out is V. OK."""
+        a = self._generate_inputs((4,), self.pg, R)
+        b = self._generate_inputs((4,), self.pg, V)
+        c = self._generate_inputs((4,), self.pg, V)
+        torch.add(a, b, out=c)
+        self.assertIs(get_axis_local_type(c, self.pg), V)
+
+    def test_inplace_p_p_add_ok(self):
+        """P.add_(P) -> P: type preserved (linear op)."""
+        x = self._generate_inputs((4,), self.pg, P)
+        y = self._generate_inputs((4,), self.pg, P)
+        x.add_(y)
+        self.assertIs(get_axis_local_type(x, self.pg), P)
+
+
+class TestMutateType(unittest.TestCase):
+    """Test mutate_type for explicit single-axis type transitions."""
+
+    def test_basic_mutation(self):
+        """Mutate a single axis from V to R."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": V})
+        mutate_type(x, "dp", src=V, dst=R)
+        self.assertIs(get_axis_local_type(x, "dp"), R)
+
+    def test_shard_sugar_src(self):
+        """S(i) is accepted as src and compared as V."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": S(0)})
+        mutate_type(x, "dp", src=S(0), dst=R)
+        self.assertIs(get_axis_local_type(x, "dp"), R)
+
+    def test_shard_sugar_dst(self):
+        """S(i) is accepted as dst and stored as V."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": R})
+        mutate_type(x, "dp", src=R, dst=S(0))
+        self.assertIs(get_axis_local_type(x, "dp"), V)
+
+    def test_preserves_other_axes(self):
+        """Mutating one axis must not affect other axes."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": V, "tp": I})
+        mutate_type(x, "dp", src=V, dst=R)
+        self.assertIs(get_axis_local_type(x, "dp"), R)
+        self.assertIs(get_axis_local_type(x, "tp"), I)
+
+    def test_wrong_src_raises(self):
+        """Mismatched src raises SpmdTypeError."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": V})
+        with self.assertRaises(SpmdTypeError):
+            mutate_type(x, "dp", src=R, dst=I)
+
+    def test_missing_axis_raises(self):
+        """Axis not present in tensor's type raises SpmdTypeError."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": V})
+        with self.assertRaises(SpmdTypeError):
+            mutate_type(x, "tp", src=V, dst=R)
+
+    def test_unannotated_tensor_raises(self):
+        """Tensor with no type at all raises SpmdTypeError."""
+        x = torch.randn(4)
+        with self.assertRaises(SpmdTypeError):
+            mutate_type(x, "dp", src=V, dst=R)
+
+    def test_returns_tensor(self):
+        """mutate_type returns the tensor for chaining."""
+        x = torch.randn(4)
+        assert_type(x, {"dp": V})
+        result = mutate_type(x, "dp", src=V, dst=R)
+        self.assertIs(result, x)
 
 
 if __name__ == "__main__":

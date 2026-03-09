@@ -1,7 +1,7 @@
 """
 Shared test utilities for SPMD type system tests.
 
-Provides FakeMesh and LocalTensorTestCase for simulating distributed operations
+Provides LocalTensorTestCase for simulating distributed operations
 in a single process using PyTorch's LocalTensorMode.
 """
 
@@ -10,34 +10,14 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-from sixlib.spmd_types import set_mesh
 from sixlib.spmd_types._checker import (
     assert_type,
     SpmdTypeMode,
 )
 from sixlib.spmd_types.types import I, P, R, Shard, V
 from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
+from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
-
-
-class FakeMesh:
-    """
-    A fake DeviceMesh for testing that returns the default process group.
-
-    In real distributed code, DeviceMesh maps axis names to process groups.
-    For testing with LocalTensorMode, we just return the default group.
-    """
-
-    def __init__(self, world_size: int):
-        self.world_size = world_size
-
-    def get_group(self, axis_name: str):
-        """Return the default process group for any axis name.
-
-        Args:
-            axis_name: The mesh axis name (ignored -- always returns the default group).
-        """
-        return dist.distributed_c10d._get_default_group()
 
 
 class LocalTensorTestCase(unittest.TestCase):
@@ -55,13 +35,12 @@ class LocalTensorTestCase(unittest.TestCase):
             dist.init_process_group(
                 backend="fake", rank=0, world_size=cls.WORLD_SIZE, store=store
             )
-        # Set up the global mesh
-        set_mesh(FakeMesh(cls.WORLD_SIZE))
+        cls.mesh = init_device_mesh("cpu", (cls.WORLD_SIZE,), mesh_dim_names=("tp",))
+        cls.pg = cls.mesh.get_group("tp")
 
     @classmethod
     def tearDownClass(cls):
         """Clean up distributed environment."""
-        set_mesh(None)
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -94,7 +73,7 @@ class LocalTensorTestCase(unittest.TestCase):
 
         Args:
             shape: The tensor shape to generate.
-            axis: The mesh axis name to annotate the tensor on.
+            axis: The mesh axis (ProcessGroup) to annotate the tensor on.
             typ: The SPMD type to assign (R, I, V, P, or S(i)).
         """
         if typ is R or typ is I:
@@ -151,7 +130,7 @@ class LocalTensorTestCase(unittest.TestCase):
         Args:
             like_lt: A LocalTensor whose per-rank shapes to match.
             typ: The SPMD type to assign (R, I, V, P, or S(i)).
-            axis: The mesh axis name to annotate on.
+            axis: The mesh axis (ProcessGroup) to annotate on.
         """
         base = V if isinstance(typ, Shard) else typ
         if base is R or base is I:
@@ -210,7 +189,7 @@ class LocalTensorTestCase(unittest.TestCase):
         Args:
             fn: The SPMD operation to test (a callable taking one tensor).
             x: Input tensor with the correct SPMD type.
-            axis: The mesh axis name.
+            axis: The mesh axis (ProcessGroup).
             src_type: The source SPMD type of fn.
             dst_type: The destination SPMD type of fn.
         """

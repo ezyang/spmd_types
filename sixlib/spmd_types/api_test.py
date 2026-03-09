@@ -35,43 +35,43 @@ class TestRedistribute(LocalTensorTestCase):
     def test_redistribute_v_to_r(self):
         """redistribute(V,R) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=V, dst=R)
+            result = redistribute(x, self.pg, src=V, dst=R)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_redistribute_v_to_i(self):
         """redistribute(V,I) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=V, dst=I)
+            result = redistribute(x, self.pg, src=V, dst=I)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), I)
+        self.assertIs(get_axis_local_type(result, self.pg), I)
 
     def test_redistribute_p_to_r(self):
         """redistribute(P,R) uses all_reduce."""
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=P, dst=R)
+            result = redistribute(x, self.pg, src=P, dst=R)
 
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_redistribute_p_to_s(self):
         """redistribute(P,S(0)) uses reduce_scatter."""
@@ -79,10 +79,10 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.rank_map(
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=P, dst=S(0))
+            result = redistribute(x, self.pg, src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -95,44 +95,44 @@ class TestRedistribute(LocalTensorTestCase):
                 expected,
                 msg=f"rank {r}",
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_redistribute_r_to_v_uses_convert(self):
         """redistribute(R,V) delegates to convert."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.rank_map(lambda r: base.clone())
-        assert_type(x, {"tp": R})
+        assert_type(x, {self.pg: R})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=R, dst=V)
+            result = redistribute(x, self.pg, src=R, dst=V)
 
         for r in range(self.WORLD_SIZE):
             expected = base[r]
             torch.testing.assert_close(
                 result._local_tensors[r], expected, msg=f"rank {r}"
             )
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_redistribute_r_to_p_uses_convert(self):
         """redistribute(R,P) delegates to convert."""
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
-        assert_type(x, {"tp": R})
+        assert_type(x, {self.pg: R})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=R, dst=P)
+            result = redistribute(x, self.pg, src=R, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], torch.zeros_like(base))
-        self.assertIs(get_axis_local_type(result, "tp"), P)
+        self.assertIs(get_axis_local_type(result, self.pg), P)
 
     def test_redistribute_same_type_noop(self):
         """redistribute with same src and dst is identity."""
-        x = self._generate_inputs((4,), "tp", R)
-        result = redistribute(x, "tp", src=R, dst=R)
+        x = self._generate_inputs((4,), self.pg, R)
+        result = redistribute(x, self.pg, src=R, dst=R)
         self.assertIs(result, x)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_redistribute_shard_to_shard_uses_all_to_all(self):
         """redistribute(S(i),S(j)) with different dims uses all_to_all."""
@@ -141,16 +141,16 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(6, dtype=torch.float).reshape(2, 3) + r * 10
         )
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = redistribute(x, "tp", src=S(0), dst=S(1))
+            result = redistribute(x, self.pg, src=S(0), dst=S(1))
 
         # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 6)
             self.assertEqual(result._local_tensors[r].shape[1], 1)
-        self.assertIs(get_axis_local_type(result, "tp"), V)
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
 
 class TestShardNegativeDim(LocalTensorTestCase):
@@ -172,9 +172,9 @@ class TestShardNegativeDim(LocalTensorTestCase):
         x = self.mode.rank_map(
             lambda r: torch.arange(54, dtype=torch.float).reshape(6, 9) + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
-        result = reduce_scatter(x, "tp", src=P, dst=S(-1))
+        result = reduce_scatter(x, self.pg, src=P, dst=S(-1))
 
         for r in range(self.WORLD_SIZE):
             self.assertEqual(
@@ -194,25 +194,25 @@ class TestShardNegativeDim(LocalTensorTestCase):
         # Each rank has shape (2, 1), world_size=3.
         # src=S(-1) = S(1) on 2D, result should be (2, 3).
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
-        assert_type(x, {"tp": V})
+        assert_type(x, {self.pg: V})
 
         with SpmdTypeMode():
-            result = all_gather(x, "tp", src=S(-1), dst=R)
+            result = all_gather(x, self.pg, src=S(-1), dst=R)
 
         expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
-        self.assertIs(get_axis_local_type(result, "tp"), R)
+        self.assertIs(get_axis_local_type(result, self.pg), R)
 
     def test_redistribute_p_to_shard_neg1(self):
         """redistribute(P, S(-1)) delegates to reduce_scatter, which is broken for S(-1)."""
         x = self.mode.rank_map(
             lambda r: torch.arange(54, dtype=torch.float).reshape(6, 9) + r
         )
-        assert_type(x, {"tp": P})
+        assert_type(x, {self.pg: P})
 
-        result = redistribute(x, "tp", src=P, dst=S(-1))
+        result = redistribute(x, self.pg, src=P, dst=S(-1))
 
         for r in range(self.WORLD_SIZE):
             self.assertEqual(
@@ -228,9 +228,9 @@ class TestShardNegativeDim(LocalTensorTestCase):
         # S(-1) = S(1) on 2D, each rank gets a (2, 1) chunk.
         base = torch.arange(6, dtype=torch.float).reshape(2, 3)
         x = self.rank_map(lambda r: base.clone())
-        assert_type(x, {"tp": R})
+        assert_type(x, {self.pg: R})
 
-        result = convert(x, "tp", src=R, dst=S(-1))
+        result = convert(x, self.pg, src=R, dst=S(-1))
 
         for r in range(self.WORLD_SIZE):
             expected = base[:, r : r + 1]
@@ -249,51 +249,51 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- reinterpret ---
 
     def test_backward_reinterpret_r_to_v(self):
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=R, dst=V, expert_mode=True),
+            lambda x: reinterpret(x, self.pg, src=R, dst=V, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=V,
         )
 
     def test_backward_reinterpret_r_to_i(self):
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=R, dst=I, expert_mode=True),
+            lambda x: reinterpret(x, self.pg, src=R, dst=I, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=I,
         )
 
     def test_backward_reinterpret_i_to_r(self):
-        x = self._generate_inputs((4,), "tp", I)
+        x = self._generate_inputs((4,), self.pg, I)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=I, dst=R, expert_mode=True),
+            lambda x: reinterpret(x, self.pg, src=I, dst=R, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=I,
             dst_type=R,
         )
 
     def test_backward_reinterpret_v_to_p(self):
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=V, dst=P),
+            lambda x: reinterpret(x, self.pg, src=V, dst=P),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=V,
             dst_type=P,
         )
 
     def test_backward_reinterpret_r_to_p(self):
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: reinterpret(x, "tp", src=R, dst=P, expert_mode=True),
+            lambda x: reinterpret(x, self.pg, src=R, dst=P, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=P,
         )
@@ -301,81 +301,81 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- convert ---
 
     def test_backward_convert_r_to_v(self):
-        x = self._generate_inputs((3, 4), "tp", R)
+        x = self._generate_inputs((3, 4), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=R, dst=V),
+            lambda x: convert(x, self.pg, src=R, dst=V),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=V,
         )
 
     def test_backward_convert_r_to_s0(self):
-        x = self._generate_inputs((6,), "tp", R)
+        x = self._generate_inputs((6,), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=R, dst=S(0)),
+            lambda x: convert(x, self.pg, src=R, dst=S(0)),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=S(0),
         )
 
     def test_backward_convert_i_to_v(self):
-        x = self._generate_inputs((3, 4), "tp", I)
+        x = self._generate_inputs((3, 4), self.pg, I)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=I, dst=V),
+            lambda x: convert(x, self.pg, src=I, dst=V),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=I,
             dst_type=V,
         )
 
     def test_backward_convert_i_to_s0(self):
-        x = self._generate_inputs((6,), "tp", I)
+        x = self._generate_inputs((6,), self.pg, I)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=I, dst=S(0)),
+            lambda x: convert(x, self.pg, src=I, dst=S(0)),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=I,
             dst_type=S(0),
         )
 
     def test_backward_convert_r_to_p(self):
-        x = self._generate_inputs((4,), "tp", R)
+        x = self._generate_inputs((4,), self.pg, R)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=R, dst=P),
+            lambda x: convert(x, self.pg, src=R, dst=P),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=R,
             dst_type=P,
         )
 
     def test_backward_convert_i_to_p(self):
-        x = self._generate_inputs((4,), "tp", I)
+        x = self._generate_inputs((4,), self.pg, I)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=I, dst=P, expert_mode=True),
+            lambda x: convert(x, self.pg, src=I, dst=P, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=I,
             dst_type=P,
         )
 
     def test_backward_convert_v_to_p(self):
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=V, dst=P, expert_mode=True),
+            lambda x: convert(x, self.pg, src=V, dst=P, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=V,
             dst_type=P,
         )
 
     def test_backward_convert_s0_to_p(self):
-        x = self._generate_inputs((2,), "tp", S(0))
+        x = self._generate_inputs((2,), self.pg, S(0))
         self.spmd_gradcheck(
-            lambda x: convert(x, "tp", src=S(0), dst=P, expert_mode=True),
+            lambda x: convert(x, self.pg, src=S(0), dst=P, expert_mode=True),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=S(0),
             dst_type=P,
         )
@@ -383,21 +383,21 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- all_reduce ---
 
     def test_backward_all_reduce_p_to_r(self):
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         self.spmd_gradcheck(
-            lambda x: all_reduce(x, "tp", src=P, dst=R),
+            lambda x: all_reduce(x, self.pg, src=P, dst=R),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=P,
             dst_type=R,
         )
 
     def test_backward_all_reduce_p_to_i(self):
-        x = self._generate_inputs((4,), "tp", P)
+        x = self._generate_inputs((4,), self.pg, P)
         self.spmd_gradcheck(
-            lambda x: all_reduce(x, "tp", src=P, dst=I),
+            lambda x: all_reduce(x, self.pg, src=P, dst=I),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=P,
             dst_type=I,
         )
@@ -405,41 +405,41 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- all_gather ---
 
     def test_backward_all_gather_v_to_r(self):
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         self.spmd_gradcheck(
-            lambda x: all_gather(x, "tp", src=V, dst=R),
+            lambda x: all_gather(x, self.pg, src=V, dst=R),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=V,
             dst_type=R,
         )
 
     def test_backward_all_gather_s0_to_r(self):
-        x = self._generate_inputs((2,), "tp", S(0))
+        x = self._generate_inputs((2,), self.pg, S(0))
         self.spmd_gradcheck(
-            lambda x: all_gather(x, "tp", src=S(0), dst=R),
+            lambda x: all_gather(x, self.pg, src=S(0), dst=R),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=S(0),
             dst_type=R,
         )
 
     def test_backward_all_gather_v_to_i(self):
-        x = self._generate_inputs((4,), "tp", V)
+        x = self._generate_inputs((4,), self.pg, V)
         self.spmd_gradcheck(
-            lambda x: all_gather(x, "tp", src=V, dst=I),
+            lambda x: all_gather(x, self.pg, src=V, dst=I),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=V,
             dst_type=I,
         )
 
     def test_backward_all_gather_s0_to_i(self):
-        x = self._generate_inputs((2,), "tp", S(0))
+        x = self._generate_inputs((2,), self.pg, S(0))
         self.spmd_gradcheck(
-            lambda x: all_gather(x, "tp", src=S(0), dst=I),
+            lambda x: all_gather(x, self.pg, src=S(0), dst=I),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=S(0),
             dst_type=I,
         )
@@ -447,21 +447,21 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- reduce_scatter ---
 
     def test_backward_reduce_scatter_p_to_v(self):
-        x = self._generate_inputs((3, 4), "tp", P)
+        x = self._generate_inputs((3, 4), self.pg, P)
         self.spmd_gradcheck(
-            lambda x: reduce_scatter(x, "tp", src=P, dst=V),
+            lambda x: reduce_scatter(x, self.pg, src=P, dst=V),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=P,
             dst_type=V,
         )
 
     def test_backward_reduce_scatter_p_to_s0(self):
-        x = self._generate_inputs((6,), "tp", P)
+        x = self._generate_inputs((6,), self.pg, P)
         self.spmd_gradcheck(
-            lambda x: reduce_scatter(x, "tp", src=P, dst=S(0)),
+            lambda x: reduce_scatter(x, self.pg, src=P, dst=S(0)),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=P,
             dst_type=S(0),
         )
@@ -469,21 +469,21 @@ class TestBackwardCorrectness(LocalTensorTestCase):
     # --- all_to_all ---
 
     def test_backward_all_to_all_v_to_v(self):
-        x = self._generate_inputs((3, 4), "tp", V)
+        x = self._generate_inputs((3, 4), self.pg, V)
         self.spmd_gradcheck(
-            lambda x: all_to_all(x, "tp", src=V, dst=V),
+            lambda x: all_to_all(x, self.pg, src=V, dst=V),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=V,
             dst_type=V,
         )
 
     def test_backward_all_to_all_s0_to_s1(self):
-        x = self._generate_inputs((3, 6), "tp", S(0))
+        x = self._generate_inputs((3, 6), self.pg, S(0))
         self.spmd_gradcheck(
-            lambda x: all_to_all(x, "tp", src=S(0), dst=S(1)),
+            lambda x: all_to_all(x, self.pg, src=S(0), dst=S(1)),
             x,
-            axis="tp",
+            axis=self.pg,
             src_type=S(0),
             dst_type=S(1),
         )

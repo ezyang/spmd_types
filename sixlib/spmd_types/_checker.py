@@ -12,7 +12,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import auto, Enum
-from typing import Callable, overload
+from typing import Callable, Literal, NamedTuple, overload
 
 import torch
 import torch.overrides
@@ -25,6 +25,14 @@ from sixlib.spmd_types._collectives import (
 )
 from sixlib.spmd_types._local import convert, invariant_to_replicate, reinterpret
 from sixlib.spmd_types._scalar import _unwrap_args, Scalar
+from sixlib.spmd_types._type_attr import (
+    get_axis_local_type,
+    get_local_type,
+    has_local_type,
+    is_factory,
+    set_factory,
+    set_local_type as _set_local_type_raw,
+)
 from sixlib.spmd_types.types import (
     DeviceMeshAxis,
     format_axis,
@@ -247,9 +255,6 @@ def _format_error_with_suggestions(
 # SPMD Type Tracking on Tensors
 # =============================================================================
 
-# Attribute name for storing SPMD types on tensors
-_LOCAL_TYPE_ATTR = "_local_type"
-
 
 def _validate(type: LocalSpmdType) -> LocalSpmdType:
     """Validate a LocalSpmdType.
@@ -285,43 +290,13 @@ def _validate(type: LocalSpmdType) -> LocalSpmdType:
     return dict(type)
 
 
-def has_local_type(value: torch.Tensor | Scalar) -> bool:
-    """Return True if the tensor or Scalar has SPMD type annotations.
-
-    Args:
-        value: The tensor or Scalar to check for SPMD type annotations.
-    """
-    return hasattr(value, _LOCAL_TYPE_ATTR)
-
-
-def get_local_type(value: torch.Tensor | Scalar) -> LocalSpmdType:
-    """Get the SPMD types stored on a tensor or Scalar.
-
-    Args:
-        value: The tensor or Scalar to retrieve SPMD type annotations from.
-
-    Raises:
-        AttributeError: If the object has no SPMD type annotations.
-            Use ``has_local_type`` to check first.
-    """
-    result = getattr(value, _LOCAL_TYPE_ATTR, None)
-    if result is None:
-        raise AttributeError(
-            "Tensor has no SPMD type annotations. "
-            "Use has_local_type() to check, or assert_type() to annotate."
-        )
-    return result
+# has_local_type, get_local_type, get_axis_local_type are imported from
+# _type_attr (a leaf module shared with _raw_dist to avoid a Buck cycle).
 
 
 def _set_local_type(tensor: torch.Tensor, type: LocalSpmdType) -> torch.Tensor:
-    """Set SPMD type on a tensor (internal). Returns the tensor for chaining.
-
-    Args:
-        tensor: The tensor to annotate with an SPMD type.
-        type: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types.
-    """
-    setattr(tensor, _LOCAL_TYPE_ATTR, _validate(type))
-    return tensor
+    """Set SPMD type on a tensor (internal). Validates and returns tensor."""
+    return _set_local_type_raw(tensor, _validate(type))
 
 
 @overload
@@ -379,7 +354,7 @@ def assert_type(  # noqa: C901
             with an explicit partition_spec
         SpmdTypeError: If partition_spec length doesn't match tensor ndim, or
             if a partition_spec axis conflicts with a non-Varying type in type
-        AssertionError: If existing type doesn't match provided type
+        SpmdTypeError: If existing type doesn't match provided type
     """
     # Separate S(i) entries from R/I/V/P entries
     local_type: LocalSpmdType = {}
@@ -448,7 +423,7 @@ def assert_type(  # noqa: C901
     # existing is already validated (_set_local_type validates on store)
     existing = get_local_type(tensor)
     if existing != canonical:
-        raise AssertionError(
+        raise SpmdTypeError(
             f"SPMD type mismatch: tensor has {existing}, expected {canonical}"
         )
     return tensor
@@ -459,31 +434,71 @@ def assert_local_type(tensor: torch.Tensor, type: PerMeshAxisSpmdTypes) -> torch
     return assert_type(tensor, type)
 
 
-def get_axis_local_type(
-    tensor: torch.Tensor, axis: DeviceMeshAxis
-) -> PerMeshAxisLocalSpmdType:
-    """Get the SPMD type for a specific mesh axis.
+def mutate_type(
+    tensor: torch.Tensor,
+    axis: DeviceMeshAxis,
+    *,
+    src: PerMeshAxisSpmdType,
+    dst: PerMeshAxisSpmdType,
+) -> torch.Tensor:
+    """Change the SPMD type of a single mesh axis on an already-annotated tensor.
 
-    Raises:
-        ValueError: If the tensor has no SPMD type annotations, or if the
-            axis is not present in the tensor's SPMD type dict.
+    Unlike ``assert_type``, this function *overwrites* the existing type on
+    ``axis``.  The caller must specify the expected current type (``src``) to
+    prevent silent corruption; a ``SpmdTypeError`` is raised if the tensor's
+    current type on ``axis`` does not match ``src``.
+
+    This is intended for internal use in low-level parallelism primitives
+    where a buffer legitimately changes its distribution semantics in place
+    (e.g. an all-gather output buffer that transitions from S(0) to R).
+
+    With D95084345 (raw dist type rules), most collectives can be type-checked
+    automatically. mutate_type is still needed for updating spmd types on
+    *views* into a buffer after an in-place collective has changed the
+    buffer's semantics.
 
     Args:
-        tensor: The tensor to query.
-        axis: The mesh axis to look up (string name or ProcessGroup).
+        tensor: The tensor whose type to mutate.  Must already have a local
+            type annotation.
+        axis: The mesh axis (string name or ProcessGroup) to modify.
+        src: The expected current type on ``axis``.  Raises if it does not
+            match.  Accepts R, I, V, P, or S(i) (S(i) is compared as V).
+        dst: The new type to set on ``axis``.  Accepts R, I, V, P, or S(i)
+            (S(i) is stored as V).
+
+    Returns:
+        The tensor for chaining.
+
+    Raises:
+        SpmdTypeError: If the tensor has no type, the axis is missing,
+            or the current type does not match ``src``.
     """
     if not has_local_type(tensor):
-        raise ValueError(
-            "get_axis_local_type: tensor has no SPMD type annotations. "
-            "Use has_local_type() to check first, or assert_type() to annotate."
+        raise SpmdTypeError(
+            "mutate_type: tensor has no SPMD type annotations. "
+            "Use assert_type() to set an initial type first."
         )
     local_type = get_local_type(tensor)
     if axis not in local_type:
-        raise ValueError(
-            f"Axis {format_axis(axis)} not found in tensor's SPMD type. "
-            f"Tensor has axes: {set(local_type.keys())}"
+        raise SpmdTypeError(
+            f"mutate_type: axis {format_axis(axis)} not found in tensor's "
+            f"SPMD type. Tensor has axes: {set(local_type.keys())}"
         )
-    return local_type[axis]
+
+    # Normalize S(i) → V for comparison and storage
+    src_local = V if isinstance(src, Shard) else src
+    dst_local = V if isinstance(dst, Shard) else dst
+
+    current = local_type[axis]
+    if current is not src_local:
+        raise SpmdTypeError(
+            f"mutate_type: expected current type {src_local} on axis "
+            f"{format_axis(axis)}, got {current}"
+        )
+
+    new_type = dict(local_type)
+    new_type[axis] = dst_local
+    return _set_local_type(tensor, new_type)
 
 
 # =============================================================================
@@ -1036,61 +1051,94 @@ def _iter_tensors_in(val: object):
             yield item
 
 
-def _iter_tensor_args(args: tuple, kwargs: dict):
-    """Yield all tensor arguments from args and kwargs.
+class _UntypedEntry(NamedTuple):
+    tensor: torch.Tensor
+    location: str
+    factory: bool
 
-    Handles direct tensors and flat list/tuple of tensors (common cases) with
-    a fast path, and falls back to pytree flattening for arbitrary nesting.
+
+class _ArgInfo(NamedTuple):
+    """Classification and collected types from all tensor arguments.
+
+    Produced by ``_classify_args`` in a single pass over args/kwargs.
+
+    Attributes:
+        tensor_types: Types from typed tensors (in iteration order).
+            Excludes factory and untyped tensors.
+        has_typed: At least one tensor has a real SPMD type.
+        has_factory: At least one tensor has the factory marker.
+        has_untyped: At least one tensor is truly untyped (no type, no factory).
+        untyped_entries: Factory and untyped tensors with location info
+            (for strict-mode error messages).
+    """
+
+    tensor_types: list[LocalSpmdType]
+    has_typed: bool
+    has_factory: bool
+    has_untyped: bool
+    untyped_entries: list[_UntypedEntry]
+
+
+def _classify_args(args: tuple, kwargs: dict) -> _ArgInfo:
+    """Classify all tensor arguments in a single pass.
+
+    Iterates every tensor in ``args`` and ``kwargs`` (skipping ``out=``),
+    classifying each as typed, factory, or truly untyped.  Types from typed
+    tensors are collected for downstream inference.
 
     Args:
-        args: Positional arguments to the torch operation.
-        kwargs: Keyword arguments to the torch operation.
+        args: Positional arguments (post-Scalar-unwrapping).
+        kwargs: Keyword arguments (post-Scalar-unwrapping).
     """
-    for arg in args:
-        yield from _iter_tensors_in(arg)
-    for key, v in kwargs.items():
-        if key == "out":
-            continue
-        yield from _iter_tensors_in(v)
+    tensor_types: list[LocalSpmdType] = []
+    _has_typed = False
+    _has_factory = False
+    _has_untyped = False
+    untyped_entries: list[_UntypedEntry] = []
 
+    def _classify(t: torch.Tensor, location: str) -> None:
+        nonlocal _has_typed, _has_factory, _has_untyped
+        if has_local_type(t):
+            _has_typed = True
+            tensor_types.append(get_local_type(t))
+        elif is_factory(t):
+            _has_factory = True
+            untyped_entries.append(_UntypedEntry(t, location, factory=True))
+        else:
+            _has_untyped = True
+            untyped_entries.append(_UntypedEntry(t, location, factory=False))
 
-def _check_all_typed(func, args: tuple, kwargs: dict) -> None:
-    """Raise ``SpmdTypeError`` if any operand is unannotated.
-
-    Called once at the top of the regular-op path in strict mode so that
-    ``_collect_tensor_types`` itself stays simple and unconditional.
-
-    Uses ``has_local_type`` rather than truthiness of the types dict because
-    a tensor's type dict is an implementation detail -- ``has_local_type`` is
-    the canonical way to check whether a tensor has been annotated.
-
-    Args:
-        func: The torch function being called.
-        args: Positional arguments to the torch operation.
-        kwargs: Keyword arguments to the torch operation.
-    """
-    untyped: list[str] = []
     for i, arg in enumerate(args):
         for t in _iter_tensors_in(arg):
-            if not has_local_type(t):
-                untyped.append(f"args[{i}] (shape={tuple(t.shape)}, dtype={t.dtype})")
+            _classify(t, f"args[{i}]")
     for key, v in kwargs.items():
         if key == "out":
             continue
         for t in _iter_tensors_in(v):
-            if not has_local_type(t):
-                untyped.append(
-                    f"kwargs[{key!r}] (shape={tuple(t.shape)}, dtype={t.dtype})"
-                )
-    if untyped:
-        func_name = getattr(func, "__name__", repr(func))
-        listing = "\n  ".join(untyped)
-        raise SpmdTypeError(
-            f"Strict mode: {len(untyped)} unannotated tensor(s) "
-            f"in operation {func_name}:\n  {listing}\n"
-            f"All tensor operands must be annotated. "
-            f"Use SpmdTypeMode(strict=False) if you want partial type checking."
+            _classify(t, f"kwargs[{key!r}]")
+
+    return _ArgInfo(
+        tensor_types, _has_typed, _has_factory, _has_untyped, untyped_entries
+    )
+
+
+def _raise_strict_error(func: Callable, untyped_entries: list[_UntypedEntry]) -> None:
+    """Raise ``SpmdTypeError`` for unannotated tensors in strict mode."""
+    func_name = getattr(func, "__name__", repr(func))
+    lines = []
+    for entry in untyped_entries:
+        tag = "factory" if entry.factory else "unannotated"
+        lines.append(
+            f"{entry.location} ({tag}, shape={tuple(entry.tensor.shape)}, "
+            f"dtype={entry.tensor.dtype})"
         )
+    listing = "\n  ".join(lines)
+    raise SpmdTypeError(
+        f"Strict mode: {len(untyped_entries)} unannotated tensor(s) "
+        f"in operation {func_name}:\n  {listing}\n"
+        f"All tensor operands must be annotated with assert_type(). "
+        f"Use SpmdTypeMode(strict_mode='permissive') if you want partial type checking."
+    )
 
 
 def _is_numeric_scalar(val: object) -> bool:
@@ -1098,69 +1146,166 @@ def _is_numeric_scalar(val: object) -> bool:
     return isinstance(val, (int, float, complex)) and not isinstance(val, bool)
 
 
-def _collect_input_types(  # noqa: C901
-    args: tuple, kwargs: dict, spec: _OpSpec | None = None
+def _collect_scalar_types(  # noqa: C901
+    tensor_types: list[LocalSpmdType],
+    original_args: tuple,
+    original_kwargs: dict,
+    spec: _OpSpec,
 ) -> list[LocalSpmdType]:
-    """Collect SPMD types from tensor args and scalar args.
+    """Append scalar types to tensor types based on op spec positions.
 
-    When a spec is available, numeric scalars at declared tensor-input
-    positions are included with _Scalar on all known mesh axes.  Without a
-    spec we cannot distinguish scalar operands from non-tensor parameters
-    (like ``dim``), so only tensor types are collected.
+    Numeric scalars at declared tensor-input positions are included with
+    ``_Scalar`` on all known mesh axes.  ``Scalar`` wrapper objects use their
+    exact SPMD type.
 
-    We assume a Python scalar is the same value on all ranks and carries no
-    gradient.  Rather than eagerly picking R or I, we assign _Scalar -- a typeless
-    sentinel analogous to "weak" scalars in dtype promotion.  The inference
-    engine filters _Scalar when determining the output type, so scalars
-    never force a choice between R and I.
+    Returns a new list with scalar types appended (or ``tensor_types``
+    unchanged if no scalars are found).
 
     Args:
-        args: Positional arguments to the torch operation.
-        kwargs: Keyword arguments to the torch operation.
-        spec: Optional op specification for detecting scalar tensor positions.
+        tensor_types: Types already collected from typed tensors.
+        original_args: Positional arguments (pre-Scalar-unwrapping, so
+            ``Scalar`` objects are visible).
+        original_kwargs: Keyword arguments (pre-Scalar-unwrapping).
+        spec: Op specification declaring which positions are tensor inputs.
     """
-    result: list[LocalSpmdType] = []
-    for t in _iter_tensor_args(args, kwargs):
-        if has_local_type(t):
-            result.append(get_local_type(t))
+    all_axes: set[DeviceMeshAxis] = set()
+    for typ in tensor_types:
+        all_axes.update(typ.keys())
+    if not all_axes:
+        return tensor_types
 
-    # _Scalar is typeless (doesn't force R vs I), so it is safe to collect
-    # for all linearities -- the old LINEAR-only gate was only needed when
-    # scalars were eagerly assigned R.
-    if result and spec is not None:
-        all_axes: set[DeviceMeshAxis] = set()
-        for typ in result:
-            all_axes.update(typ.keys())
-        if all_axes:
-            scalar_type: LocalSpmdType = {axis: _Scalar for axis in all_axes}
+    scalar_type: LocalSpmdType = {axis: _Scalar for axis in all_axes}
+    extra: list[LocalSpmdType] = []
 
-            def _check(val: object) -> None:
-                if isinstance(val, Scalar):
-                    # Scalar wrapper: use its exact SPMD type.
-                    result.append(get_local_type(val))
-                elif _is_numeric_scalar(val):
-                    result.append(scalar_type)
-                elif isinstance(val, (list, tuple)):
-                    for item in val:
-                        if isinstance(item, Scalar):
-                            result.append(get_local_type(item))
-                        elif _is_numeric_scalar(item):
-                            result.append(scalar_type)
+    def _check(val: object) -> None:
+        if isinstance(val, Scalar):
+            extra.append(get_local_type(val))
+        elif _is_numeric_scalar(val):
+            extra.append(scalar_type)
+        elif isinstance(val, (list, tuple)):
+            for item in val:
+                if isinstance(item, Scalar):
+                    extra.append(get_local_type(item))
+                elif _is_numeric_scalar(item):
+                    extra.append(scalar_type)
 
-            for i in spec.tensor_args:
-                if i < len(args):
-                    _check(args[i])
-            if spec.tensor_varargs_from is not None:
-                for i in range(spec.tensor_varargs_from, len(args)):
-                    _check(args[i])
-            for name in spec.tensor_kwargs:
-                if name in kwargs:
-                    _check(kwargs[name])
+    for i in spec.tensor_args:
+        if i < len(original_args):
+            _check(original_args[i])
+    if spec.tensor_varargs_from is not None:
+        for i in range(spec.tensor_varargs_from, len(original_args)):
+            _check(original_args[i])
+    for name in spec.tensor_kwargs:
+        if name in original_kwargs:
+            _check(original_kwargs[name])
 
-    return result
+    if extra:
+        return list(tensor_types) + extra
+    return tensor_types
 
 
-def _set_result_type(result: object, output_type: LocalSpmdType) -> None:
+def _get_mutated_tensors(  # noqa: C901
+    func: Callable,
+    args: tuple,
+    kwargs: dict,
+    result: object,
+) -> list[torch.Tensor]:
+    """Detect tensors being mutated/written-to by this operation.
+
+    Uses three heuristics (any match is sufficient):
+    1. An input tensor is identical to the result (result is args[i]).
+    2. The function name has a trailing underscore (PyTorch in-place convention),
+       excluding dunder methods but including __iadd__ etc.
+    3. An out= keyword argument was provided.
+
+    Returns:
+        List of mutated tensors (deduplicated by identity).
+    """
+    mutated: list[torch.Tensor] = []
+    seen_ids: set[int] = set()
+
+    def _add(t: torch.Tensor) -> None:
+        tid = id(t)
+        if tid not in seen_ids:
+            seen_ids.add(tid)
+            mutated.append(t)
+
+    # (3) out= kwarg
+    out = kwargs.get("out")
+    if out is not None:
+        if isinstance(out, torch.Tensor):
+            _add(out)
+        elif isinstance(out, (list, tuple)):
+            for item in out:
+                if isinstance(item, torch.Tensor):
+                    _add(item)
+
+    # (1) Identity: result is one of the input tensors
+    if isinstance(result, torch.Tensor):
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and result is arg:
+                _add(result)
+                break
+
+    # (2) Trailing underscore (fallback when identity/out didn't trigger).
+    # Catches method-style in-place ops (add_, zero_) and dunder in-place
+    # ops (__iadd__, __imul__). PASSTHROUGH functions (requires_grad_, etc.)
+    # never reach this code path.
+    if not mutated:
+        func_name = getattr(func, "__name__", "")
+        is_inplace_name = (
+            func_name.endswith("_") and not func_name.startswith("__")
+        ) or (
+            func_name.startswith("__i")
+            and func_name.endswith("__")
+            and len(func_name) > 5
+        )
+        if is_inplace_name and args and isinstance(args[0], torch.Tensor):
+            _add(args[0])
+
+    return mutated
+
+
+def _validate_mutation_types(
+    func: Callable,
+    mutated_tensors: list[torch.Tensor],
+    output_type: LocalSpmdType,
+) -> None:
+    """Validate that mutated tensors' existing SPMD types match the output type.
+
+    For mutating/out operations, the operation writes into an existing tensor.
+    The output SPMD type must match the mutated tensor's existing type on every
+    axis; otherwise the mutation would silently change the tensor's SPMD type,
+    which is unsound (other references to the tensor still expect the old type).
+
+    Args:
+        func: The torch function (for error messages).
+        mutated_tensors: Tensors being mutated by this operation.
+        output_type: The inferred output SPMD type.
+
+    Raises:
+        SpmdTypeError: If any mutated tensor's type conflicts with output_type.
+    """
+    func_name = getattr(func, "__name__", repr(func))
+    for t in mutated_tensors:
+        if not has_local_type(t):
+            continue  # Factory or untyped -- OK to set type
+        existing = get_local_type(t)
+        for axis, new_typ in output_type.items():
+            old_typ = existing.get(axis)
+            if old_typ is not None and old_typ is not new_typ:
+                raise SpmdTypeError(
+                    f"{func_name}: in-place/out operation would change "
+                    f"SPMD type on axis {format_axis(axis)} from {old_typ} "
+                    f"to {new_typ}. In-place and out= operations cannot "
+                    f"change a tensor's SPMD type."
+                    # TODO: For in-place ops that support autograd, we may
+                    # want to allow the type to change (mutating the SPMD
+                    # type of the out argument).
+                )
+
+
+def _set_result_type(result: object, output_type: LocalSpmdType | None) -> None:
     """Set SPMD types on the result tensor(s).
 
     Handles single tensors, flat list/tuple of tensors, and arbitrary nested
@@ -1168,20 +1313,23 @@ def _set_result_type(result: object, output_type: LocalSpmdType) -> None:
     The common cases (single tensor, flat sequence) are checked first to
     avoid the overhead of pytree flattening.
 
-    Args:
-        result: The operation result -- a single tensor, a list/tuple of tensors,
-            or an arbitrary nested structure containing tensors.
-        output_type: The LocalSpmdType dict to set on each result tensor.
+    If ``output_type`` is None, sets the factory marker instead.
     """
+
+    def _apply(t: torch.Tensor) -> None:
+        if output_type is not None:
+            _set_local_type(t, output_type)
+        else:
+            set_factory(t)
+
     if isinstance(result, torch.Tensor):
-        _set_local_type(result, output_type)
+        _apply(result)
         return
     if isinstance(result, (list, tuple)):
-        # Check if it's a flat sequence of tensors/non-tensors (common case).
         all_flat = True
         for item in result:
             if isinstance(item, torch.Tensor):
-                _set_local_type(item, output_type)
+                _apply(item)
             elif isinstance(item, (list, tuple, dict)):
                 all_flat = False
         if all_flat:
@@ -1190,7 +1338,7 @@ def _set_result_type(result: object, output_type: LocalSpmdType) -> None:
     flat, _ = torch.utils._pytree.tree_flatten(result)
     for item in flat:
         if isinstance(item, torch.Tensor):
-            _set_local_type(item, output_type)
+            _apply(item)
 
 
 def _apply_fixed_args(  # noqa: C901
@@ -1262,7 +1410,7 @@ def _apply_fixed_args(  # noqa: C901
                 )
 
     # Exclude fixed_types from input_types_list: return only free_types
-    # plus any scalar types that were appended by _collect_input_types.
+    # plus any scalar types that were appended by _collect_scalar_types.
     # scalar_types count = len(input_types_list) - len(free_types) - len(fixed_types)
     n_tensor_types = len(free_types) + len(fixed_types)
     scalar_types = input_types_list[n_tensor_types:]
@@ -1324,6 +1472,7 @@ _PASSTHROUGH = {
 
 # Import shared state from _state module to avoid circular dependencies
 import sixlib.spmd_types._state as _state  # noqa: E402
+from sixlib.spmd_types._raw_dist import RAW_DIST_RULES  # noqa: E402
 from sixlib.spmd_types._state import is_type_checking  # noqa: E402, F401
 
 
@@ -1343,15 +1492,35 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
     (shape mismatches, invalid arguments) surface before type errors.
 
     Args:
-        strict: If True, raises ``SpmdTypeError`` when a regular torch op
-            mixes typed and untyped tensor operands.  Once all tensors are
-            annotated, keep this on to prevent unannotated tensors from
-            silently slipping through.
+        strict_mode: Controls the strictness of type checking.
+
+            - ``"permissive"``: allows mixing annotated and unannotated
+              tensor operands without error.  Useful during incremental
+              annotation of an existing codebase.
+
+            - ``"strict"`` (default): raises ``SpmdTypeError`` when a
+              regular torch op mixes typed and untyped tensor operands.
+              Factory ops (ops with no typed tensor inputs, like
+              ``torch.zeros``) produce tensors with a special "factory"
+              marker; mixing a factory tensor with a real-typed tensor
+              raises ``SpmdTypeError``.  Call ``assert_type()`` on the
+              factory tensor to assign it a real type before combining.
+
+            - ``"strict_factory"``: like ``"strict"``, but additionally
+              raises ``SpmdTypeError`` at the point where a factory op
+              creates an untyped tensor, rather than deferring the error.
+              This is useful for auditing whether each factory tensor
+              should be replicated or varying, which can be non-obvious.
     """
 
-    def __init__(self, strict: bool = True):
+    def __init__(
+        self,
+        *,
+        strict_mode: Literal["permissive", "strict", "strict_factory"] = "strict",
+    ):
         super().__init__()
-        self.strict = strict
+        self._strict = strict_mode in ("strict", "strict_factory")
+        self._strict_factory = strict_mode == "strict_factory"
         self._disabled = False
 
     @contextmanager
@@ -1401,72 +1570,138 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         original_args, original_kwargs = args, kwargs
         args, kwargs = _unwrap_args(args, kwargs)
 
-        # Run the function first (catches runtime errors before type errors).
-        # This means collectives execute before type checking, but that's fine:
-        # type checking typically runs with a fake PG where comms are free.
+        # Run the function, then type-check the result below.
+        # Raw torch.distributed collectives are already type-checked above;
+        # SPMD collectives and regular ops are checked after execution.
         result = func(*args, **kwargs)
 
-        # Strict mode: all tensor operands must be annotated (applies to both
-        # SPMD collectives and regular torch ops).
-        if self.strict:
-            _check_all_typed(func, args, kwargs)
+        # =============================================================
+        # Classification phase: single pass over all tensor args.
+        # =============================================================
+        info = _classify_args(args, kwargs)
 
-        if func in _SPMD_FUNCTION_DEFAULTS:
-            # Special spmd collective/reinterpret/collect
-            x = args[0]
-            if has_local_type(x):
-                defaults = _SPMD_FUNCTION_DEFAULTS[func]
-                axis = args[1] if len(args) > 1 else kwargs["axis"]
-                src = kwargs.get("src", defaults["src"])
-                dst = kwargs.get("dst", defaults["dst"])
-
-                # Decay Shard to Varying for local SPMD type checking.
-                # S(i) is a global SPMD refinement; locally it behaves as V.
-                if isinstance(src, Shard):
-                    src = V
-                if isinstance(dst, Shard):
-                    dst = V
-
-                # Validate input type on the axis matches src
-                input_type = get_axis_local_type(x, axis)
-                if src is not None:
-                    if input_type != src:
-                        raise SpmdTypeError(
-                            f"{func.__name__}: expected input type {src} on axis "
-                            f"{format_axis(axis)}, got {input_type}"
-                        )
-
-                # Build output types: copy all axes from input, override this axis
-                output_type = get_local_type(x).copy()
-                if dst is not None:
-                    output_type[axis] = dst
-                _set_local_type(result, output_type)
+        # =============================================================
+        # Decision phase: determine if type checking can proceed.
+        #
+        # After this block, either we have returned early (skip / factory
+        # propagation / strict error) or ALL tensor operands are typed.
+        # =============================================================
+        if info.has_typed and not info.has_factory and not info.has_untyped:
+            # All typed: proceed to type checking below.
+            pass
+        elif not info.has_typed and not info.has_untyped:
+            # All factory or no tensor args at all.
+            # Propagation/rejection handled per-op-kind below.
+            pass
         else:
-            # Regular torch op: propagate types according to non-comms rules
-            # Use original_args/original_kwargs so Scalar types are collected.
+            # Mixed: some tensors lack types (factory mixed with typed,
+            # truly untyped, or both).
+            if self._strict:
+                _raise_strict_error(func, info.untyped_entries)
+            # Non-strict: can't safely infer types from a partial set of
+            # inputs (e.g., seeing only R args might hide a V arg, leading
+            # to an incorrect R output and error cascade).  Skip entirely.
+            return result
+
+        # =============================================================
+        # Type checking phase.
+        #
+        # Invariants at this point:
+        #  - All-typed: every tensor operand has a real SPMD type.
+        #  - All-factory / no tensors: info.tensor_types is empty.
+        #  - Non-strict mixed (regular ops only): info.tensor_types has
+        #    the typed subset; untyped/factory tensors are ignored.
+        # =============================================================
+        if func in _SPMD_FUNCTION_DEFAULTS:
+            x = args[0]
+            if not has_local_type(x):
+                # Factory tensor passed to a collective.
+                raise SpmdTypeError(
+                    f"{func.__name__}: input tensor is a factory tensor "
+                    f"(no SPMD type). Use assert_type() to annotate it "
+                    f"before calling collectives."
+                )
+            defaults = _SPMD_FUNCTION_DEFAULTS[func]
+            axis = args[1] if len(args) > 1 else kwargs["axis"]
+            src = kwargs.get("src", defaults["src"])
+            dst = kwargs.get("dst", defaults["dst"])
+
+            # Decay Shard to Varying for local SPMD type checking.
+            # S(i) is a global SPMD refinement; locally it behaves as V.
+            if isinstance(src, Shard):
+                src = V
+            if isinstance(dst, Shard):
+                dst = V
+
+            # Validate input type on the axis matches src
+            input_type = get_axis_local_type(x, axis)
+            if src is not None and input_type != src:
+                raise SpmdTypeError(
+                    f"{func.__name__}: expected input type {src} on axis "
+                    f"{format_axis(axis)}, got {input_type}"
+                )
+
+            # Build output types: copy all axes from input, override this axis
+            output_type = get_local_type(x).copy()
+            if dst is not None:
+                output_type[axis] = dst
+            _set_local_type(result, output_type)
+
+        elif func in RAW_DIST_RULES:
+            # Raw torch.distributed collective (e.g. all_gather_into_tensor).
+            # The rule functions check types internally; reject factory here.
+            if not info.has_typed:
+                func_name = getattr(func, "__name__", repr(func))
+                raise SpmdTypeError(
+                    f"{func_name}: input tensor is a factory tensor "
+                    f"(no SPMD type). Use assert_type() to annotate it "
+                    f"before calling collectives."
+                )
+            RAW_DIST_RULES[func](func, args, kwargs)
+
+        else:
+            # Regular op: infer output type from tensor types + scalars.
+            if not info.tensor_types:
+                # No typed tensor inputs (all factory or no tensors).
+                if self._strict_factory:
+                    func_name = getattr(func, "__name__", repr(func))
+                    raise SpmdTypeError(
+                        f"Strict factory mode: operation {func_name} "
+                        f"produced a tensor with no SPMD type because none "
+                        f"of its inputs were annotated. "
+                        f"Use assert_type() on the inputs first."
+                    )
+                _set_result_type(result, None)  # propagate factory marker
+                return result
+
             spec = _OP_REGISTRY.get(func)
-            input_types_list = _collect_input_types(
-                original_args, original_kwargs, spec
-            )
-            if input_types_list:
-                # Check for type-level decomposition first.
-                decomp_rule = _DECOMP_TYPE_RULES.get(func)
-                if decomp_rule is not None:
-                    output_type = decomp_rule(*input_types_list)
-                else:
-                    linearity = (
-                        spec.linearity if spec is not None else OpLinearity.NONLINEAR
+            input_types_list = list(info.tensor_types)
+            if spec is not None:
+                input_types_list = _collect_scalar_types(
+                    input_types_list, original_args, original_kwargs, spec
+                )
+
+            decomp_rule = _DECOMP_TYPE_RULES.get(func)
+            if decomp_rule is not None:
+                output_type = decomp_rule(*input_types_list)
+            else:
+                linearity = (
+                    spec.linearity if spec is not None else OpLinearity.NONLINEAR
+                )
+                if spec is not None and spec.fixed_args:
+                    input_types_list = _apply_fixed_args(
+                        func, args, kwargs, spec, input_types_list
                     )
-                    if spec is not None and spec.fixed_args:
-                        input_types_list = _apply_fixed_args(
-                            func, args, kwargs, spec, input_types_list
-                        )
-                    output_type = infer_output_type(
-                        input_types_list, linearity=linearity
-                    )
-                _set_result_type(result, output_type)
-                out = original_kwargs.get("out")
-                if out is not None:
-                    _set_result_type(out, output_type)
+                output_type = infer_output_type(input_types_list, linearity=linearity)
+
+            # Validate mutation safety for in-place/out operations.
+            mutated = _get_mutated_tensors(func, args, kwargs, result)
+            if mutated:
+                _validate_mutation_types(func, mutated, output_type)
+
+            _set_result_type(result, output_type)
+            out = original_kwargs.get("out")
+            if out is not None:
+                _set_result_type(out, output_type)
 
         return result

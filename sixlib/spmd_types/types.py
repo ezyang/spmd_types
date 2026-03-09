@@ -162,6 +162,15 @@ GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"
 DimSharding = None | str | Sequence[str]
 
 
+def normalize_dim_sharding(dim_sharding: DimSharding) -> Sequence[str]:
+    """Normalizes a sharding to a sequence of dim names."""
+    if dim_sharding is None:
+        return ()
+    if isinstance(dim_sharding, str):
+        return (dim_sharding,)
+    return dim_sharding
+
+
 class _PytreeTuple:
     """Tuple-like values that are treated as leaves of a PyTree.
 
