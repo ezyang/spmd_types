@@ -12,11 +12,12 @@ import torch
 import torch.distributed as dist
 from sixlib.spmd_types._checker import (
     assert_type,
-    SpmdTypeMode,
+    no_typecheck,
+    typecheck,
 )
+from sixlib.spmd_types._mesh_axis import _reset
 from sixlib.spmd_types.types import I, P, R, Shard, V
 from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
-from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
@@ -30,19 +31,21 @@ class LocalTensorTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Initialize fake distributed environment."""
-        if not dist.is_initialized():
-            store = FakeStore()
-            dist.init_process_group(
-                backend="fake", rank=0, world_size=cls.WORLD_SIZE, store=store
-            )
-        cls.mesh = init_device_mesh("cpu", (cls.WORLD_SIZE,), mesh_dim_names=("tp",))
-        cls.pg = cls.mesh.get_group("tp")
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+        store = FakeStore()
+        dist.init_process_group(
+            backend="fake", rank=0, world_size=cls.WORLD_SIZE, store=store
+        )
+        cls.pg = dist.distributed_c10d._get_default_group()
 
     @classmethod
     def tearDownClass(cls):
         """Clean up distributed environment."""
         if dist.is_initialized():
             dist.destroy_process_group()
+        _reset()
 
     def setUp(self):
         """Enter LocalTensorMode for each test."""
@@ -229,14 +232,14 @@ class SpmdTypeCheckedTestCase(LocalTensorTestCase):
     """
 
     def setUp(self):
-        """Enter LocalTensorMode and SpmdTypeMode for each test."""
+        """Enter LocalTensorMode and typecheck for each test."""
         super().setUp()
-        self.spmd_mode = SpmdTypeMode()
-        self.spmd_mode.__enter__()
+        self._type_checking_cm = typecheck()
+        self._type_checking_cm.__enter__()
 
     def tearDown(self):
-        """Exit SpmdTypeMode and LocalTensorMode after each test."""
-        self.spmd_mode.__exit__(None, None, None)
+        """Exit typecheck and LocalTensorMode after each test."""
+        self._type_checking_cm.__exit__(None, None, None)
         super().tearDown()
 
     def rank_map(self, cb: Callable[[int], torch.Tensor]) -> LocalTensor:
@@ -250,5 +253,5 @@ class SpmdTypeCheckedTestCase(LocalTensorTestCase):
         Args:
             cb: A callable taking a rank (int) and returning a tensor.
         """
-        with self.spmd_mode.disable():
+        with no_typecheck():
             return self.mode.rank_map(cb)

@@ -6,11 +6,16 @@ from types import ModuleType
 
 # Collectives and operations
 from sixlib.spmd_types._checker import (  # noqa: F401
+    _SpmdTypeBackwardCompatibleMode as SpmdTypeMode,
     assert_local_type,
     assert_type,
     is_type_checking,
     mutate_type,
-    SpmdTypeMode,
+    no_typecheck,
+    register_autograd_function,
+    register_local_autograd_function,
+    trace,
+    typecheck,
 )
 from sixlib.spmd_types._collectives import (  # noqa: F401
     all_gather,
@@ -22,6 +27,7 @@ from sixlib.spmd_types._collectives import (  # noqa: F401
 )
 from sixlib.spmd_types._dist import set_dist  # noqa: F401
 from sixlib.spmd_types._dtensor import (  # noqa: F401
+    dtensor_placement_to_spmd_type,
     spmd_redistribute,
     spmd_type_to_dtensor_placement,
 )
@@ -31,7 +37,10 @@ from sixlib.spmd_types._local import (  # noqa: F401
     reinterpret,
     shard,
 )
+from sixlib.spmd_types._mesh_axis import MeshAxis  # noqa: F401
 from sixlib.spmd_types._scalar import Scalar  # noqa: F401
+from sixlib.spmd_types._traceback import traceback_filtering  # noqa: F401
+from sixlib.spmd_types._type_attr import get_local_type  # noqa: F401
 
 # Types
 from sixlib.spmd_types.types import (  # noqa: F401
@@ -39,6 +48,7 @@ from sixlib.spmd_types.types import (  # noqa: F401
     I,
     Invariant,
     LocalSpmdType,
+    normalize_axis,
     P,
     Partial,
     PartitionSpec,
@@ -60,7 +70,7 @@ class _SpmdTypesModule(ModuleType):
     """Module wrapper that provides TYPE_CHECKING as a dynamic attribute.
 
     Accessing ``sixlib.spmd_types.TYPE_CHECKING`` returns True when a
-    SpmdTypeMode context is active and False otherwise.  This uses the
+    ``typecheck()`` context is active and False otherwise.  This uses the
     sys.modules replacement trick (same pattern as torch._dynamo.config)
     so that a simple attribute read works like a function call.
     """

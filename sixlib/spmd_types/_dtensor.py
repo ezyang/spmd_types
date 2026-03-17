@@ -32,6 +32,47 @@ from torch.distributed.tensor import (
 )
 
 
+def dtensor_placement_to_spmd_type(
+    placement: DtPlacement,
+    grad_placement: DtPlacement | None = None,
+) -> PerMeshAxisSpmdType:
+    """Converts a DTensor placement to an spmd_types per-axis type.
+
+    This is the reverse of ``spmd_type_to_dtensor_placement``.
+
+    For Replicate placements, the forward type is ambiguous between R and I.
+    The ``grad_placement`` parameter disambiguates:
+
+    - ``Partial`` gradient -> R (backward does all-reduce)
+    - ``Replicate`` gradient (or None, the default) -> I (backward is no-op)
+
+    Args:
+        placement: A DTensor placement (Replicate, Shard, or Partial).
+        grad_placement: The gradient placement for this axis, used to
+            disambiguate Replicate (R vs I).  When None, defaults to I
+            (matching DTensor's default of keeping Replicate gradients
+            as Replicate).
+
+    Returns:
+        The corresponding spmd_types per-axis type.
+
+    Raises:
+        ValueError: If the placement type is unknown.
+    """
+    if isinstance(placement, DtReplicate):
+        # Disambiguate R vs I via the gradient placement.
+        # DTensor default: grad of Replicate stays Replicate (= I semantics).
+        # Explicit Partial grad: backward does all-reduce (= R semantics).
+        if isinstance(grad_placement, DtPartial):
+            return R
+        return I
+    elif isinstance(placement, DtShard):
+        return S(placement.dim)
+    elif isinstance(placement, DtPartial):
+        return P
+    raise ValueError(f"Unknown DTensor placement: {placement}")
+
+
 def spmd_type_to_dtensor_placement(
     spmd_type: PerMeshAxisSpmdType,
 ) -> DtPlacement:

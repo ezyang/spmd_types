@@ -19,7 +19,7 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
-    SpmdTypeMode,
+    typecheck,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
 
@@ -32,7 +32,7 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=R, dst=V, expert_mode=True)
 
         # Forward is no-op, values unchanged
@@ -45,7 +45,7 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=R, dst=I, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
@@ -57,7 +57,7 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=R, dst=P, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
@@ -69,7 +69,7 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=I, dst=R, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
@@ -81,7 +81,7 @@ class TestReinterpret(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, V)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=V, dst=P)
 
         for r in range(self.WORLD_SIZE):
@@ -133,7 +133,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=R, dst=V)
 
         # Each rank gets its chunk: rank 0 gets [0,1], rank 1 gets [2,3], rank 2 gets [4,5]
@@ -150,7 +150,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=R, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
@@ -166,7 +166,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: I})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=I, dst=V)
 
         for r in range(self.WORLD_SIZE):
@@ -182,7 +182,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: I})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=I, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
@@ -198,7 +198,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=R, dst=P)
 
         # Rank 0 keeps values, others are zeroed
@@ -217,7 +217,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: I})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=I, dst=P, expert_mode=True)
 
         torch.testing.assert_close(result._local_tensors[0], base)
@@ -235,7 +235,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=V, dst=P, expert_mode=True)
 
         # Each rank has a tensor of size world_size with its value at its position
@@ -252,7 +252,7 @@ class TestConvert(LocalTensorTestCase):
         x = self.rank_map(lambda r: torch.tensor([float(r)]))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=S(0), dst=P, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
@@ -275,7 +275,7 @@ class TestConvert(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, R)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=R, dst=I, expert_mode=True)
 
         for r in range(self.WORLD_SIZE):
@@ -287,7 +287,7 @@ class TestConvert(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = convert(x, self.pg, src=I, dst=R)
 
         for r in range(self.WORLD_SIZE):
@@ -336,7 +336,7 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=I, dst=V)
 
         # Forward is no-op (composition of two no-ops)
@@ -349,13 +349,71 @@ class TestReinterpretCompositions(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, I)
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reinterpret(x, self.pg, src=I, dst=P)
 
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
         self.assertIs(get_axis_local_type(result, self.pg), P)
+
+
+class TestConvertSubmesh(LocalTensorTestCase):
+    """Test convert operations on submesh axes (group size < world size).
+
+    Verifies that convert correctly maps global ranks to group-local ranks
+    when using process groups from a multi-dimensional mesh. Previously,
+    tensor_map passed global ranks directly to chunk/select, causing
+    IndexError when global rank >= group size.
+    """
+
+    WORLD_SIZE = 4
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from torch.distributed.device_mesh import init_device_mesh
+
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        cls.tp = mesh.get_group("tp")
+        cls.dp = mesh.get_group("dp")
+
+    def test_convert_r_to_shard_submesh(self):
+        """convert(R, S(1)) on a submesh axis uses group-local rank for chunking."""
+        x = self.rank_map(lambda r: torch.arange(32).float().reshape(4, 8))
+        assert_type(x, {self.tp: R})
+
+        result = convert(x, self.tp, src=R, dst=S(1))
+
+        # tp groups are [0,1] and [2,3], each with world_size=2
+        # Chunking dim=1 of shape [4,8] into 2 gives [4,4] per rank
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (4, 4))
+        # Ranks in the same tp group should get different chunks
+        self.assertFalse(
+            torch.equal(result._local_tensors[0], result._local_tensors[1])
+        )
+        # Ranks in different tp groups but same position should get same chunk
+        torch.testing.assert_close(result._local_tensors[0], result._local_tensors[2])
+        torch.testing.assert_close(result._local_tensors[1], result._local_tensors[3])
+
+    def test_convert_r_to_shard_strided_submesh(self):
+        """convert(R, S(0)) on a strided submesh (dp groups [0,2] and [1,3])."""
+        x = self.rank_map(lambda r: torch.arange(8).float().reshape(4, 2))
+        assert_type(x, {self.dp: R})
+
+        result = convert(x, self.dp, src=R, dst=S(0))
+
+        # dp groups are [0,2] and [1,3], each with world_size=2
+        # Chunking dim=0 of shape [4,2] into 2 gives [2,2] per rank
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (2, 2))
+        # Ranks 0 and 2 are in the same dp group, different positions
+        self.assertFalse(
+            torch.equal(result._local_tensors[0], result._local_tensors[2])
+        )
+        # Ranks 0 and 1 are in different dp groups, same position -> same chunk
+        torch.testing.assert_close(result._local_tensors[0], result._local_tensors[1])
 
 
 if __name__ == "__main__":

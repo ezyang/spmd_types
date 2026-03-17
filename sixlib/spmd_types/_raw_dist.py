@@ -25,15 +25,14 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as _torch_dist
+from sixlib.spmd_types import _state
 from sixlib.spmd_types._type_attr import (
-    get_axis_local_type,
     get_local_type,
-    has_local_type,
-    is_factory,
 )
 from sixlib.spmd_types.types import (
     format_axis,
     I,
+    normalize_axis,
     P,
     PerMeshAxisLocalSpmdType,
     R,
@@ -62,6 +61,11 @@ def _check_raw_collective(
     to change the input tensor's type after validation.  This models a
     read-write operand that is both checked as input and mutated as output.
 
+    In strict mode, a typed tensor missing the group axis raises
+    ``SpmdTypeError``.  In permissive mode, missing axes skip src/dst
+    validation but ``mutate_src_to`` is still applied (we know the
+    post-collective type even if we didn't validate the pre-collective type).
+
     Args:
         func_name: Name of the collective (for error messages).
         input_tensor: The input tensor operand.
@@ -78,22 +82,30 @@ def _check_raw_collective(
     if group is None:
         group = _torch_dist.distributed_c10d._get_default_group()
 
-    if is_factory(input_tensor):
-        raise SpmdTypeError(
-            f"{func_name}: input tensor is a factory tensor "
-            f"(no SPMD type). Use assert_type() to annotate it "
-            f"before calling collectives."
-        )
+    # Normalize group to MeshAxis for dict lookups (types are stored under
+    # normalized keys).
+    group = normalize_axis(group)
 
-    if has_local_type(input_tensor):
-        input_type = get_axis_local_type(input_tensor, group)
+    if group.size() == 1:
+        return  # singleton axes are not tracked
+
+    local_type = get_local_type(input_tensor)
+    if group in local_type:
+        input_type = local_type[group]
         if input_type is not src:
             raise SpmdTypeError(
                 f"{func_name}: expected input type {src} on axis "
                 f"{format_axis(group)}, got {input_type}"
             )
-        if mutate_src_to is not None:
-            get_local_type(input_tensor)[group] = mutate_src_to
+    elif _state.is_strict():
+        raise SpmdTypeError(
+            f"{func_name}: tensor has no type for axis "
+            f"{format_axis(group)}. Use assert_type() to annotate "
+            f"the tensor on this axis before calling collectives."
+        )
+    # Always apply mutate_src_to (even if axis was previously missing).
+    if mutate_src_to is not None:
+        local_type[group] = mutate_src_to
 
     if output_tensors is not None:
         if isinstance(output_tensors, list):
@@ -110,22 +122,27 @@ def _check_output_tensor(
     dst: tuple[PerMeshAxisLocalSpmdType, ...],
     index: int | None = None,
 ) -> None:
-    """Check a single output tensor's factory status and SPMD type."""
+    """Check a single output tensor's SPMD type."""
+    # Normalize group to MeshAxis for dict lookups.
+    group = normalize_axis(group)
+    if group.size() == 1:
+        return  # singleton axes are not tracked
     label = f"output tensor_list[{index}]" if index is not None else "output tensor"
-    if is_factory(tensor):
-        raise SpmdTypeError(
-            f"{func_name}: {label} is a factory tensor "
-            f"(no SPMD type). Use assert_type() to annotate it "
-            f"before calling collectives."
-        )
-    if has_local_type(tensor):
-        output_type = get_axis_local_type(tensor, group)
+    local_type = get_local_type(tensor)
+    if group in local_type:
+        output_type = local_type[group]
         if output_type not in dst:
             raise SpmdTypeError(
                 f"{func_name}: expected {label} type "
                 f"{'/'.join(str(t) for t in dst)} on axis "
                 f"{format_axis(group)}, got {output_type}"
             )
+    elif _state.is_strict():
+        raise SpmdTypeError(
+            f"{func_name}: {label} has no type for axis "
+            f"{format_axis(group)}. Use assert_type() to annotate "
+            f"the tensor on this axis before calling collectives."
+        )
 
 
 def _make_rule(input_arg, output_arg, src, dst, *, mutate_src_to=None):

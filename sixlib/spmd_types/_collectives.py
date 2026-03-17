@@ -7,6 +7,7 @@ from typing import List, Optional, TYPE_CHECKING
 import torch
 from sixlib.spmd_types import _dist
 from sixlib.spmd_types._local import convert, reinterpret
+from sixlib.spmd_types._traceback import api_boundary
 from sixlib.spmd_types.types import (
     _canonicalize_shard,
     I,
@@ -65,6 +66,7 @@ class _AllReduce(torch.autograd.Function):
         return grad, None, None, None
 
 
+@api_boundary
 def all_reduce(
     x,
     axis: ProcessGroup,
@@ -269,6 +271,7 @@ class _AllGatherUneven(torch.autograd.Function):
         return output, None, None, None, None
 
 
+@api_boundary
 def all_gather(
     x,
     axis: ProcessGroup,
@@ -491,6 +494,7 @@ class _ReduceScatterUneven(torch.autograd.Function):
         )
 
 
+@api_boundary
 def reduce_scatter(
     x,
     axis: ProcessGroup,
@@ -682,6 +686,7 @@ class _AllToAllShard(torch.autograd.Function):
         return grad, None, None, None
 
 
+@api_boundary
 def all_to_all(
     x,
     axis: ProcessGroup,
@@ -825,6 +830,7 @@ def all_to_all(
 # =============================================================================
 
 
+@api_boundary
 def redistribute(  # noqa: C901
     x,
     axis: ProcessGroup,

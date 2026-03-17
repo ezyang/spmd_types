@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Sequence, TYPE_CHECKING, TypeAlias
 
+from sixlib.spmd_types._mesh_axis import MeshAxis
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -111,8 +113,10 @@ Partial = P
 # Type aliases
 PerMeshAxisSpmdType = PerMeshAxisLocalSpmdType | Shard
 
-# Axis identifier: either a mesh axis name (string) or a ProcessGroup directly
-DeviceMeshAxis: TypeAlias = "str | ProcessGroup"
+# Axis identifier: a MeshAxis or a ProcessGroup.
+# ProcessGroup is accepted for convenience but is normalized to MeshAxis
+# internally via normalize_axis().
+DeviceMeshAxis: TypeAlias = "MeshAxis | ProcessGroup"
 
 # PerMeshAxisSpmdTypes is the permissive input variant that also accepts S(i).
 # Used in user-facing APIs like assert_type, where S(i) is syntax sugar
@@ -128,28 +132,48 @@ LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisLocalSpmdType]"
 # =============================================================================
 
 
+def _format_spec_entry(
+    entry: DeviceMeshAxis | tuple[DeviceMeshAxis, ...] | None,
+) -> str:
+    """Format a single PartitionSpec entry for display.
+
+    Uses ``format_axis`` so that ProcessGroup entries show a readable name
+    (e.g. their ``group_desc``) instead of the opaque default repr.
+    """
+    if entry is None:
+        return "None"
+    if isinstance(entry, tuple):
+        formatted = ", ".join(format_axis(a) for a in entry)
+        return f"({formatted})"
+    return format_axis(entry)
+
+
 class PartitionSpec(tuple):
     """
     A partition spec describes how tensor dimensions map to mesh axes.
 
     Each element corresponds to a tensor dimension and specifies zero, one, or
-    multiple mesh axis names that shard that dimension. For example:
-        - PartitionSpec('tp', None) means dim 0 is sharded on 'tp', dim 1 is replicated
-        - PartitionSpec(('dp', 'tp'), None) means dim 0 is sharded on both 'dp' and 'tp'
+    multiple mesh axes that shard that dimension. For example:
+        - PartitionSpec(tp, None) means dim 0 is sharded on tp, dim 1 is replicated
+        - PartitionSpec((dp, tp), None) means dim 0 is sharded on both dp and tp
         - PartitionSpec() means fully replicated
     """
 
-    def __new__(cls, *args: str | tuple[str, ...] | None):
+    def __new__(cls, *args: MeshAxis | tuple[MeshAxis, ...] | None):
+        for i, entry in enumerate(args):
+            if isinstance(entry, tuple) and len(entry) == 0:
+                raise ValueError(
+                    f"PartitionSpec entry at dim {i} is an empty tuple. "
+                    f"Use None for replicated dimensions."
+                )
         return super().__new__(cls, args)
 
     def __repr__(self):
-        pr = repr(tuple(self))[1:-1]
         if not self:
             return "PartitionSpec()"
-        return f"PartitionSpec({pr})"
+        parts = ", ".join(_format_spec_entry(e) for e in self)
+        return f"PartitionSpec({parts})"
 
-
-GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"
 
 # =============================================================================
 # TensorSharding for Module Boundary Contracts
@@ -159,6 +183,9 @@ GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"
 # * None: replicated;
 # * str: the device mesh axis name, e.g., "fsdp" or "tp";
 # * Sequence[str]: multiple device mesh axis names, e.g., ("fsdp", "cp").
+#
+# Note: DimSharding uses plain strings (mesh dim names) rather than MeshAxis
+# because it describes DeviceMesh dimensions by name, not axis identifiers.
 DimSharding = None | str | Sequence[str]
 
 
@@ -246,9 +273,27 @@ class SpmdTypeError(RuntimeError):
     ``__torch_function__``.  Python interprets a TypeError from an operator
     dunder as "this type doesn't support the operation" and silently falls
     through to reflected operations, masking the real error message.
+
+    The optional ``context`` field carries a pre-formatted string describing
+    the operator and its typed operands (shapes, dtypes, SPMD types).  When
+    present, ``__str__`` appends it after the base message so that error
+    output looks like::
+
+        SpmdTypeError: Partial type on axis DP in a linear op ...
+          In add(args[0]: f32[8, 16] {DP: P, TP: R}, args[1]: f32[16] {DP: R, TP: R})
     """
 
-    pass
+    context: str | None
+
+    def __init__(self, msg: str, *, context: str | None = None):
+        super().__init__(msg)
+        self.context = context
+
+    def __str__(self):
+        base = super().__str__()
+        if self.context:
+            return base + "\n\n" + self.context
+        return base
 
 
 def _canonicalize_shard(typ: PerMeshAxisSpmdType, ndim: int) -> PerMeshAxisSpmdType:
@@ -257,27 +302,215 @@ def _canonicalize_shard(typ: PerMeshAxisSpmdType, ndim: int) -> PerMeshAxisSpmdT
     Args:
         typ: The per-mesh-axis SPMD type, possibly a Shard with a negative dim.
         ndim: The number of dimensions of the tensor, used to resolve negative dims.
+
+    Raises:
+        SpmdTypeError: If the resolved dim is out of bounds.
     """
-    if isinstance(typ, Shard) and typ.dim < 0:
-        return Shard(typ.dim % ndim)
+    if isinstance(typ, Shard):
+        if typ.dim < 0:
+            if typ.dim < -ndim:
+                raise SpmdTypeError(
+                    f"S({typ.dim}) is out of bounds for tensor with ndim={ndim}"
+                )
+            return Shard(typ.dim + ndim)
+        if typ.dim >= ndim:
+            raise SpmdTypeError(
+                f"S({typ.dim}) is out of bounds for tensor with ndim={ndim}"
+            )
     return typ
+
+
+def normalize_axis(axis: DeviceMeshAxis) -> MeshAxis:
+    """Normalize a DeviceMeshAxis to its canonical form (MeshAxis).
+
+    ProcessGroup is converted to MeshAxis via MeshAxis.of().
+    MeshAxis passes through unchanged.
+
+    Args:
+        axis: The mesh axis identifier (MeshAxis or ProcessGroup).
+    """
+    if isinstance(axis, MeshAxis):
+        return axis
+    # ProcessGroup -> MeshAxis
+    return MeshAxis.of(axis)
+
+
+def _check_orthogonality(axes: list[MeshAxis]) -> None:
+    """Check that all mesh axes are mutually orthogonal.
+
+    Axes must tile different dimensions of the device mesh without rank
+    collisions. Overlapping axes (e.g., a flattened ``dp_cp`` axis alongside
+    an individual ``dp`` axis) produce incorrect type inference results because
+    type inference reasons about each axis independently.
+
+    Args:
+        axes: The mesh axes to check (must have length >= 2).
+
+    Raises:
+        SpmdTypeError: If any two axes overlap (share ranks).
+    """
+    # Fast path: check all axes at once.
+    if axes[0].isorthogonal(*axes[1:]):
+        return
+    # Slow path: find the specific overlapping pair for a clear error message.
+    for i in range(len(axes)):
+        for j in range(i + 1, len(axes)):
+            if not axes[i].isorthogonal(axes[j]):
+                raise SpmdTypeError(
+                    f"Mesh axes {format_axis(axes[i])} and "
+                    f"{format_axis(axes[j])} are not orthogonal (they share "
+                    f"ranks). All axes in a LocalSpmdType must be mutually "
+                    f"orthogonal."
+                )
+    # If no pair is non-orthogonal but the group fails, it means a three-way
+    # collision. This shouldn't happen with standard mesh layouts but handle
+    # it for completeness.
+    axis_names = ", ".join(format_axis(a) for a in axes)
+    raise SpmdTypeError(f"Mesh axes [{axis_names}] are not mutually orthogonal.")
+
+
+def normalize_local_type(spmd_type: LocalSpmdType) -> LocalSpmdType:
+    """Normalize a LocalSpmdType dict: canonicalize axis keys and drop singletons.
+
+    This is the canonical way to build a ``LocalSpmdType`` dict from
+    user-supplied axis/type pairs.  It ensures that:
+
+    1. All axis keys are normalized to ``MeshAxis`` (via ``normalize_axis``).
+    2. All values are ``PerMeshAxisLocalSpmdType`` (R, I, V, or P).
+    3. Size-1 (singleton) axes are dropped -- they carry no information since
+       there is only one rank, and dropping them keeps the key set consistent
+       across tensors and ``Scalar`` objects.
+    4. Remaining axes are mutually orthogonal (no shared ranks).
+
+    Higher-level validators (e.g., ``_validate`` in ``_checker.py``) may add
+    further checks (rejection of internal sentinel types) on top of this
+    function.
+
+    Args:
+        spmd_type: A mapping from mesh axes to per-axis SPMD types.
+
+    Raises:
+        TypeError: If any value is not a PerMeshAxisLocalSpmdType.
+        SpmdTypeError: If any two axes overlap (share ranks).
+    """
+    result: LocalSpmdType = {}
+    for axis, typ in spmd_type.items():
+        if not isinstance(typ, PerMeshAxisLocalSpmdType):
+            raise TypeError(
+                f"Expected PerMeshAxisLocalSpmdType (R, I, V, or P) on axis "
+                f"{format_axis(axis)}, got {typ!r}"
+            )
+        norm = normalize_axis(axis)
+        if norm.size() == 1:
+            continue  # singleton axes are not tracked
+        result[norm] = typ
+    if len(result) >= 2:
+        _check_orthogonality(list(result.keys()))
+    return result
 
 
 def format_axis(axis: DeviceMeshAxis) -> str:
     """Format a mesh axis for display in error messages.
 
-    For string axes, returns the repr (e.g., ``'tp'``).
-    For ProcessGroup axes, uses ``group_desc`` when available to produce a
-    bare human-readable name (e.g., ``TP``) instead of the default opaque
-    object repr.
+    For MeshAxis, uses the MeshAxis repr (e.g., ``tp``).
+    For ProcessGroup axes, converts to MeshAxis first.
 
     Args:
-        axis: The mesh axis identifier, either a string name or a ProcessGroup.
+        axis: The mesh axis identifier (MeshAxis or ProcessGroup).
     """
-    if isinstance(axis, str):
+    if isinstance(axis, MeshAxis):
         return repr(axis)
-    # ProcessGroup - use group_desc for a readable name
-    desc = getattr(axis, "group_desc", None)
-    if desc and desc != "undefined":
-        return desc
-    return repr(axis)
+    # ProcessGroup - convert to MeshAxis for display
+    return repr(normalize_axis(axis))
+
+
+def shard_types_to_partition_spec(
+    types: dict[DeviceMeshAxis, PerMeshAxisSpmdType],
+    ndim: int,
+    axis_order: Sequence[DeviceMeshAxis] | None = None,
+) -> PartitionSpec:
+    """Convert Shard entries in a types dict to a PartitionSpec.
+
+    Scans ``types`` for Shard entries, groups them by resolved dim, and
+    returns a PartitionSpec of length ``ndim``.
+
+    Axes listed in ``axis_order`` are placed first (in the given order)
+    for each dim; remaining Shard axes are appended.  If a dim ends up
+    with multiple axes and their relative order was not determined by
+    ``axis_order``, a ``SpmdTypeError`` is raised.  When every dim has
+    at most one axis, ``axis_order`` can be omitted.
+
+    Args:
+        types: Dict mapping mesh axes to per-axis SPMD types.
+            Only Shard entries are considered; R/I/P entries are ignored.
+        ndim: Number of tensor dimensions (length of the returned spec).
+        axis_order: Optional sequence that pins the ordering of axes
+            within multi-axis dims.  Need only cover axes that share a
+            dim; axes on unique dims are handled automatically.
+
+    Returns:
+        A PartitionSpec of length ``ndim``.
+
+    Raises:
+        SpmdTypeError: If multiple axes shard the same dim and
+            ``axis_order`` does not resolve their ordering.
+    """
+    dim_to_axes: dict[int, list[DeviceMeshAxis]] = {}
+    mesh_axis_processed: set[DeviceMeshAxis] = set()
+    if axis_order is not None:
+        for axis in axis_order:
+            typ = types.get(axis)
+            if isinstance(typ, Shard):
+                dim_to_axes.setdefault(typ.dim, []).append(axis)
+                mesh_axis_processed.add(axis)
+    # Scan remaining entries, but make sure no unresolved ordering.
+    for axis, typ in types.items():
+        if isinstance(typ, Shard) and axis not in mesh_axis_processed:
+            dim_to_axes.setdefault(typ.dim, []).append(axis)
+            if len(dim_to_axes[typ.dim]) > 1:
+                names = ", ".join(format_axis(a) for a in dim_to_axes[typ.dim])
+                raise SpmdTypeError(
+                    f"Tensor dim {typ.dim} is sharded on multiple axes "
+                    f"({names}) but axis_order does not resolve their "
+                    f"ordering. Pass all conflicting axes in axis_order."
+                )
+
+    entries: list[DeviceMeshAxis | tuple[DeviceMeshAxis, ...] | None] = [None] * ndim
+    for dim, axes in dim_to_axes.items():
+        if len(axes) == 1:
+            entries[dim] = axes[0]
+        else:
+            entries[dim] = tuple(axes)
+    return PartitionSpec(*entries)
+
+
+def partition_spec_to_shard_types(
+    spec: PartitionSpec,
+) -> dict[DeviceMeshAxis, Shard]:
+    """Convert a PartitionSpec to a dict of Shard types.
+
+    Walks PartitionSpec entries; for each axis at dim ``d``, emits
+    ``axis: S(d)``.
+
+    Args:
+        spec: The PartitionSpec to convert.
+
+    Returns:
+        A dict mapping mesh axes to Shard types.
+
+    Raises:
+        SpmdTypeError: If an axis appears at two different dims.
+    """
+    result: dict[DeviceMeshAxis, Shard] = {}
+    for dim, entry in enumerate(spec):
+        if entry is None:
+            continue
+        axes = entry if isinstance(entry, tuple) else (entry,)
+        for axis in axes:
+            if axis in result:
+                raise SpmdTypeError(
+                    f"Axis {format_axis(axis)} appears at both dim "
+                    f"{result[axis].dim} and dim {dim} in PartitionSpec"
+                )
+            result[axis] = Shard(dim)
+    return result

@@ -24,7 +24,7 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
-    SpmdTypeMode,
+    typecheck,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
 
@@ -37,7 +37,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=V, dst=R)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
@@ -51,7 +51,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=V, dst=I)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
@@ -65,7 +65,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self._generate_inputs((4,), self.pg, P)
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=P, dst=R)
 
         self._assert_all_ranks_equal(result)
@@ -81,7 +81,7 @@ class TestRedistribute(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: P})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
@@ -103,7 +103,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=R, dst=V)
 
         for r in range(self.WORLD_SIZE):
@@ -119,7 +119,7 @@ class TestRedistribute(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: base.clone())
         assert_type(x, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=R, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
@@ -143,7 +143,7 @@ class TestRedistribute(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = redistribute(x, self.pg, src=S(0), dst=S(1))
 
         # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
@@ -196,7 +196,7 @@ class TestShardNegativeDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(-1), dst=R)
 
         expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])

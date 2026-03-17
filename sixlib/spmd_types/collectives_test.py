@@ -22,10 +22,11 @@ from sixlib.spmd_types import (
 from sixlib.spmd_types._checker import (
     assert_type,
     get_axis_local_type,
-    SpmdTypeMode,
+    typecheck,
 )
 from sixlib.spmd_types._test_utils import LocalTensorTestCase
-from sixlib.spmd_types.types import SpmdTypeError
+from sixlib.spmd_types.types import MeshAxis, SpmdTypeError
+from torch.distributed.device_mesh import init_device_mesh
 
 
 class TestAllReduce(LocalTensorTestCase):
@@ -40,7 +41,7 @@ class TestAllReduce(LocalTensorTestCase):
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Run all_reduce
-        with SpmdTypeMode():
+        with typecheck():
             result = all_reduce(x, self.pg, src=P, dst=R)
 
         # Check all ranks have the same summed value
@@ -57,7 +58,7 @@ class TestAllReduce(LocalTensorTestCase):
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_reduce(x, self.pg, src=P, dst=I)
 
         self._assert_all_ranks_equal(
@@ -89,7 +90,7 @@ class TestAllReduce(LocalTensorTestCase):
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_reduce(x, self.pg, src=P, dst=R, inplace=True)
 
         # Check correctness
@@ -116,7 +117,7 @@ class TestAllReduce(LocalTensorTestCase):
         # Save data pointers before
         input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_reduce(x, self.pg, src=P, dst=I, inplace=True)
 
         # Check correctness
@@ -135,22 +136,30 @@ class TestAllReduce(LocalTensorTestCase):
                 f"rank {r}: inplace result should share storage with input",
             )
 
-    def test_all_reduce_preserves_other_axes(self):
-        """all_reduce preserves SPMD types on other mesh axes."""
-        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
-        dp = dist.new_group()
-        assert_type(x, {self.pg: P, dp: R})
-        with SpmdTypeMode():
-            result = all_reduce(x, self.pg, src=P, dst=R)
-        self.assertIs(get_axis_local_type(result, self.pg), R)
-        self.assertIs(get_axis_local_type(result, dp), R)
-
     def test_all_reduce_type_mismatch(self):
         """all_reduce raises SpmdTypeError when input type doesn't match src."""
         x = self._generate_inputs((4,), self.pg, R)
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 all_reduce(x, self.pg, src=P, dst=R)
+
+
+class TestAllReduceMultiAxis(LocalTensorTestCase):
+    """Test all_reduce with multiple mesh axes (requires WORLD_SIZE=6)."""
+
+    WORLD_SIZE = 6
+
+    def test_all_reduce_preserves_other_axes(self):
+        """all_reduce preserves SPMD types on other mesh axes."""
+        mesh = init_device_mesh("cpu", (2, 3), mesh_dim_names=("dp", "tp"))
+        tp = mesh.get_group("tp")
+        dp = mesh.get_group("dp")
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        assert_type(x, {tp: P, dp: R})
+        with typecheck():
+            result = all_reduce(x, tp, src=P, dst=R)
+        self.assertIs(get_axis_local_type(result, tp), R)
+        self.assertIs(get_axis_local_type(result, dp), R)
 
 
 class TestAllGather(LocalTensorTestCase):
@@ -162,7 +171,7 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=V, dst=R)
 
         # Result should be [0, 1, 2] on all ranks (stack)
@@ -177,7 +186,7 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=V, dst=I)
 
         expected = torch.tensor([0.0, 2.0, 4.0])
@@ -192,7 +201,7 @@ class TestAllGather(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(0), dst=R)
 
         # Result should be concatenated shards
@@ -233,7 +242,7 @@ class TestReduceScatter(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: P})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reduce_scatter(x, self.pg, src=P, dst=V, scatter_dim=0)
 
         # Each rank r gets the sum of chunk r from all ranks
@@ -256,7 +265,7 @@ class TestReduceScatter(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: P})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = reduce_scatter(x, self.pg, src=P, dst=S(0))
 
         for r in range(self.WORLD_SIZE):
@@ -299,7 +308,7 @@ class TestAllToAll(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_to_all(x, self.pg, src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
@@ -319,7 +328,7 @@ class TestAllToAll(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_to_all(x, self.pg, src=S(0), dst=S(1))
 
         # Split on dim 1 (size 3/3=1), concat on dim 0 (2*3=6)
@@ -378,7 +387,7 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should be concatenation of all shards on all ranks
@@ -401,7 +410,7 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         )
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(0), dst=I, split_sizes=split_sizes)
 
         expected = torch.cat(
@@ -422,7 +431,7 @@ class TestAllGatherUnevenShard(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.randn(split_sizes[r], D))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(0), dst=R, split_sizes=split_sizes)
 
         # Result should have shape (sum(split_sizes), D) = (6, 4)
@@ -488,7 +497,7 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=S(1), dst=R)
 
         # Result should have shape (2, 3) on all ranks (cat along dim 1)
@@ -504,7 +513,7 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.full((2, 2), float(r)))
         assert_type(x, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             result = all_gather(x, self.pg, src=V, dst=R)
 
         # Result should be (3, 2, 2) - stack along dim 0
@@ -549,7 +558,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
         assert_type(output, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_gather_into_tensor(output, x, group=pg)
 
         # Output retains its R annotation
@@ -563,7 +572,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
         assert_type(output, {self.pg: I})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_gather_into_tensor(output, x, group=pg)
 
         self.assertIs(get_axis_local_type(output, self.pg), I)
@@ -576,7 +585,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
         assert_type(output, {self.pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_gather_into_tensor(output, x, group=pg)
 
@@ -588,7 +597,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
         assert_type(output, {self.pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_gather_into_tensor(output, x, group=pg)
 
@@ -602,7 +611,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
         assert_type(x, {pg: P})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_reduce(x, group=pg)
 
         # Type mutated in-place from P to R
@@ -614,7 +623,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([1.0, 2.0]))
         assert_type(x, {pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_reduce(x, group=pg)
 
@@ -624,7 +633,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
         assert_type(x, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_reduce(x, group=pg)
 
@@ -640,7 +649,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
         assert_type(output, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.reduce_scatter_tensor(output, x, group=pg)
 
         self.assertIs(get_axis_local_type(output, pg), V)
@@ -653,7 +662,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
         assert_type(output, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.reduce_scatter_tensor(output, x, group=pg)
 
@@ -665,7 +674,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.tensor([0.0]))
         assert_type(output, {pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.reduce_scatter_tensor(output, x, group=pg)
 
@@ -681,7 +690,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
         assert_type(output, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_to_all_single(output, x, group=pg)
 
         self.assertIs(get_axis_local_type(output, pg), V)
@@ -694,7 +703,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
         assert_type(output, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_to_all_single(output, x, group=pg)
 
@@ -706,7 +715,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE))
         assert_type(output, {pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_to_all_single(output, x, group=pg)
 
@@ -725,7 +734,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         for t in tensor_list:
             assert_type(t, {pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_gather(tensor_list, x, group=pg)
 
         for t in tensor_list:
@@ -742,7 +751,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         for t in tensor_list:
             assert_type(t, {pg: I})
 
-        with SpmdTypeMode():
+        with typecheck():
             dist.all_gather(tensor_list, x, group=pg)
 
         for t in tensor_list:
@@ -759,7 +768,7 @@ class TestRawDistCollective(LocalTensorTestCase):
         for t in tensor_list:
             assert_type(t, {pg: R})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_gather(tensor_list, x, group=pg)
 
@@ -774,9 +783,109 @@ class TestRawDistCollective(LocalTensorTestCase):
         for t in tensor_list:
             assert_type(t, {pg: V})
 
-        with SpmdTypeMode():
+        with typecheck():
             with self.assertRaises(SpmdTypeError):
                 dist.all_gather(tensor_list, x, group=pg)
+
+
+class TestRawDistUnknownGroup(LocalTensorTestCase):
+    """Test raw dist collectives with a group not in the tensor's type dict.
+
+    In strict mode this should raise; in permissive mode it should skip.
+
+    Tensors are typed on ``other_axis`` (a MeshAxis with a different layout
+    than self.pg) so that when the collective runs on self.pg the axis
+    lookup genuinely misses.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A MeshAxis with the same size but different stride than self.pg,
+        # so it normalizes to a distinct key.
+        self.other_axis = MeshAxis.of(self.WORLD_SIZE, 2)
+
+    # -----------------------------------------------------------------
+    # Strict mode (default): unknown group raises SpmdTypeError
+    # -----------------------------------------------------------------
+
+    def test_strict_unknown_group_input_raises(self):
+        """Strict mode raises when input is typed but missing the group axis."""
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.other_axis: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.other_axis: R})
+
+        with typecheck(strict_mode="strict"):
+            with self.assertRaises(SpmdTypeError) as ctx:
+                dist.all_gather_into_tensor(output, x, group=self.pg)
+            self.assertIn("no type for axis", str(ctx.exception))
+
+    def test_strict_unknown_group_output_raises(self):
+        """Strict mode raises when output is typed but missing the group axis."""
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.pg: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        # Output only typed on other_axis, not self.pg.
+        assert_type(output, {self.other_axis: R})
+
+        with typecheck(strict_mode="strict"):
+            with self.assertRaises(SpmdTypeError) as ctx:
+                dist.all_gather_into_tensor(output, x, group=self.pg)
+            self.assertIn("no type for axis", str(ctx.exception))
+
+    def test_strict_unknown_group_all_reduce_raises(self):
+        """Strict mode raises for in-place all_reduce with unknown group."""
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        assert_type(x, {self.other_axis: P})
+
+        with typecheck(strict_mode="strict"):
+            with self.assertRaises(SpmdTypeError) as ctx:
+                dist.all_reduce(x, group=self.pg)
+            self.assertIn("no type for axis", str(ctx.exception))
+
+    # -----------------------------------------------------------------
+    # Permissive mode: unknown group skips validation
+    # -----------------------------------------------------------------
+
+    def test_permissive_unknown_group_input_skips(self):
+        """Permissive mode skips validation for unknown group on input."""
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
+        assert_type(x, {self.other_axis: V})
+        output = self.mode.rank_map(lambda r: torch.empty(self.WORLD_SIZE * 2))
+        assert_type(output, {self.other_axis: R})
+
+        with typecheck(strict_mode="permissive"):
+            # Should not raise.
+            dist.all_gather_into_tensor(output, x, group=self.pg)
+
+        # Types on the other axis are preserved.
+        self.assertIs(get_axis_local_type(x, self.other_axis), V)
+        self.assertIs(get_axis_local_type(output, self.other_axis), R)
+
+    def test_permissive_unknown_group_all_reduce_skips_and_mutates(self):
+        """Permissive mode skips validation but still applies mutate_src_to."""
+        x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
+        assert_type(x, {self.other_axis: P})
+
+        with typecheck(strict_mode="permissive"):
+            # Should not raise -- self.pg axis not in type dict, skips.
+            dist.all_reduce(x, group=self.pg)
+
+        # Other axis type is unchanged.
+        self.assertIs(get_axis_local_type(x, self.other_axis), P)
+        # mutate_src_to=R is applied unconditionally -- we know the
+        # post-collective type even without validating the pre-collective type.
+        self.assertIs(get_axis_local_type(x, self.pg), R)
+
+    def test_permissive_known_group_still_checks(self):
+        """Permissive mode still validates when the group IS in the type dict."""
+        x = self.mode.rank_map(lambda r: torch.tensor([1.0, 2.0]))
+        assert_type(x, {self.pg: R})
+
+        with typecheck(strict_mode="permissive"):
+            with self.assertRaises(SpmdTypeError):
+                # R is wrong for all_reduce (expects P).
+                dist.all_reduce(x, group=self.pg)
 
 
 if __name__ == "__main__":

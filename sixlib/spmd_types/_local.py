@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from sixlib.spmd_types import _dist
+from sixlib.spmd_types._traceback import api_boundary
 from sixlib.spmd_types.types import (
     _canonicalize_shard,
     I,
@@ -18,6 +19,7 @@ from sixlib.spmd_types.types import (
 
 try:
     from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
+    from torch.distributed._local_tensor._c10d import _prepare_collective_groups
 
     _HAS_LOCAL_TENSOR = True
 except ImportError:
@@ -37,6 +39,26 @@ def _get_local_tensor_mode(x: torch.Tensor):
     if mode is not None and isinstance(x, LocalTensor):
         return mode
     return None
+
+
+def _build_rank_to_group_local(pg) -> dict[int, int]:
+    """Build a mapping from global rank to group-local rank.
+
+    In LocalTensor mode, tensor_map iterates over all global ranks, but
+    operations like chunk/select need the rank's position within its process
+    group (group-local rank). This uses the complement computation from
+    PyTorch's _c10d.py to handle both contiguous and strided process groups.
+
+    For example, with world_size=4 and pg=[0,1]:
+      - Groups are [0,1] and [2,3]
+      - Returns {0: 0, 1: 1, 2: 0, 3: 1}
+    """
+    ranks, group_offsets, _offset = _prepare_collective_groups(pg)
+    mapping = {}
+    for group_offset in group_offsets:
+        for local_rank, r in enumerate(ranks):
+            mapping[group_offset + r] = local_rank
+    return mapping
 
 
 # =============================================================================
@@ -116,6 +138,7 @@ class _ReplicateToPartial(torch.autograd.Function):
         return reinterpret(grad_out, ctx.axis, src=R, dst=P, expert_mode=True), None
 
 
+@api_boundary
 def reinterpret(  # noqa: C901
     x,
     axis: ProcessGroup,
@@ -388,10 +411,11 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
+            r2l = _build_rank_to_group_local(pg)
             return mode.tensor_map(
                 x,
                 lambda r, t: _replicate_to_varying_fwd(
-                    t, world_size, split_dim, r, stack=stack
+                    t, world_size, split_dim, r2l[r], stack=stack
                 ),
             )
         else:
@@ -425,10 +449,11 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
+            r2l = _build_rank_to_group_local(pg)
             return mode.tensor_map(
                 x,
                 lambda r, t: _replicate_to_varying_fwd(
-                    t, world_size, split_dim, r, stack=stack
+                    t, world_size, split_dim, r2l[r], stack=stack
                 ),
             )
         else:
@@ -456,7 +481,8 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
-            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
+            r2l = _build_rank_to_group_local(pg)
+            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r2l[r]))
         else:
             rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(x, rank)
@@ -477,7 +503,8 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
-            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
+            r2l = _build_rank_to_group_local(pg)
+            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r2l[r]))
         else:
             rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(x, rank)
@@ -501,10 +528,11 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
 
         mode = _get_local_tensor_mode(x)
         if mode is not None:
+            r2l = _build_rank_to_group_local(pg)
             return mode.tensor_map(
                 x,
                 lambda r, t: _varying_to_partial_fwd(
-                    t, world_size, split_dim, r, stack=stack
+                    t, world_size, split_dim, r2l[r], stack=stack
                 ),
             )
         else:
@@ -518,6 +546,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         return convert(grad_out, ctx.axis, src=R, dst=dst), None, None, None
 
 
+@api_boundary
 def convert(  # noqa: C901
     x,
     axis: ProcessGroup,
