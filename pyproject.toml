@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spmd_types"
+version = "0.1.0"
+description = "A type system for distributed (SPMD) tensor computations in PyTorch"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [
+    { name = "Edward Z. Yang", email = "ezyang@mit.edu" },
+]
+dependencies = [
+    "torch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/ezyang/spmd_types"
+Repository = "https://github.com/ezyang/spmd_types"
+
+[tool.setuptools.packages.find]
+include = ["sixlib*"]
+exclude = ["sixlib.spmd_types.*_test*", "sixlib.spmd_types.eval*"]
+
+[tool.setuptools.package-data]
+"sixlib.spmd_types" = ["py.typed"]
