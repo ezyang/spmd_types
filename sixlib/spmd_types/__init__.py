@@ -1,8 +1,7 @@
 # spmd_types package
 from __future__ import annotations
 
-import sys
-from types import ModuleType
+import sixlib.spmd_types._dtensor_checker as _dtensor_checker  # noqa: F401
 
 # Collectives and operations
 from sixlib.spmd_types._checker import (  # noqa: F401
@@ -14,6 +13,7 @@ from sixlib.spmd_types._checker import (  # noqa: F401
     no_typecheck,
     register_autograd_function,
     register_local_autograd_function,
+    reinterpret_mesh,
     trace,
     typecheck,
 )
@@ -37,10 +37,16 @@ from sixlib.spmd_types._local import (  # noqa: F401
     reinterpret,
     shard,
 )
+from sixlib.spmd_types._mesh import set_current_mesh  # noqa: F401
 from sixlib.spmd_types._mesh_axis import MeshAxis  # noqa: F401
 from sixlib.spmd_types._scalar import Scalar  # noqa: F401
+from sixlib.spmd_types._state import current_mesh  # noqa: F401
 from sixlib.spmd_types._traceback import traceback_filtering  # noqa: F401
-from sixlib.spmd_types._type_attr import get_local_type  # noqa: F401
+from sixlib.spmd_types._type_attr import (  # noqa: F401
+    get_axis_local_type,
+    get_local_type,
+    maybe_get_axis_local_type,
+)
 
 # Types
 from sixlib.spmd_types.types import (  # noqa: F401
@@ -66,27 +72,19 @@ from sixlib.spmd_types.types import (  # noqa: F401
 )
 
 
-class _SpmdTypesModule(ModuleType):
-    """Module wrapper that provides TYPE_CHECKING as a dynamic attribute.
+class _TypeCheckingSentinel:
+    """Singleton whose bool value reflects whether type checking is active.
 
-    Accessing ``sixlib.spmd_types.TYPE_CHECKING`` returns True when a
-    ``typecheck()`` context is active and False otherwise.  This uses the
-    sys.modules replacement trick (same pattern as torch._dynamo.config)
-    so that a simple attribute read works like a function call.
+    ``bool(TYPE_CHECKING)`` returns True when a ``typecheck()`` context is
+    active on the current thread, False otherwise.  This avoids the
+    sys.modules replacement trick which breaks torch.compile / Dynamo.
     """
 
-    @property
-    def TYPE_CHECKING(self) -> bool:
+    def __bool__(self) -> bool:
         return is_type_checking()
 
+    def __repr__(self) -> str:
+        return f"TYPE_CHECKING({is_type_checking()})"
 
-# Replace this module in sys.modules so that attribute access on the
-# module object goes through _SpmdTypesModule.__getattr__ / properties.
-_self = sys.modules[__name__]
-_obj = _SpmdTypesModule(__name__)
-_obj.__dict__.update(_self.__dict__)
-_obj.__file__ = _self.__file__
-_obj.__package__ = _self.__package__
-_obj.__path__ = _self.__path__  # type: ignore[attr-defined]
-_obj.__spec__ = _self.__spec__
-sys.modules[__name__] = _obj
+
+TYPE_CHECKING = _TypeCheckingSentinel()

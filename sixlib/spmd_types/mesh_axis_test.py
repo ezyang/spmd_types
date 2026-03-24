@@ -6,7 +6,9 @@ import unittest
 
 import torch.distributed as dist
 from sixlib.spmd_types._mesh_axis import (
+    _register_name,
     _reset,
+    flatten_axes,
     MeshAxis,
     set_printoptions,
 )
@@ -130,6 +132,21 @@ class TestMeshAxis(unittest.TestCase):
         with set_printoptions(debug=False):
             # Only the first name (alphabetically).
             self.assertEqual(repr(a), "CP")
+
+    def test_repr_prefers_non_default_pg(self) -> None:
+        """When both 'default_pg' and another name exist, prefer the other."""
+        a = MeshAxis.of(4, 1)
+        _register_name(a, "default_pg")
+        _register_name(a, "TP")
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(a), "TP")
+
+    def test_repr_default_pg_only(self) -> None:
+        """When 'default_pg' is the only name, use it."""
+        a = MeshAxis.of(4, 1)
+        _register_name(a, "default_pg")
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(a), "default_pg")
 
     def test_repr_debug_no_names(self) -> None:
         with set_printoptions(debug=True):
@@ -410,6 +427,80 @@ class TestMeshAxisDeviceMesh(unittest.TestCase):
             # dp_ep is NOT a subgroup of dp or ep individually.
             self.assertFalse(dp_ep <= dp)
             self.assertFalse(dp_ep <= ep)
+
+
+class TestInferredFlattenedRepr(unittest.TestCase):
+    """Tests for unnamed axes that infer names from named sub-axes."""
+
+    def setUp(self) -> None:
+        _reset()
+
+    def tearDown(self) -> None:
+        _reset()
+
+    def test_unnamed_flattened_axis_shows_components(self) -> None:
+        """An unnamed axis that equals flatten_axes of named axes shows {dp,cp}."""
+        dp = MeshAxis.of(2, 8)
+        cp = MeshAxis.of(2, 4)
+        _register_name(dp, "dp")
+        _register_name(cp, "cp")
+
+        dp_cp = flatten_axes((dp, cp))
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(dp_cp), "{dp,cp}")
+
+    def test_unnamed_flattened_axis_debug_mode(self) -> None:
+        """In debug mode, inferred name includes layout."""
+        dp = MeshAxis.of(2, 8)
+        cp = MeshAxis.of(2, 4)
+        _register_name(dp, "dp")
+        _register_name(cp, "cp")
+
+        dp_cp = flatten_axes((dp, cp))
+        with set_printoptions(debug=True):
+            self.assertEqual(repr(dp_cp), "{dp,cp}{4:4}")
+
+    def test_named_axis_prefers_own_name(self) -> None:
+        """If an axis has its own name, it uses that even if decomposable."""
+        dp = MeshAxis.of(2, 8)
+        cp = MeshAxis.of(2, 4)
+        _register_name(dp, "dp")
+        _register_name(cp, "cp")
+
+        dp_cp = flatten_axes((dp, cp))
+        _register_name(dp_cp, "dp_cp")
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(dp_cp), "dp_cp")
+
+    def test_no_decomposition_falls_back(self) -> None:
+        """An unnamed axis with no matching sub-axes falls back to MeshAxis(...)."""
+        x = MeshAxis.of(4, 1)
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(x), "MeshAxis(4:1)")
+
+    def test_three_way_flattened(self) -> None:
+        """Three named sub-axes compose into one inferred name."""
+        dp = MeshAxis.of(2, 8)
+        cp = MeshAxis.of(2, 4)
+        tp = MeshAxis.of(4, 1)
+        _register_name(dp, "dp")
+        _register_name(cp, "cp")
+        _register_name(tp, "tp")
+
+        full = flatten_axes((dp, cp, tp))
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(full), "{dp,cp,tp}")
+
+    def test_ordering_is_outermost_first(self) -> None:
+        """Sub-axes are ordered by stride descending (outermost first)."""
+        tp = MeshAxis.of(4, 1)
+        dp = MeshAxis.of(2, 4)
+        _register_name(tp, "tp")
+        _register_name(dp, "dp")
+
+        flat = flatten_axes((tp, dp))
+        with set_printoptions(debug=False):
+            self.assertEqual(repr(flat), "{dp,tp}")
 
 
 if __name__ == "__main__":

@@ -57,11 +57,28 @@ def get_axis_local_type(
         tensor: The tensor to query.
         axis: The mesh axis to look up (MeshAxis or ProcessGroup).
     """
-    axis = normalize_axis(axis)
-    local_type = get_local_type(tensor)
-    if axis not in local_type:
+    result = maybe_get_axis_local_type(tensor, axis)
+    if result is None:
+        axis = normalize_axis(axis)
         raise ValueError(
             f"Axis {format_axis(axis)} not found in tensor's SPMD type. "
-            f"Tensor has axes: {set(local_type.keys())}"
+            f"Tensor has axes: {set(get_local_type(tensor).keys())}"
         )
-    return local_type[axis]
+    return result
+
+
+def maybe_get_axis_local_type(
+    tensor: torch.Tensor, axis: DeviceMeshAxis
+) -> PerMeshAxisLocalSpmdType | None:
+    """Get the SPMD type for a specific mesh axis, or None if not found.
+
+    Like ``get_axis_local_type`` but returns None instead of raising when
+    the axis is not present in the tensor's SPMD type dict.
+
+    Args:
+        tensor: The tensor to query.
+        axis: The mesh axis to look up (MeshAxis or ProcessGroup).
+    """
+    axis = normalize_axis(axis)
+    local_type = get_local_type(tensor)
+    return local_type.get(axis)

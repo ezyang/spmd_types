@@ -375,6 +375,128 @@ class TestAllToAll(LocalTensorTestCase):
         )
 
 
+class TestAllToAllUneven(LocalTensorTestCase):
+    """Test all_to_all with explicit split sizes (_AllToAllUneven path)."""
+
+    def _make_input(self, total, D):
+        """Create a V-typed input of shape (total, D) with deterministic data."""
+        x = self.mode.rank_map(
+            lambda r: torch.arange(total * D, dtype=torch.float).reshape(total, D)
+            + r * 100
+        )
+        assert_type(x, {self.pg: V})
+        return x
+
+    def test_all_to_all_uneven_both_splits(self):
+        """all_to_all with both output_split_sizes and input_split_sizes matches even baseline."""
+        D = 4
+        total = 6  # 6 / world_size(3) = 2 per rank
+        even_splits = [2, 2, 2]
+
+        x_baseline = self._make_input(total, D)
+        with typecheck():
+            baseline = all_to_all(x_baseline, self.pg, src=S(0), dst=S(0))
+
+        x = self._make_input(total, D)
+        with typecheck():
+            result = all_to_all(
+                x,
+                self.pg,
+                src=S(0),
+                dst=S(0),
+                output_split_sizes=even_splits,
+                input_split_sizes=even_splits,
+            )
+
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (total, D))
+            torch.testing.assert_close(
+                result._local_tensors[r],
+                baseline._local_tensors[r],
+                msg=f"rank {r}",
+            )
+        self.assertIs(get_axis_local_type(result, self.pg), V)
+
+    def test_all_to_all_uneven_only_output_splits(self):
+        """all_to_all with output_split_sizes only; input_split_sizes=None defaults to even."""
+        D = 4
+        total = 6
+        even_splits = [2, 2, 2]
+
+        x_baseline = self._make_input(total, D)
+        with typecheck():
+            baseline = all_to_all(x_baseline, self.pg, src=S(0), dst=S(0))
+
+        x = self._make_input(total, D)
+        with typecheck():
+            result = all_to_all(
+                x,
+                self.pg,
+                src=S(0),
+                dst=S(0),
+                output_split_sizes=even_splits,
+            )
+
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (total, D))
+            torch.testing.assert_close(
+                result._local_tensors[r],
+                baseline._local_tensors[r],
+                msg=f"rank {r}",
+            )
+        self.assertIs(get_axis_local_type(result, self.pg), V)
+
+    def test_all_to_all_uneven_only_input_splits(self):
+        """all_to_all with input_split_sizes only; output_split_sizes=None defaults to even."""
+        D = 4
+        total = 6
+        even_splits = [2, 2, 2]
+
+        x_baseline = self._make_input(total, D)
+        with typecheck():
+            baseline = all_to_all(x_baseline, self.pg, src=S(0), dst=S(0))
+
+        x = self._make_input(total, D)
+        with typecheck():
+            result = all_to_all(
+                x,
+                self.pg,
+                src=S(0),
+                dst=S(0),
+                input_split_sizes=even_splits,
+            )
+
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(result._local_tensors[r].shape, (total, D))
+            torch.testing.assert_close(
+                result._local_tensors[r],
+                baseline._local_tensors[r],
+                msg=f"rank {r}",
+            )
+        self.assertIs(get_axis_local_type(result, self.pg), V)
+
+    def test_all_to_all_uneven_backward(self):
+        """all_to_all with uneven splits backward satisfies the adjoint identity."""
+        D = 4
+        total = 6
+        even_splits = [2, 2, 2]
+        x = self._generate_inputs((total, D), self.pg, V)
+        self.spmd_gradcheck(
+            lambda t: all_to_all(
+                t,
+                self.pg,
+                src=S(0),
+                dst=S(0),
+                output_split_sizes=even_splits,
+                input_split_sizes=even_splits,
+            ),
+            x,
+            self.pg,
+            V,
+            V,
+        )
+
+
 class TestAllGatherUnevenShard(LocalTensorTestCase):
     """Test all_gather with uneven split_sizes on S(i)."""
 
@@ -886,6 +1008,72 @@ class TestRawDistUnknownGroup(LocalTensorTestCase):
             with self.assertRaises(SpmdTypeError):
                 # R is wrong for all_reduce (expects P).
                 dist.all_reduce(x, group=self.pg)
+
+
+class TestFlattenedAxisCollectives(LocalTensorTestCase):
+    """Test collective type checking with flattened/merged mesh axes."""
+
+    WORLD_SIZE = 6
+
+    def _make_mesh(self):
+        """Create a (2, 3) mesh with dp, cp, and flattened dp_cp axes."""
+        mesh = init_device_mesh("cpu", (2, 3), mesh_dim_names=("dp", "cp"))
+        dp = mesh.get_group("dp")
+        cp = mesh.get_group("cp")
+        dp_cp_mesh = mesh["dp", "cp"]._flatten("dp_cp")
+        dp_cp = dp_cp_mesh.get_group("dp_cp")
+        return dp, cp, dp_cp
+
+    def test_all_reduce_flattened_axis(self):
+        """all_reduce on flattened dp_cp axis decomposes to update both dp and cp."""
+        dp, cp, dp_cp = self._make_mesh()
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        assert_type(x, {dp: P, cp: P})
+        with typecheck():
+            result = all_reduce(x, dp_cp, src=P, dst=R)
+        self.assertIs(get_axis_local_type(result, dp), R)
+        self.assertIs(get_axis_local_type(result, cp), R)
+
+    def test_all_reduce_flattened_axis_src_mismatch(self):
+        """all_reduce on flattened axis errors when sub-axes have mismatched types."""
+        dp, cp, dp_cp = self._make_mesh()
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        assert_type(x, {dp: P, cp: R})
+        with typecheck():
+            with self.assertRaises(SpmdTypeError):
+                all_reduce(x, dp_cp, src=P, dst=R)
+
+    def test_all_gather_flattened_axis(self):
+        """all_gather on flattened dp_cp axis decomposes to update both dp and cp."""
+        dp, cp, dp_cp = self._make_mesh()
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        assert_type(x, {dp: V, cp: V})
+        with typecheck():
+            result = all_gather(x, dp_cp, src=V, dst=R)
+        self.assertIs(get_axis_local_type(result, dp), R)
+        self.assertIs(get_axis_local_type(result, cp), R)
+
+    def test_reduce_scatter_flattened_axis(self):
+        """reduce_scatter on flattened dp_cp axis decomposes to update both dp and cp."""
+        dp, cp, dp_cp = self._make_mesh()
+        x = self.mode.rank_map(
+            lambda r: torch.arange(6, dtype=torch.float).reshape(6, 1) + r
+        )
+        assert_type(x, {dp: P, cp: P})
+        with typecheck():
+            result = reduce_scatter(x, dp_cp, src=P, dst=V, scatter_dim=0)
+        self.assertIs(get_axis_local_type(result, dp), V)
+        self.assertIs(get_axis_local_type(result, cp), V)
+
+    def test_flattened_axis_strict_error_non_decomposable(self):
+        """Strict mode errors when flattened axis cannot decompose to tensor axes."""
+        dp, cp, dp_cp = self._make_mesh()
+        x = self.mode.rank_map(lambda r: torch.randn(4) + r)
+        # Only type on dp, not cp -- dp_cp cannot fully decompose
+        assert_type(x, {dp: P})
+        with typecheck(strict_mode="strict"):
+            with self.assertRaises(SpmdTypeError):
+                all_reduce(x, dp_cp, src=P, dst=R)
 
 
 if __name__ == "__main__":

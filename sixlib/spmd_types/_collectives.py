@@ -650,6 +650,44 @@ class _AllToAllStack(torch.autograd.Function):
         return grad, None, None, None
 
 
+class _AllToAllUneven(torch.autograd.Function):
+    """all_to_all with uneven split sizes on dim 0 for S(0) -> S(0)."""
+
+    @staticmethod
+    def forward(ctx, x, axis, output_split_sizes, input_split_sizes):
+        ctx.axis = axis
+        pg = axis
+        world_size = _dist.dist.get_world_size(pg)
+        if input_split_sizes is None:
+            input_split_sizes = [x.shape[0] // world_size] * world_size
+        if output_split_sizes is None:
+            output_split_sizes = [x.shape[0] // world_size] * world_size
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        input_chunks = [
+            c.contiguous() for c in torch.split(x, input_split_sizes, dim=0)
+        ]
+        output_chunks = [
+            torch.empty([s] + list(x.shape[1:]), dtype=x.dtype, device=x.device)
+            for s in output_split_sizes
+        ]
+        _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
+        return torch.cat(output_chunks, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # Backward reverses input/output splits.
+        grad = all_to_all(
+            grad_out,
+            ctx.axis,
+            src=Shard(0),
+            dst=Shard(0),
+            output_split_sizes=ctx.input_split_sizes,
+            input_split_sizes=ctx.output_split_sizes,
+        )
+        return grad, None, None, None
+
+
 class _AllToAllShard(torch.autograd.Function):
     """all_to_all with shard semantics: S(i) -> S(j), backward is all_to_all(S(j),S(i))."""
 
@@ -695,6 +733,8 @@ def all_to_all(
     dst: PerMeshAxisSpmdType = V,
     split_dim: int | None = None,
     concat_dim: int | None = None,
+    output_split_sizes: Optional[List[int]] = None,
+    input_split_sizes: Optional[List[int]] = None,
 ):
     """``all_to_all(x, mesh_axis, src, dst): Varying -> Varying``
 
@@ -741,6 +781,13 @@ def all_to_all(
         concat_dim: The tensor dimension to concatenate along. Defaults to 0
             when dst is V; inferred from the shard dim when dst is S(j). If
             both concat_dim and dst=S(j) are provided, they must agree.
+        output_split_sizes: Per-rank output sizes for uneven all-to-all-v.
+            Only supported with src=S(0), dst=S(0). If None, defaults to
+            even splits. Length must equal world_size.
+        input_split_sizes: Per-rank input sizes for uneven all-to-all-v.
+            Only supported with src=S(0), dst=S(0). If None, defaults to
+            even splits. Length must equal world_size and sum must equal
+            x.shape[0].
 
     Returns:
         Tensor with V or S(j) type depending on dst
@@ -769,6 +816,8 @@ def all_to_all(
             dst=dst,
             split_dim=split_dim,
             concat_dim=concat_dim,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
         )
     # Canonicalize negative Shard dims
     src = _canonicalize_shard(src, x.ndim)
@@ -818,6 +867,14 @@ def all_to_all(
             split_dim = 0
         if concat_dim is None:
             concat_dim = 0
+
+    if output_split_sizes is not None or input_split_sizes is not None:
+        if split_dim != 0 or concat_dim != 0:
+            raise ValueError(
+                f"output_split_sizes/input_split_sizes only supported with "
+                f"src=S(0), dst=S(0), got src={src}, dst={dst}"
+            )
+        return _AllToAllUneven.apply(x, axis, output_split_sizes, input_split_sizes)
 
     if src is V and dst is V:
         return _AllToAllStack.apply(x, axis, split_dim, concat_dim)

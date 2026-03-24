@@ -127,28 +127,17 @@ PerMeshAxisSpmdTypes: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisSpmdType]"
 # This is the type stored on tensors; Shard is never stored.
 LocalSpmdType: TypeAlias = "dict[DeviceMeshAxis, PerMeshAxisLocalSpmdType]"
 
+# Element type for PartitionSpec entries after normalization.
+# Each entry is None (replicated), a single MeshAxis, or a tuple of MeshAxis
+# (multi-axis sharding on one dim).
+PartitionSpecEntry: TypeAlias = "MeshAxis | tuple[MeshAxis, ...] | None"
+
 # =============================================================================
 # PartitionSpec for Global SPMD
 # =============================================================================
 
 
-def _format_spec_entry(
-    entry: DeviceMeshAxis | tuple[DeviceMeshAxis, ...] | None,
-) -> str:
-    """Format a single PartitionSpec entry for display.
-
-    Uses ``format_axis`` so that ProcessGroup entries show a readable name
-    (e.g. their ``group_desc``) instead of the opaque default repr.
-    """
-    if entry is None:
-        return "None"
-    if isinstance(entry, tuple):
-        formatted = ", ".join(format_axis(a) for a in entry)
-        return f"({formatted})"
-    return format_axis(entry)
-
-
-class PartitionSpec(tuple):
+class PartitionSpec(tuple[PartitionSpecEntry, ...]):
     """
     A partition spec describes how tensor dimensions map to mesh axes.
 
@@ -159,20 +148,47 @@ class PartitionSpec(tuple):
         - PartitionSpec() means fully replicated
     """
 
-    def __new__(cls, *args: MeshAxis | tuple[MeshAxis, ...] | None):
+    def __new__(
+        cls,
+        *args: DeviceMeshAxis | tuple[DeviceMeshAxis, ...] | None,
+    ):
+        normalized: list[MeshAxis | tuple[MeshAxis, ...] | None] = []
         for i, entry in enumerate(args):
-            if isinstance(entry, tuple) and len(entry) == 0:
-                raise ValueError(
-                    f"PartitionSpec entry at dim {i} is an empty tuple. "
-                    f"Use None for replicated dimensions."
-                )
-        return super().__new__(cls, args)
+            if entry is None:
+                normalized.append(None)
+            elif isinstance(entry, tuple):
+                if len(entry) == 0:
+                    raise ValueError(
+                        f"PartitionSpec entry at dim {i} is an empty tuple. "
+                        f"Use None for replicated dimensions."
+                    )
+                normalized.append(tuple(normalize_axis(a) for a in entry))
+            else:
+                normalized.append(normalize_axis(entry))
+        return super().__new__(cls, normalized)
 
     def __repr__(self):
         if not self:
             return "PartitionSpec()"
-        parts = ", ".join(_format_spec_entry(e) for e in self)
-        return f"PartitionSpec({parts})"
+        parts = []
+        for entry in self:
+            if entry is None:
+                parts.append("None")
+            elif isinstance(entry, tuple):
+                parts.append("(" + ", ".join(repr(a) for a in entry) + ")")
+            else:
+                parts.append(repr(entry))
+        return f"PartitionSpec({', '.join(parts)})"
+
+    def axes_with_partition_spec(self) -> set["MeshAxis"]:
+        """Return the set of all mesh axes referenced by this PartitionSpec."""
+        result: set[MeshAxis] = set()
+        for entry in self:
+            if entry is None:
+                continue
+            for a in entry if isinstance(entry, tuple) else (entry,):
+                result.add(a)
+        return result
 
 
 # =============================================================================
@@ -344,11 +360,13 @@ def _check_orthogonality(axes: list[MeshAxis]) -> None:
     type inference reasons about each axis independently.
 
     Args:
-        axes: The mesh axes to check (must have length >= 2).
+        axes: The mesh axes to check.
 
     Raises:
         SpmdTypeError: If any two axes overlap (share ranks).
     """
+    if len(axes) < 2:
+        return  # 0 or 1 axes are trivially orthogonal.
     # Fast path: check all axes at once.
     if axes[0].isorthogonal(*axes[1:]):
         return
@@ -404,9 +422,18 @@ def normalize_local_type(spmd_type: LocalSpmdType) -> LocalSpmdType:
         if norm.size() == 1:
             continue  # singleton axes are not tracked
         result[norm] = typ
-    if len(result) >= 2:
-        _check_orthogonality(list(result.keys()))
+    _check_orthogonality(list(result.keys()))
     return result
+
+
+def to_local_type(typ: PerMeshAxisSpmdType) -> PerMeshAxisLocalSpmdType:
+    """Map a global per-axis type to its local counterpart.
+
+    S(i) -> V, R -> R, I -> I, P -> P.
+    """
+    if isinstance(typ, Shard):
+        return V
+    return typ
 
 
 def format_axis(axis: DeviceMeshAxis) -> str:
@@ -486,7 +513,7 @@ def shard_types_to_partition_spec(
 
 def partition_spec_to_shard_types(
     spec: PartitionSpec,
-) -> dict[DeviceMeshAxis, Shard]:
+) -> dict[MeshAxis, Shard]:
     """Convert a PartitionSpec to a dict of Shard types.
 
     Walks PartitionSpec entries; for each axis at dim ``d``, emits
@@ -501,7 +528,7 @@ def partition_spec_to_shard_types(
     Raises:
         SpmdTypeError: If an axis appears at two different dims.
     """
-    result: dict[DeviceMeshAxis, Shard] = {}
+    result: dict[MeshAxis, Shard] = {}
     for dim, entry in enumerate(spec):
         if entry is None:
             continue
@@ -514,3 +541,28 @@ def partition_spec_to_shard_types(
                 )
             result[axis] = Shard(dim)
     return result
+
+
+def partition_spec_get_shard(
+    spec: PartitionSpec | None,
+    axis: MeshAxis,
+) -> Shard | None:
+    """Return the Shard type for ``axis`` in ``spec``, or None if not sharded.
+
+    Args:
+        spec: The PartitionSpec to query (None means no sharding).
+        axis: The mesh axis to look up.
+
+    Returns:
+        ``Shard(dim)`` if ``axis`` appears at dimension ``dim`` in the spec,
+        otherwise None.
+    """
+    if spec is None:
+        return None
+    for dim, entry in enumerate(spec):
+        if entry is None:
+            continue
+        axes = entry if isinstance(entry, tuple) else (entry,)
+        if axis in axes:
+            return Shard(dim)
+    return None

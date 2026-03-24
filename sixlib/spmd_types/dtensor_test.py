@@ -564,6 +564,83 @@ class TestDtensorTransparency(_LocalTensorDTensorMixin):
             dt2 = DTensor.from_local(local, mesh, (Replicate(),), run_check=False)
             assert isinstance(dt2, DTensor)
 
+    def test_redistribute_passes_through(self):
+        """DTensor.redistribute() should pass through without type errors.
+
+        _Redistribute is DTensor's internal autograd function for changing
+        placements.  It operates on DTensor-internal local tensors and should
+        be handled by the generic DTensor passthrough, not as a local autograd
+        function.  The actual SPMD types are stamped at the DTensor boundary
+        by _ToTorchTensor / _FromTorchTensor.
+        """
+        from sixlib.spmd_types import get_local_type, typecheck
+        from sixlib.spmd_types.types import normalize_axis
+
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
+        tp_axis = normalize_axis(mesh.get_group(0))
+
+        x_local = torch.randn(4, 4)
+        dt = DTensor.from_local(x_local, mesh, (Shard(0),), run_check=False)
+
+        with typecheck():
+            # redistribute Shard(0) -> Replicate should work without errors
+            dt_r = dt.redistribute(placements=(Replicate(),))
+            assert isinstance(dt_r, DTensor)
+            assert dt_r.placements == (Replicate(),)
+
+            # to_local should stamp the correct SPMD type (I for Replicate default)
+            local = dt_r.to_local()
+            lt = get_local_type(local)
+            assert tp_axis in lt, f"Expected tp axis in local type, got {lt}"
+            assert lt[tp_axis] is I, (
+                f"Expected I for Replicate (default), got {lt[tp_axis]}"
+            )
+
+    def test_redistribute_roundtrip_types(self):
+        """Redistribute roundtrip: S(0) -> R -> S(0) preserves correct types."""
+        from sixlib.spmd_types import get_local_type, typecheck
+        from sixlib.spmd_types.types import normalize_axis
+
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
+        tp_axis = normalize_axis(mesh.get_group(0))
+
+        x_local = torch.randn(2, 4)
+        dt = DTensor.from_local(x_local, mesh, (Shard(0),), run_check=False)
+
+        with typecheck():
+            # S(0) -> R -> S(0)
+            dt_r = dt.redistribute(placements=(Replicate(),))
+            dt_s = dt_r.redistribute(placements=(Shard(0),))
+            assert isinstance(dt_s, DTensor)
+            assert dt_s.placements == (Shard(0),)
+
+            # to_local should stamp V (S(0) decays to V)
+            local = dt_s.to_local()
+            lt = get_local_type(local)
+            assert lt[tp_axis] is V, f"Expected V for Shard(0), got {lt[tp_axis]}"
+
+    def test_nested_dtensor_in_list_passes_through(self):
+        """torch.cat([dtensor, dtensor]) should pass through without type errors.
+
+        DTensors nested inside a list arg were previously missed by the flat
+        isinstance scan in _typecheck_core, causing spurious type errors.
+        """
+        from sixlib.spmd_types import typecheck
+
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
+        dt1 = DTensor.from_local(
+            torch.randn(2, 4), mesh, (Replicate(),), run_check=False
+        )
+        dt2 = DTensor.from_local(
+            torch.randn(2, 4), mesh, (Replicate(),), run_check=False
+        )
+
+        with typecheck():
+            # torch.cat receives [dt1, dt2] as a single list arg.
+            result = torch.cat([dt1, dt2], dim=0)
+            assert isinstance(result, DTensor)
+            assert result.shape == (4, 4)
+
 
 class TestDtensorTransparencyMultiAxis(_LocalTensorDTensorMixin):
     """Tests for DTensor-transparent SPMD type checking on multi-axis meshes."""

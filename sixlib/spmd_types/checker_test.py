@@ -21,8 +21,10 @@ from sixlib.spmd_types import (
 )
 from sixlib.spmd_types._checker import (
     _trace_logger,
+    _validate_partition_spec_for_global_spmd,
     assert_type,
     get_axis_local_type,
+    get_partition_spec,
     infer_local_type_for_axis,
     mutate_type,
     OpLinearity,
@@ -30,11 +32,13 @@ from sixlib.spmd_types._checker import (
     typecheck,
 )
 from sixlib.spmd_types._collectives import all_reduce
+from sixlib.spmd_types._mesh_axis import MeshAxis
 from sixlib.spmd_types._test_utils import LocalTensorTestCase, SpmdTypeCheckedTestCase
 from sixlib.spmd_types._type_attr import get_local_type
 from sixlib.spmd_types.types import normalize_axis, PartitionSpec, SpmdTypeError
 from torch.distributed._local_tensor import LocalTensorMode
 from torch.distributed.device_mesh import init_device_mesh
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 class TestEinsumTypePropagation(unittest.TestCase):
@@ -385,6 +389,22 @@ class TestFactoryTensors(LocalTensorTestCase):
         z = torch.zeros(4)
         with self.assertRaises(SpmdTypeError):
             all_reduce(z, self.pg, dst=R)
+
+    def test_arange_with_scalar_propagates_type(self):
+        """torch.arange with Scalar args propagates the Scalar type."""
+        start = Scalar(0, {self.pg: V})
+        end = Scalar(5, {self.pg: V})
+        indices = torch.arange(start, end)
+        self.assertIs(get_axis_local_type(indices, self.pg), V)
+
+    def test_arange_with_scalar_then_index_typed(self):
+        """torch.arange(Scalar(V)) produces V which combines with R via indexing."""
+        start = Scalar(0, {self.pg: V})
+        end = Scalar(5, {self.pg: V})
+        indices = torch.arange(start, end)
+        data = self._generate_inputs((10, 4), self.pg, R)
+        result = data[indices]
+        self.assertIs(get_axis_local_type(result, self.pg), V)
 
     def test_factory_raw_collective_raises(self):
         """Passing a {} tensor to a raw dist collective raises (missing axis)."""
@@ -759,6 +779,14 @@ class TestAssertTypeShardSugar(LocalTensorTestCase):
             assert_type(x, {self.tp: S(2)})
         with self.assertRaises(SpmdTypeError):
             assert_type(x, {self.tp: S(-3)})
+
+    def test_assert_type_accepts_both_pg_and_meshaxis(self):
+        """assert_type works with both ProcessGroup and MeshAxis keys."""
+        x = torch.randn(3, 4)
+        ma = normalize_axis(self.tp)
+        assert_type(x, {self.tp: V})
+        assert_type(x, {self.tp: S(0)})
+        assert_type(x, {ma: S(0)})
 
     def test_shard_sugar_0d_tensor_rejected(self):
         """S(i) on a 0-d tensor is out of bounds."""
@@ -1262,27 +1290,27 @@ class TestThreadLocalState(SpmdTypeCheckedTestCase):
 
     def test_reentrant_noop(self):
         """typecheck() inside active mode is a no-op (does not nest modes)."""
-        from sixlib.spmd_types._state import _tls, is_type_checking
+        from sixlib.spmd_types._state import _current_mode, is_type_checking
 
-        outer = getattr(_tls, "active_mode", None)
+        outer = _current_mode()
         self.assertIsNotNone(outer)
         with typecheck():
-            self.assertIs(getattr(_tls, "active_mode", None), outer)
+            self.assertIs(_current_mode(), outer)
         self.assertTrue(is_type_checking())
-        self.assertIs(getattr(_tls, "active_mode", None), outer)
+        self.assertIs(_current_mode(), outer)
 
     def test_typecheck_inside_no_typecheck_reuses_mode(self):
         """typecheck() inside no_typecheck() reuses the existing mode."""
         from sixlib.spmd_types._checker import no_typecheck
-        from sixlib.spmd_types._state import _tls, is_type_checking
+        from sixlib.spmd_types._state import _current_mode, is_type_checking
 
-        outer = getattr(_tls, "active_mode", None)
+        outer = _current_mode()
         self.assertIsNotNone(outer)
         with no_typecheck():
             self.assertFalse(is_type_checking())
             with typecheck():
                 # Should reuse the outer mode, not create a new one.
-                self.assertIs(getattr(_tls, "active_mode", None), outer)
+                self.assertIs(_current_mode(), outer)
                 self.assertTrue(is_type_checking())
                 # Type inference should work inside the inner typecheck.
                 x = self._generate_inputs((4,), self.pg, R)
@@ -1311,13 +1339,13 @@ class TestThreadLocalState(SpmdTypeCheckedTestCase):
 
     def test_typecheck_inherits_strict_mode(self):
         """typecheck() without strict_mode inherits the current strict mode."""
-        from sixlib.spmd_types import _state
         from sixlib.spmd_types._checker import no_typecheck
+        from sixlib.spmd_types._state import _current_mode
 
         # Outer mode is "strict" (the default from setUp).
         with no_typecheck():
             with typecheck():
-                mode = getattr(_state._tls, "active_mode", None)
+                mode = _current_mode()
                 self.assertIsNotNone(mode)
                 self.assertTrue(mode._strict)
 
@@ -1328,7 +1356,7 @@ class TestThreadLocalState(SpmdTypeCheckedTestCase):
             self._type_checking_cm.__enter__()
             with no_typecheck():
                 with typecheck():
-                    mode = getattr(_state._tls, "active_mode", None)
+                    mode = _current_mode()
                     self.assertIsNotNone(mode)
                     self.assertFalse(mode._strict)
         finally:
@@ -1899,6 +1927,38 @@ class TestOrthogonalityValidation(LocalTensorTestCase):
         # Mutating an existing key is fine (changes value, not keys).
         mutate_type(x, self.dp, src=R, dst=V)
 
+    def test_merge_overlapping_axis_rejected(self):
+        """Re-check path: merging a new axis that overlaps existing axes raises."""
+        x = torch.randn(4)
+        # First call: set type on the overlapping dp_cp axis.
+        assert_type(x, {self.dp_cp: V})
+        # Second call: try to merge dp, which overlaps with dp_cp.
+        with self.assertRaises(SpmdTypeError) as ctx:
+            assert_type(x, {self.dp: R})
+        self.assertIn("not orthogonal", str(ctx.exception))
+        # Failed assert_type must not corrupt the tensor's type dict.
+        existing = get_local_type(x)
+        self.assertNotIn(normalize_axis(self.dp), existing)
+        self.assertIs(existing[normalize_axis(self.dp_cp)], V)
+
+    def test_merge_overlapping_default_pg_rejected(self):
+        """Re-check path: default_pg overlaps with sub-mesh axes."""
+        from sixlib.spmd_types._mesh_axis import MeshAxis
+
+        # default_pg covers all 8 ranks.
+        default_pg = MeshAxis.of(self.pg)
+        x = torch.randn(4)
+        # First call: set type on default_pg (all ranks).
+        assert_type(x, {default_pg: V})
+        # Second call: try to merge dp (subset of default_pg ranks).
+        with self.assertRaises(SpmdTypeError) as ctx:
+            assert_type(x, {self.dp: R})
+        self.assertIn("not orthogonal", str(ctx.exception))
+        # Failed assert_type must not corrupt the tensor's type dict.
+        existing = get_local_type(x)
+        self.assertNotIn(normalize_axis(self.dp), existing)
+        self.assertIs(existing[default_pg], V)
+
 
 class TestTraceMode(SpmdTypeCheckedTestCase, expecttest.TestCase):
     """Test SPMD_TYPES_TRACE logging output."""
@@ -1983,7 +2043,8 @@ checker_test.py:N  all_reduce({default_pg: P}) -> {default_pg: R}""",
 
         self.assertExpectedInline(
             self._trace_output(),
-            """checker_test.py:N  assert_type({}) -> {default_pg: R}""",
+            """\
+checker_test.py:N  assert_type({}) -> {default_pg: R}""",
         )
 
     def test_trace_logs_assert_type_refinement(self):
@@ -1996,6 +2057,18 @@ checker_test.py:N  all_reduce({default_pg: P}) -> {default_pg: R}""",
             self._trace_output(),
             """checker_test.py:N  assert_type({default_pg: R}) -> {default_pg: R}""",
         )
+
+    def test_trace_omits_all_empty_types(self):
+        """Trace suppresses lines where all inputs and output are empty."""
+        with trace():
+            # Two factory tensors with {} type -- op should be suppressed.
+            x = torch.zeros(4)
+            assert_type(x, {})
+            y = torch.ones(4)
+            assert_type(y, {})
+            _ = x + y
+
+        self.assertExpectedInline(self._trace_output(), """""")
 
 
 class TestErrorContext(SpmdTypeCheckedTestCase, expecttest.TestCase):
@@ -2343,6 +2416,239 @@ class TestMissingAxesValidation(SpmdTypeCheckedTestCase):
         result = x + y
         self.assertIs(get_axis_local_type(result, self.tp), R)
         self.assertIs(get_axis_local_type(result, self.dp), R)
+
+
+class TestReinterpretMeshIntegration(expecttest.TestCase):
+    """Test explicit cross-mesh reinterpretation."""
+
+    def setUp(self) -> None:
+        from sixlib.spmd_types._mesh_axis import _reset
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=16, store=store)
+
+        mesh = init_device_mesh("cpu", (2, 2, 4), mesh_dim_names=("dp", "cp", "tp"))
+        self.dp = mesh.get_group("dp")
+        self.cp = mesh.get_group("cp")
+        self.tp = mesh.get_group("tp")
+        dp_cp_mesh = mesh["dp", "cp"]._flatten("dp_cp")
+        self.dp_cp = dp_cp_mesh.get_group("dp_cp")
+        cp_tp_mesh = mesh["cp", "tp"]._flatten("cp_tp")
+        self.cp_tp = cp_tp_mesh.get_group("cp_tp")
+
+        # Register all axes so complement detection works (realistic --
+        # in real programs all mesh dimensions would be used somewhere).
+        for pg in (self.dp, self.cp, self.tp, self.dp_cp, self.cp_tp):
+            normalize_axis(pg)
+
+    def tearDown(self) -> None:
+        from sixlib.spmd_types._mesh_axis import _reset
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+
+    def test_mesh_mismatch_cross_mesh_compatible(self) -> None:
+        """Cross-mesh compatible axes should suggest reinterpret_mesh."""
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp_cp: V})
+            y = torch.randn(4)
+            assert_type(y, {self.dp: R, self.cp: R})
+            with self.assertRaises(SpmdTypeError) as cm:
+                x + y
+            self.assertExpectedInline(
+                str(cm.exception),
+                """\
+Operand missing axis mesh_cp. Operand has axes {mesh_dp_cp}, but the union of all operand axes is {mesh_cp, mesh_dp, mesh_dp_cp}. All operands must be annotated on the same set of mesh axes.
+
+Hint: The operand axes {mesh_dp_cp} and {mesh_cp, mesh_dp} are cross-mesh compatible. Use reinterpret_mesh() to convert the operand with axes {mesh_dp_cp} to axes {mesh_cp, mesh_dp} before this operation.
+
+  In add(
+    args[0]: f32[4] {mesh_dp_cp: V},
+    args[1]: f32[4] {mesh_dp: R, mesh_cp: R},
+  )""",
+            )
+
+    def test_mesh_mismatch_sub_axis(self) -> None:
+        """Sub-axis relationship should identify missing axes."""
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp: V, self.tp: V})
+            y = torch.randn(4)
+            assert_type(y, {self.dp_cp: V, self.tp: V})
+            with self.assertRaises(SpmdTypeError) as cm:
+                x + y
+            self.assertExpectedInline(
+                str(cm.exception),
+                """\
+Operand missing axis mesh_dp. Operand has axes {mesh_dp_cp, mesh_tp}, but the union of all operand axes is {mesh_dp, mesh_dp_cp, mesh_tp}. All operands must be annotated on the same set of mesh axes.
+
+Hint: mesh_dp is a sub-axis of mesh_dp_cp (ranks {0, 8} vs {0, 4, 8, 12}), so the operand with axes {mesh_dp, mesh_tp} is missing axis mesh_cp.
+
+  In add(
+    args[0]: f32[4] {mesh_dp: V, mesh_tp: V},
+    args[1]: f32[4] {mesh_dp_cp: V, mesh_tp: V},
+  )""",
+            )
+
+    def test_mesh_mismatch_disjoint_no_hint(self) -> None:
+        """Completely disjoint axes should not produce a hint."""
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp: V})
+            y = torch.randn(4)
+            assert_type(y, {self.tp: R})
+            with self.assertRaises(SpmdTypeError) as cm:
+                x + y
+            self.assertExpectedInline(
+                str(cm.exception),
+                """\
+Operand missing axis mesh_dp. Operand has axes {mesh_tp}, but the union of all operand axes is {mesh_dp, mesh_tp}. All operands must be annotated on the same set of mesh axes.
+
+  In add(
+    args[0]: f32[4] {mesh_dp: V},
+    args[1]: f32[4] {mesh_tp: R},
+  )""",
+            )
+
+    def test_mesh_mismatch_partial_overlap(self) -> None:
+        """Partial rank overlap (no sub-axis) should flag the overlap."""
+        # dp_cp covers ranks {0, 4, 8, 12}, cp_tp covers ranks {0..7}.
+        # They partially overlap at rank 4 (excluding trivial rank 0),
+        # but neither is a sub-axis of the other.
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp_cp: V})
+            y = torch.randn(4)
+            assert_type(y, {self.cp_tp: R})
+            with self.assertRaises(SpmdTypeError) as cm:
+                x + y
+            self.assertExpectedInline(
+                str(cm.exception),
+                """\
+Operand missing axis mesh_cp_tp. Operand has axes {mesh_dp_cp}, but the union of all operand axes is {mesh_cp_tp, mesh_dp_cp}. All operands must be annotated on the same set of mesh axes.
+
+Hint: The non-shared axes {mesh_dp_cp} and {mesh_cp_tp} partially overlap. The operand with axes {mesh_dp_cp} is missing mesh_tp; the operand with axes {mesh_cp_tp} is missing mesh_dp.
+
+  In add(
+    args[0]: f32[4] {mesh_dp_cp: V},
+    args[1]: f32[4] {mesh_cp_tp: R},
+  )""",
+            )
+
+    def test_reinterpret_mesh_flatten_unflatten(self) -> None:
+        """Explicit reinterpret_mesh should allow dp,cp <-> dp_cp retagging."""
+        from sixlib.spmd_types._checker import reinterpret_mesh
+
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp: R, self.cp: R})
+            y = reinterpret_mesh(x, {self.dp_cp: R})
+            self.assertEqual(
+                get_local_type(x),
+                {normalize_axis(self.dp): R, normalize_axis(self.cp): R},
+            )
+            self.assertEqual(get_local_type(y), {normalize_axis(self.dp_cp): R})
+
+            z = torch.randn(4)
+            assert_type(z, {self.dp_cp: V})
+            out = y + z
+            self.assertIs(get_axis_local_type(out, self.dp_cp), V)
+
+    def test_reinterpret_mesh_parallel_folding(self) -> None:
+        """Explicit reinterpret_mesh should handle tuple-to-tuple retagging."""
+        from sixlib.spmd_types._checker import reinterpret_mesh
+
+        with typecheck(strict_mode="strict"):
+            dp = MeshAxis.of(2, 8)
+            cp = MeshAxis.of(2, 4)
+            tp = MeshAxis.of(4, 1)
+            edp = MeshAxis.of(4, 4)
+            ep = MeshAxis.of(2, 2)
+            etp = MeshAxis.of(2, 1)
+
+            x = torch.randn(4)
+            assert_type(x, {dp: V, cp: V, tp: V})
+            y = reinterpret_mesh(x, {edp: V, ep: V, etp: V})
+            self.assertEqual(get_local_type(y), {edp: V, ep: V, etp: V})
+
+            z = torch.randn(4)
+            assert_type(z, {edp: R, ep: R, etp: R})
+            out = y + z
+            self.assertIs(get_axis_local_type(out, edp), V)
+            self.assertIs(get_axis_local_type(out, ep), V)
+            self.assertIs(get_axis_local_type(out, etp), V)
+
+    def test_reinterpret_mesh_rejects_mixed_group_types(self) -> None:
+        """Mixed local types within a grouped region are not compatible."""
+        from sixlib.spmd_types._checker import reinterpret_mesh
+
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4)
+            assert_type(x, {self.dp: V, self.cp: R})
+            with self.assertRaises(SpmdTypeError) as cm:
+                reinterpret_mesh(x, {self.dp_cp: V})
+            self.assertExpectedInline(
+                str(cm.exception),
+                """Incompatible cross-mesh local types: {mesh_dp: V, mesh_cp: R} vs {mesh_dp_cp: V}. Source group [mesh_dp, mesh_cp] has mixed local types.""",
+            )
+
+    def test_reinterpret_mesh_rejects_partition_spec(self) -> None:
+        """reinterpret_mesh is local-SPMD-only and rejects global sharding metadata."""
+        from sixlib.spmd_types._checker import reinterpret_mesh
+
+        with typecheck(strict_mode="strict"):
+            x = torch.randn(4, 4)
+            assert_type(x, {self.dp: V}, PartitionSpec(self.dp, None))
+            with self.assertRaises(SpmdTypeError) as cm:
+                reinterpret_mesh(x, {self.dp_cp: V})
+            self.assertExpectedInline(
+                str(cm.exception),
+                """reinterpret_mesh does not support tensors carrying PartitionSpec. Cross-mesh reinterpretation is currently local-SPMD-only.""",
+            )
+
+
+class TestValidatePartitionSpecForGlobalSpmd(LocalTensorTestCase):
+    """Test _validate_partition_spec_for_global_spmd bidirectional consistency."""
+
+    def test_passes_s_with_partition_spec(self):
+        """S(i) axis (V + PartitionSpec) passes validation in global mode."""
+        x = torch.zeros(4, 3)
+        assert_type(x, {self.pg: S(0)})
+        _validate_partition_spec_for_global_spmd(
+            get_local_type(x), get_partition_spec(x)
+        )
+
+    def test_passes_replicate_without_partition_spec(self):
+        """R axis without PartitionSpec passes validation."""
+        x = torch.zeros(4, 3)
+        assert_type(x, {self.pg: R})
+        _validate_partition_spec_for_global_spmd(
+            get_local_type(x), get_partition_spec(x)
+        )
+
+    def test_fails_v_without_partition_spec(self):
+        """V axis without PartitionSpec raises SpmdTypeError."""
+        x = torch.zeros(4, 3)
+        assert_type(x, {self.pg: V})
+        with self.assertRaises(SpmdTypeError):
+            _validate_partition_spec_for_global_spmd(
+                get_local_type(x), get_partition_spec(x)
+            )
+
+    def test_global_mode_rejects_v_without_spec(self):
+        """global region rejects V-typed tensors without PartitionSpec."""
+        with typecheck(local=True):
+            x = torch.zeros(4, 3)
+            assert_type(x, {self.pg: V})
+            torch.add(x, x)
+            with typecheck(local=False):
+                with self.assertRaises(SpmdTypeError):
+                    torch.add(x, x)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import os
 import weakref
 from collections.abc import Generator
 from dataclasses import dataclass
+from itertools import combinations
 from typing import overload, TYPE_CHECKING
 
 from sixlib.spmd_types import _dist
@@ -148,10 +149,16 @@ class MeshAxis:
             if names:
                 name_str = "/".join(sorted(names))
                 return f"{name_str}{{{layout}}}"
+            inferred = _infer_flattened_name(self)
+            if inferred is not None:
+                return f"{inferred}{{{layout}}}"
             return f"MeshAxis({layout})"
         else:
             if names:
-                return sorted(names)[0]
+                return _best_name(names)
+            inferred = _infer_flattened_name(self)
+            if inferred is not None:
+                return inferred
             return f"MeshAxis({self._layout_str()})"
 
     # -- Construction helpers ----------------------------------------------
@@ -191,6 +198,66 @@ class MeshAxis:
                 "stride cannot be specified when constructing from a ProcessGroup"
             )
         return _from_pg(size_or_pg)
+
+
+def flatten_axes(axes: tuple[MeshAxis, ...]) -> MeshAxis:
+    """Flatten a tuple of orthogonal axes into one coalesced region axis."""
+    if not axes:
+        raise ValueError("flatten_axes requires at least one axis")
+    if len(axes) > 1 and not axes[0].isorthogonal(*axes[1:]):
+        raise ValueError(f"flatten_axes requires orthogonal axes, got {axes}")
+
+    atoms = sorted(
+        (sd for axis in axes for sd in axis.layout.sizes_and_strides),
+        key=lambda item: -item[1],
+    )
+    return MeshAxis(_MeshLayout(tuple(s for s, _ in atoms), tuple(d for _, d in atoms)))
+
+
+def _best_name(names: set[str]) -> str:
+    """Pick the best display name from a set of names.
+
+    Prefers any name over ``"default_pg"``, which is a generic fallback
+    assigned by PyTorch to the world process group.
+    """
+    if len(names) > 1:
+        filtered = sorted(n for n in names if n != "default_pg")
+        if filtered:
+            return filtered[0]
+    return sorted(names)[0]
+
+
+def _infer_flattened_name(axis: MeshAxis) -> str | None:
+    """If axis equals flatten_axes of some named sub-axes, return '{name1,name2}'.
+
+    Returns None if no decomposition into named axes is found.
+    """
+    # Collect all named axes that are strictly smaller than the target.
+    named = [
+        (a, _best_name(ns))
+        for a, ns in _mesh_axis_names.items()
+        if a.size() < axis.size()
+    ]
+    if not named:
+        return None
+
+    # Try combinations of size 2..len(named), smallest first.
+    for size in range(2, len(named) + 1):
+        for group in combinations(named, size):
+            axes_tuple = tuple(a for a, _ in group)
+            if not axes_tuple[0].isorthogonal(*axes_tuple[1:]):
+                continue
+            if flatten_axes(axes_tuple) == axis:
+                # Sort by stride descending (outermost first) to match mesh order.
+                ordered = sorted(
+                    group,
+                    key=lambda item: max(
+                        d for _, d in item[0].layout.sizes_and_strides
+                    ),
+                    reverse=True,
+                )
+                return "{" + ",".join(name for _, name in ordered) + "}"
+    return None
 
 
 def _from_pg(pg: ProcessGroup) -> MeshAxis:

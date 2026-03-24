@@ -5,16 +5,24 @@ This module provides:
 - Functions to track SPMD types on tensors
 - Type inference/checking logic for operations
 - TorchFunctionMode for automatic type propagation
+- Global SPMD shard propagation via DTensor's ShardingPropagator
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import auto, Enum
-from typing import Callable, Literal, NamedTuple, Optional, overload
+from typing import (
+    Callable,
+    Literal,
+    NamedTuple,
+    Optional,
+    overload,
+)
 
 import torch
 import torch.overrides
@@ -28,7 +36,9 @@ from sixlib.spmd_types._collectives import (
 )
 from sixlib.spmd_types._frame import _get_user_frame
 from sixlib.spmd_types._local import convert, invariant_to_replicate, reinterpret
+from sixlib.spmd_types._mesh_axis import MeshAxis
 from sixlib.spmd_types._scalar import _unwrap_args, Scalar
+from sixlib.spmd_types._state import _current_mode, _set_current_mode, current_mesh
 from sixlib.spmd_types._traceback import _filter_and_reraise, api_boundary
 from sixlib.spmd_types._type_attr import (
     _LOCAL_TYPE_ATTR,
@@ -38,6 +48,7 @@ from sixlib.spmd_types._type_attr import (
 )
 from sixlib.spmd_types.types import (
     _canonicalize_shard,
+    _check_orthogonality,
     DeviceMeshAxis,
     format_axis,
     I,
@@ -45,6 +56,7 @@ from sixlib.spmd_types.types import (
     normalize_axis,
     normalize_local_type,
     P,
+    partition_spec_get_shard,
     PartitionSpec,
     PerMeshAxisLocalSpmdType,
     PerMeshAxisSpmdType,
@@ -53,30 +65,15 @@ from sixlib.spmd_types.types import (
     Shard,
     shard_types_to_partition_spec,
     SpmdTypeError,
+    to_local_type,
     V,
 )
-from torch.distributed.tensor import _api as _dt_api, DTensor, Placement, Replicate
-from torch.distributed.tensor._api import (
-    _FromTorchTensor,
-    _ToTorchTensor,
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import (
+    DTensor,
+    placement_types as dtensor_type,
 )
-
-if hasattr(_dt_api, "_normalize_placements_for_grad"):
-    _normalize_placements_for_grad = _dt_api._normalize_placements_for_grad
-else:
-
-    def _normalize_placements_for_grad(
-        placements: tuple[Placement, ...],
-    ) -> tuple[Placement, ...]:
-        normalized: list[Placement] = []
-        for p in placements:
-            if p.is_partial():
-                normalized.append(Replicate())
-            else:
-                normalized.append(p)
-        return tuple(normalized)
-
-
+from torch.distributed.tensor._utils import ExplicitRedistributionContext
 from torch.overrides import handle_torch_function, has_torch_function
 
 
@@ -146,7 +143,18 @@ def _trace_op(
     input_types: list[LocalSpmdType],
     output_type: LocalSpmdType | None,
 ) -> None:
-    """Log a trace line for a non-trivial tensor operator."""
+    """Log a trace line for a non-trivial tensor operator.
+
+    Omits the log line when all inputs and the output are empty local types
+    (``{}``), since these carry no SPMD information and would just be noise.
+    """
+    # Skip when every type is an empty dict -- no mesh axes involved.
+    if (
+        all(isinstance(t, dict) and not t for t in input_types)
+        and isinstance(output_type, dict)
+        and not output_type
+    ):
+        return
     name = getattr(func, "__name__", None) or getattr(func, "__qualname__", repr(func))
     inputs_str = ", ".join(_format_type(t) for t in input_types)
     out_str = _format_type(output_type)
@@ -262,10 +270,10 @@ _FIX_CANDIDATES: list[
 
 
 def _suggest_fixes(
-    axis: DeviceMeshAxis,
+    axis: MeshAxis,
     axis_types: list[PerMeshAxisLocalSpmdType],
     infer_fn: Callable[
-        [DeviceMeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
+        [MeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
     ],
 ) -> list[tuple[str, str, PerMeshAxisLocalSpmdType]]:
     """Try each candidate fix and return suggestions for ones that work.
@@ -325,10 +333,10 @@ def _suggest_fixes(
 
 def _format_error_with_suggestions(
     base_msg: str,
-    axis: DeviceMeshAxis,
+    axis: MeshAxis,
     axis_types: list[PerMeshAxisLocalSpmdType],
     infer_fn: Callable[
-        [DeviceMeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
+        [MeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
     ],
 ) -> str:
     """Format an error message, appending fix suggestions if any exist.
@@ -512,6 +520,13 @@ def assert_type(  # noqa: C901
             PartitionSpec info.
         SpmdTypeError: If existing local SPMD type doesn't match.
     """
+    if isinstance(tensor, DTensor):
+        raise TypeError(
+            "assert_type() does not support DTensor. SPMD type checking "
+            "operates on local tensors only; DTensor tracks its own "
+            "placement metadata."
+        )
+
     ############ Validate partition_spec length ############
     if partition_spec is not None:
         if len(partition_spec) != tensor.ndim:
@@ -524,10 +539,12 @@ def assert_type(  # noqa: C901
     # Single pass: normalize S(i) dims, separate into local types vs shards,
     # and check for multi-axis-same-dim conflicts.
     local_type: LocalSpmdType = {}
-    axis_to_dims: dict[DeviceMeshAxis, Shard] = {}
-    dim_to_axes: dict[int, list[DeviceMeshAxis]] = {}
+    axis_to_dims: dict[MeshAxis, Shard] = {}
+    dim_to_axes: dict[int, list[MeshAxis]] = {}
     for axis, typ in type.items():
         axis = normalize_axis(axis)
+        if axis.size() == 1:
+            continue  # singleton axes carry no sharding info; skip
         typ = _canonicalize_shard(typ, tensor.ndim)
         if isinstance(typ, Shard):
             dim_to_axes.setdefault(typ.dim, []).append(axis)
@@ -564,7 +581,6 @@ def assert_type(  # noqa: C901
                 continue
             axes = entry if isinstance(entry, tuple) else (entry,)
             for axis in axes:
-                axis = normalize_axis(axis)
                 axis_type = local_type.get(axis)
                 if axis_type is not None and axis_type is not V:
                     raise SpmdTypeError(
@@ -585,21 +601,25 @@ def assert_type(  # noqa: C901
         return tensor
 
     # 1. Re-check: compare local types.
-    # Only axes present in canonical are checked; extra axes in existing are
-    # ignored (partial re-check). New axes are merged in. Asserting V on an
-    # axis that already has a type (R/I/P) is allowed (V is less specific).
+    # Only axes present in local_type are checked; extra axes in existing are
+    # ignored (partial re-check). New axes are merged in.
+    #
+    # Validate before mutating so that failures are side-effect-free.
     existing_local = get_local_type(tensor)  # existing_local is mutable.
     old = dict(existing_local) if _TRACE else None
     for axis, typ in local_type.items():
-        if axis not in existing_local:
-            existing_local[axis] = typ  # New axis: merge in place.
-            continue
-        existing_typ = existing_local[axis]
-        if existing_typ != typ:
-            raise SpmdTypeError(
-                f"SPMD type mismatch on axis {format_axis(axis)}: "
-                f"tensor has {existing_typ}, expected {typ}"
-            )
+        if axis in existing_local:
+            existing_typ = existing_local[axis]
+            if existing_typ != typ:
+                raise SpmdTypeError(
+                    f"SPMD type mismatch on axis {format_axis(axis)}: "
+                    f"tensor has {existing_typ}, expected {typ}"
+                )
+    # 1a. Orthogonality: check the union of old and new keys before committing.
+    _check_orthogonality(list(existing_local.keys() | local_type.keys()))
+    # Commit: merge new axes into the live dict.
+    existing_local.update(local_type)
+
     # 2. Re-check PartitionSpec: refinement semantics.
     # Only None -> sharded refinement is allowed; adding a new mesh axis to an
     # already-sharded dim requires an explicit PartitionSpec upfront.
@@ -607,7 +627,7 @@ def assert_type(  # noqa: C901
     if partition_spec is not None:
         if existing_spec is not None:
             # Build map from mesh axis to tensor dim for conflict detection.
-            existing_axis_to_dim: dict[DeviceMeshAxis, int] = {}
+            existing_axis_to_dim: dict[MeshAxis, int] = {}
             for dim, entry in enumerate(existing_spec):
                 if entry is not None:
                     axes = entry if isinstance(entry, tuple) else (entry,)
@@ -650,6 +670,42 @@ def assert_type(  # noqa: C901
 def assert_local_type(tensor: torch.Tensor, type: PerMeshAxisSpmdTypes) -> torch.Tensor:
     """Deprecated: use ``assert_type`` instead."""
     return assert_type(tensor, type)
+
+
+@api_boundary
+def reinterpret_mesh(
+    tensor: torch.Tensor,
+    type: PerMeshAxisSpmdTypes,
+) -> torch.Tensor:
+    """Explicitly reinterpret a tensor onto a cross-mesh-compatible local type.
+
+    This is a no-op on the underlying tensor data. It only retags the tensor
+    with a new local SPMD type after verifying the source and destination mesh
+    presentations are compatible under one-hop grouping.
+    """
+    if not has_local_type(tensor):
+        raise SpmdTypeError(
+            "reinterpret_mesh requires a tensor with an existing local SPMD type."
+        )
+    if get_partition_spec(tensor) is not None:
+        raise SpmdTypeError(
+            "reinterpret_mesh does not support tensors carrying PartitionSpec. "
+            "Cross-mesh reinterpretation is currently local-SPMD-only."
+        )
+
+    from sixlib.spmd_types._mesh_region import check_reinterpret_mesh_compatible
+
+    src_type = get_local_type(tensor)
+    dst_type = _validate(type)
+    err = check_reinterpret_mesh_compatible(src_type, dst_type)
+    if err is not None:
+        raise SpmdTypeError(err)
+
+    result = torch.ops.aten.alias.default(tensor)
+    _set_local_type_raw(result, dst_type)
+    if _TRACE:
+        _trace_op(reinterpret_mesh, [src_type], dst_type)
+    return result
 
 
 @api_boundary
@@ -703,8 +759,8 @@ def mutate_type(
         )
 
     # Normalize S(i) -> V for comparison and storage
-    src_local = V if isinstance(src, Shard) else src
-    dst_local = V if isinstance(dst, Shard) else dst
+    src_local = to_local_type(src)
+    dst_local = to_local_type(dst)
 
     current = local_type[axis]
     if current is not src_local:
@@ -740,7 +796,7 @@ class OpLinearity(Enum):
 
 
 def _infer_local_type_for_axis_raw(  # noqa: C901
-    axis: DeviceMeshAxis,
+    axis: MeshAxis,
     axis_types: list[PerMeshAxisLocalSpmdType],
     out_partial: bool = False,
     linearity: OpLinearity = OpLinearity.NONLINEAR,
@@ -876,6 +932,7 @@ def infer_local_type_for_axis(
     Raises:
         SpmdTypeError: If the input types are incompatible
     """
+    axis = normalize_axis(axis)
     try:
         return _infer_local_type_for_axis_raw(axis, axis_types, out_partial, linearity)
     except SpmdTypeError as e:
@@ -889,6 +946,257 @@ def infer_local_type_for_axis(
                 ),
             )
         ) from None
+
+
+def _format_axis_set(axes: Iterable[DeviceMeshAxis]) -> str:
+    """Format a set of mesh axes for display (sorted, comma-separated, in braces)."""
+    return "{" + ", ".join(sorted(format_axis(ax) for ax in axes)) + "}"
+
+
+def _format_rank_set(ranks: Iterable[int]) -> str:
+    """Format a set of rank offsets for display (sorted, in braces)."""
+    return "{" + ", ".join(str(r) for r in sorted(set(ranks))) + "}"
+
+
+def _compute_rank_space(axes: frozenset[MeshAxis]) -> frozenset[int] | None:
+    """Compute the set of relative rank offsets covered by a set of mesh axes.
+
+    Returns None if the axes are not mutually orthogonal (cannot compute).
+    """
+    from sixlib.spmd_types._mesh_axis import flatten_axes
+
+    if not axes:
+        return frozenset()
+    axes_list = list(axes)
+    if len(axes_list) == 1:
+        return frozenset(axes_list[0].layout.all_ranks_from_zero())
+    if not axes_list[0].isorthogonal(*axes_list[1:]):
+        return None
+    combined = flatten_axes(tuple(axes_list))
+    return frozenset(combined.layout.all_ranks_from_zero())
+
+
+def _cross_mesh_advice(input_types_list: list[LocalSpmdType]) -> str:
+    """Check if operands with mismatched axes have structural relationships.
+
+    Produces advice for:
+    1. Cross-mesh compatible axes -> suggest reinterpret_mesh()
+    2. Sub-axis relationships (partial rank overlap) -> identify missing axes
+    3. Different rank spaces without sub-axis relationship -> note rank mismatch
+
+    Returns an empty string if no advice can be given.
+    """
+    from sixlib.spmd_types._mesh_region import check_reinterpret_mesh_compatible
+
+    # Normalize all types to use MeshAxis keys (not raw ProcessGroup).
+    normalized: list[LocalSpmdType] = [
+        normalize_local_type(t) for t in input_types_list
+    ]
+
+    # Collect distinct axis sets (ignoring types -- we only care about
+    # structural mesh compatibility here).
+    seen_axis_sets: list[LocalSpmdType] = []
+    for typ in normalized:
+        axes = frozenset(typ.keys())
+        if not any(frozenset(s.keys()) == axes for s in seen_axis_sets):
+            seen_axis_sets.append(typ)
+    if len(seen_axis_sets) < 2:
+        return ""
+
+    parts: list[str] = []
+
+    for i in range(len(seen_axis_sets)):
+        for j in range(i + 1, len(seen_axis_sets)):
+            a, b = seen_axis_sets[i], seen_axis_sets[j]
+            if a.keys() == b.keys():
+                continue
+
+            # 1. Check cross-mesh compatibility with uniform R types,
+            # so that type mismatches don't mask axis compatibility.
+            a_uniform: LocalSpmdType = {ax: R for ax in a}
+            b_uniform: LocalSpmdType = {ax: R for ax in b}
+            err = check_reinterpret_mesh_compatible(a_uniform, b_uniform)
+            if err is None:
+                # They are structurally compatible. Suggest converting to
+                # the set with more axes (the finer-grained mesh).
+                if len(a) >= len(b):
+                    fine, coarse = a, b
+                else:
+                    fine, coarse = b, a
+                parts.append(
+                    f"The operand axes {_format_axis_set(coarse.keys())} and "
+                    f"{_format_axis_set(fine.keys())} are cross-mesh compatible. "
+                    f"Use reinterpret_mesh() to convert the operand "
+                    f"with axes {_format_axis_set(coarse.keys())} to axes "
+                    f"{_format_axis_set(fine.keys())} before this operation."
+                )
+                continue
+
+            # 2. Not cross-mesh compatible. Check sub-axis relationships
+            # among the non-shared axes.
+            shared = a.keys() & b.keys()
+            a_only = frozenset(ax for ax in a if ax not in shared)
+            b_only = frozenset(ax for ax in b if ax not in shared)
+
+            if not a_only or not b_only:
+                continue
+
+            # Restrict complement/sub-axis searches to axes related to
+            # these operands (members or sub-axes of their axis sets),
+            # so we don't suggest axes from unrelated meshes.
+            all_operand_axes = frozenset(a.keys()) | frozenset(b.keys())
+            universe = _relevant_axes(all_operand_axes)
+
+            # Look for sub-axis relationships (one axis is a subgroup
+            # of another, indicating a flatten relationship with missing
+            # intermediate axes).
+            found_sub = False
+            for ax_a in sorted(a_only, key=lambda ax: format_axis(ax)):
+                for ax_b in sorted(b_only, key=lambda ax: format_axis(ax)):
+                    if ax_a < ax_b:
+                        found_sub = True
+                        _add_sub_axis_advice(parts, ax_a, ax_b, a, universe)
+                    elif ax_b < ax_a:
+                        found_sub = True
+                        _add_sub_axis_advice(parts, ax_b, ax_a, b, universe)
+
+            if found_sub:
+                continue
+
+            # 3. No sub-axis relationship. Check for partial rank overlap.
+            a_ranks = _compute_rank_space(a_only)
+            b_ranks = _compute_rank_space(b_only)
+
+            if a_ranks is None or b_ranks is None:
+                continue
+
+            if a_ranks == b_ranks:
+                continue
+
+            # Exclude the trivial overlap at rank 0 (all_ranks_from_zero
+            # always includes 0).
+            overlap = (a_ranks & b_ranks) - {0}
+            if overlap:
+                # Try to find named axes that would complete each side.
+                a_missing = _find_orthogonal_complements(frozenset(a.keys()), universe)
+                b_missing = _find_orthogonal_complements(frozenset(b.keys()), universe)
+                suggestions: list[str] = []
+                if a_missing:
+                    names = ", ".join(format_axis(ax) for ax in a_missing)
+                    suggestions.append(
+                        f"the operand with axes "
+                        f"{_format_axis_set(a.keys())} is missing "
+                        f"{names}"
+                    )
+                if b_missing:
+                    names = ", ".join(format_axis(ax) for ax in b_missing)
+                    suggestions.append(
+                        f"the operand with axes "
+                        f"{_format_axis_set(b.keys())} is missing "
+                        f"{names}"
+                    )
+                if suggestions:
+                    msg = (
+                        f"The non-shared axes {_format_axis_set(a_only)} "
+                        f"and {_format_axis_set(b_only)} partially "
+                        f"overlap. "
+                    )
+                    combined = "; ".join(suggestions)
+                    msg += combined[0].upper() + combined[1:] + "."
+                    parts.append(msg)
+
+    return " ".join(parts)
+
+
+def _relevant_axes(
+    all_operand_axes: frozenset[MeshAxis],
+) -> frozenset[MeshAxis]:
+    """Compute the set of named axes relevant to a set of operand axes.
+
+    Returns axes that either appear in *all_operand_axes* or are sub-axes
+    of a member.  This scopes complement/sub-axis searches to the mesh
+    dimensions actually in play, avoiding spurious suggestions from
+    unrelated meshes registered in the global ``_mesh_axis_names`` table.
+    """
+    from sixlib.spmd_types._mesh_axis import _mesh_axis_names
+
+    result: set[MeshAxis] = set()
+    for candidate in _mesh_axis_names:
+        if candidate in all_operand_axes:
+            result.add(candidate)
+            continue
+        # Include if candidate is a sub-axis of any operand axis.
+        for ax in all_operand_axes:
+            if candidate < ax:
+                result.add(candidate)
+                break
+    return frozenset(result)
+
+
+def _find_orthogonal_complements(
+    axes: frozenset[MeshAxis],
+    universe: frozenset[MeshAxis],
+) -> list[MeshAxis]:
+    """Find mesh axes from *universe* orthogonal to all axes in the set.
+
+    Returns axes from *universe* that are not already in *axes* and are
+    mutually orthogonal with every member -- i.e., axes that could be
+    added to the set without conflict.  Sorted by name for deterministic
+    output.
+    """
+    result: list[MeshAxis] = []
+    for candidate in universe:
+        if candidate in axes:
+            continue
+        if all(candidate.isorthogonal(ax) for ax in axes):
+            result.append(candidate)
+    return sorted(result, key=lambda ax: format_axis(ax))
+
+
+def _add_sub_axis_advice(
+    parts: list[str],
+    sub: MeshAxis,
+    super_: MeshAxis,
+    sub_type: LocalSpmdType,
+    universe: frozenset[MeshAxis],
+) -> None:
+    """Add advice when one axis is a proper sub-axis of another."""
+    from sixlib.spmd_types._mesh_axis import flatten_axes
+
+    sub_ranks = sub.layout.all_ranks_from_zero()
+    super_ranks = super_.layout.all_ranks_from_zero()
+
+    # Try to identify the complement axis -- a known axis that, combined
+    # with sub, produces super_.
+    complement: MeshAxis | None = None
+    for candidate in universe:
+        if candidate == sub:
+            continue
+        if candidate <= super_ and candidate.isorthogonal(sub):
+            try:
+                combined = flatten_axes((sub, candidate))
+                if combined == super_:
+                    complement = candidate
+                    break
+            except ValueError:
+                pass
+
+    if complement is not None:
+        parts.append(
+            f"{format_axis(sub)} is a sub-axis of {format_axis(super_)} "
+            f"(ranks {_format_rank_set(sub_ranks)} vs "
+            f"{_format_rank_set(super_ranks)}), "
+            f"so the operand with axes {_format_axis_set(sub_type.keys())} "
+            f"is missing axis {format_axis(complement)}."
+        )
+    else:
+        parts.append(
+            f"{format_axis(sub)} is a sub-axis of {format_axis(super_)} "
+            f"(ranks {_format_rank_set(sub_ranks)} vs "
+            f"{_format_rank_set(super_ranks)}), "
+            f"so the operand with axes {_format_axis_set(sub_type.keys())} "
+            f"is missing some mesh axes."
+        )
 
 
 def infer_output_type(
@@ -928,22 +1236,38 @@ def infer_output_type(
     for typ in input_types_list:
         all_axes.update(typ.keys())
     all_axes.update(out_partial_axes)
+    mesh = current_mesh()
+    if mesh is not None:
+        all_axes.update(mesh)
 
     strict = _state.is_strict()
 
-    # Infer output type for each axis
+    # Check for cross-mesh compatibility and give advice on axis mismatches.
+    if strict:
+        axis_sets = [set(typ.keys()) for typ in input_types_list]
+        if len(set(frozenset(s) for s in axis_sets)) > 1:
+            advice = _cross_mesh_advice(input_types_list)
+            if advice:
+                advice = f"\n\nHint: {advice}"
+        else:
+            advice = ""
+    else:
+        advice = ""
+
+    # Infer output type for each axis.  Sort for deterministic error messages.
     output_type: LocalSpmdType = {}
-    for axis in all_axes:
+    for axis in sorted(all_axes, key=lambda ax: format_axis(ax)):
         axis_types = []
         for typ in input_types_list:
             if axis not in typ:
                 if strict:
                     raise SpmdTypeError(
                         f"Operand missing axis {format_axis(axis)}. "
-                        f"Operand has axes {set(typ.keys())}, "
-                        f"but the union of all operand axes is {all_axes}. "
+                        f"Operand has axes {_format_axis_set(typ.keys())}, "
+                        f"but the union of all operand axes is "
+                        f"{_format_axis_set(all_axes)}. "
                         f"All operands must be annotated on the same set of "
-                        f"mesh axes."
+                        f"mesh axes." + advice
                     )
                 continue  # permissive: skip this operand for this axis
             axis_types.append(typ[axis])
@@ -1298,10 +1622,13 @@ class _ArgInfo(NamedTuple):
         raw_entries: All arguments (tensor and non-tensor), in call order,
             captured so error formatting can be deferred until a type error
             actually occurs.
+        partition_specs: PartitionSpec for each tensor (same order as
+            tensor_types). None for tensors without a PartitionSpec.
     """
 
     tensor_types: list[LocalSpmdType]
     raw_entries: list[_RawArgEntry]
+    partition_specs: list[PartitionSpec | None]
 
 
 def _format_tensor_for_context(t: torch.Tensor) -> str:
@@ -1312,7 +1639,11 @@ def _format_tensor_for_context(t: torch.Tensor) -> str:
     dtype_str = dtype_abbrs.get(t.dtype, str(t.dtype).removeprefix("torch."))
     shape_str = ", ".join(str(d) for d in t.shape)
     type_items = ", ".join(f"{format_axis(axis)}: {typ!r}" for axis, typ in lt.items())
-    return f"{dtype_str}[{shape_str}] {{{type_items}}}"
+    result = f"{dtype_str}[{shape_str}] {{{type_items}}}"
+    ps = get_partition_spec(t)
+    if ps is not None:
+        result += f" {ps}"
+    return result
 
 
 def _format_non_tensor_for_context(val: object) -> str:
@@ -1379,8 +1710,8 @@ def _classify_args(args: tuple, kwargs: dict) -> _ArgInfo:
     """Classify all tensor arguments in a single pass.
 
     Iterates every tensor in ``args`` and ``kwargs`` (skipping ``out=``),
-    collecting ``get_local_type`` for each.  Untyped tensors contribute
-    ``{}`` (unknown on all axes).
+    collecting ``get_local_type`` and ``get_partition_spec`` for each.
+    Untyped tensors contribute ``{}`` (unknown on all axes).
 
     Also records the original call arguments so error formatting can be
     deferred until a type error actually occurs.
@@ -1391,25 +1722,25 @@ def _classify_args(args: tuple, kwargs: dict) -> _ArgInfo:
     """
     tensor_types: list[LocalSpmdType] = []
     raw_entries: list[_RawArgEntry] = []
+    partition_specs: list[PartitionSpec | None] = []
 
-    def _classify(t: torch.Tensor, location: str) -> None:
-        lt = get_local_type(t)
-        tensor_types.append(lt)
-
-    for i, arg in enumerate(args):
+    for arg in args:
         for t in _iter_tensors_in(arg):
-            _classify(t, f"args[{i}]")
+            tensor_types.append(get_local_type(t))
+            partition_specs.append(get_partition_spec(t))
         raw_entries.append(_RawArgEntry(None, arg))
     for key, v in kwargs.items():
         if key == "out":
             continue
         for t in _iter_tensors_in(v):
-            _classify(t, key)
+            tensor_types.append(get_local_type(t))
+            partition_specs.append(get_partition_spec(t))
         raw_entries.append(_RawArgEntry(key, v))
 
     return _ArgInfo(
         tensor_types,
         raw_entries,
+        partition_specs,
     )
 
 
@@ -1481,7 +1812,7 @@ def _collect_scalar_types(  # noqa: C901
     tensor_types: list[LocalSpmdType],
     original_args: tuple,
     original_kwargs: dict,
-    spec: _OpSpec,
+    spec: _OpSpec | None,
 ) -> list[LocalSpmdType]:
     """Append scalar types to tensor types based on op spec positions.
 
@@ -1496,6 +1827,9 @@ def _collect_scalar_types(  # noqa: C901
     values.  Plain numeric scalars at non-tensor-arg positions are ignored
     (they are structural parameters like ``dim``).
 
+    When ``spec`` is ``None`` (unregistered op), only ``Scalar`` wrappers
+    are collected from all argument positions.
+
     Returns a new list with scalar types appended (or ``tensor_types``
     unchanged if no scalars are found).
 
@@ -1504,11 +1838,21 @@ def _collect_scalar_types(  # noqa: C901
         original_args: Positional arguments (pre-Scalar-unwrapping, so
             ``Scalar`` objects are visible).
         original_kwargs: Keyword arguments (pre-Scalar-unwrapping).
-        spec: Op specification declaring which positions are tensor inputs.
+        spec: Op specification declaring which positions are tensor inputs,
+            or ``None`` for unregistered ops.
     """
     all_axes: set[DeviceMeshAxis] = set()
     for typ in tensor_types:
         all_axes.update(typ.keys())
+
+    for a in (*original_args, *original_kwargs.values()):
+        if isinstance(a, Scalar):
+            all_axes.update(get_local_type(a).keys())
+        elif isinstance(a, (list, tuple)):
+            for item in a:
+                if isinstance(item, Scalar):
+                    all_axes.update(get_local_type(item).keys())
+
     if not all_axes:
         return tensor_types
 
@@ -1536,27 +1880,32 @@ def _collect_scalar_types(  # noqa: C901
                 if isinstance(item, Scalar):
                     extra.append(get_local_type(item))
 
-    # Collect from declared tensor-input positions (Scalar + plain numeric).
-    tensor_arg_positions: set[int] = set(spec.tensor_args)
-    for i in spec.tensor_args:
-        if i < len(original_args):
-            _check(original_args[i])
-    if spec.tensor_varargs_from is not None:
-        for i in range(spec.tensor_varargs_from, len(original_args)):
-            tensor_arg_positions.add(i)
-            _check(original_args[i])
-    for name in spec.tensor_kwargs:
-        if name in original_kwargs:
-            _check(original_kwargs[name])
+    if spec is not None:
+        # Collect from declared tensor-input positions (Scalar + plain numeric).
+        tensor_arg_positions: set[int] = set(spec.tensor_args)
+        for i in spec.tensor_args:
+            if i < len(original_args):
+                _check(original_args[i])
+        if spec.tensor_varargs_from is not None:
+            for i in range(spec.tensor_varargs_from, len(original_args)):
+                tensor_arg_positions.add(i)
+                _check(original_args[i])
+        for name in spec.tensor_kwargs:
+            if name in original_kwargs:
+                _check(original_kwargs[name])
 
-    # Collect Scalar wrappers from non-tensor-arg positions.  Plain numeric
-    # scalars here are structural (e.g. dim) and don't carry SPMD types.
-    for i, arg in enumerate(original_args):
-        if i not in tensor_arg_positions:
-            _check_scalar_only(arg)
-    for name, val in original_kwargs.items():
-        if name not in spec.tensor_kwargs:
-            _check_scalar_only(val)
+        # Collect Scalar wrappers from non-tensor-arg positions.  Plain numeric
+        # scalars here are structural (e.g. dim) and don't carry SPMD types.
+        for i, arg in enumerate(original_args):
+            if i not in tensor_arg_positions:
+                _check_scalar_only(arg)
+        for name, val in original_kwargs.items():
+            if name not in spec.tensor_kwargs:
+                _check_scalar_only(val)
+    else:
+        # No spec; scan all args for Scalar wrappers only.
+        for a in (*original_args, *original_kwargs.values()):
+            _check_scalar_only(a)
 
     if extra:
         return list(tensor_types) + extra
@@ -1784,6 +2133,523 @@ _SPMD_FUNCTION_DEFAULTS: dict[Callable, dict[str, PerMeshAxisSpmdType | None]] =
 }
 
 
+def _resolve_collective_axes(
+    axis: MeshAxis,
+    local_type: LocalSpmdType,
+) -> list[MeshAxis] | None:
+    """Resolve a collective's mesh axis to the matching axes on a tensor.
+
+    Returns [axis] if axis is directly in local_type.
+    Returns [sub1, sub2, ...] if axis is a flattened version of sub-axes
+    that are all present in local_type.
+    Returns None if no match is found.
+    """
+    if axis in local_type:
+        return [axis]
+
+    # Try flattened decomposition: check if sub-axes in local_type
+    # flatten to exactly this axis.
+    from sixlib.spmd_types._mesh_axis import flatten_axes
+
+    candidates = [a for a in local_type if a < axis]
+    if not candidates:
+        return None
+    if flatten_axes(tuple(candidates)) == axis:
+        return candidates
+    return None
+
+
+# =============================================================================
+# Global SPMD Shard Propagation (via DTensor ShardingPropagator)
+# =============================================================================
+
+
+def _set_result_partition_spec(
+    flat_results: list[object],
+    partition_specs: list[PartitionSpec | None],
+) -> None:
+    """Set partition specs on flattened result tensors.
+
+    Both arguments are flat lists (one entry per pytree leaf), matched
+    positionally.
+    """
+    assert len(partition_specs) == len(flat_results), (
+        f"PartitionSpec list length {len(partition_specs)} "
+        f"does not match flattened result length {len(flat_results)}"
+    )
+    for item, spec in zip(flat_results, partition_specs):
+        if isinstance(item, torch.Tensor):
+            _set_partition_spec(item, spec)
+
+
+def _collect_shard_axes(  # noqa: C901
+    partition_specs: list[PartitionSpec | None],
+    global_axes: set[MeshAxis],
+) -> tuple[list[MeshAxis], dict[MeshAxis, set[MeshAxis]]]:
+    """Collect global shard axes from input PartitionSpecs in topological order.
+
+    Scans the pre-collected PartitionSpecs, extracts ordering constraints from
+    adjacent pairs in multi-axis tuples (e.g., ``('tp', 'dp', 'ep')`` yields
+    edges tp->dp, dp->ep), and returns a topologically sorted list of global
+    axes that are sharded (i.e., appear in at least one input's PartitionSpec).
+    The function also validates that ordering constraints are consistent across
+    all inputs (no conflicts such as tp before dp in one input but dp before tp
+    in another).
+
+    Args:
+        partition_specs: Pre-collected PartitionSpecs from ``_classify_args``
+            (one per input tensor, None for tensors without a PartitionSpec).
+        global_axes: The set of axes in global SPMD mode.
+
+    Returns:
+        A tuple of (sorted_axes, edges):
+        - ``sorted_axes``: Topologically sorted list of global shard axes. When
+          multiple valid orderings exist, axes are ordered by first appearance
+          in the input PartitionSpecs.
+        - ``edges``: Dict mapping each axis to the set of axes that must come
+          after it (ordering constraints from input PartitionSpec tuples). Used
+          by the caller to verify that axes sharing the same output dim have a
+          defined ordering.
+
+        **Why a full topsort is safe**: the returned order only affects tuple
+        ordering within output PartitionSpec entries. Two axes A and B can only
+        appear in the same output tuple (e.g., ``(A, B)``) if they are reachable
+        from each other in the edge graph, which determines their relative
+        order. If no path connects them, they land on different dims and their
+        relative order is never observable. So even though the topsort is more
+        constrained than a partial order, the extra constraint never changes the
+        result. Callers must not rely on the specific linear order for other
+        purposes.
+
+    Raises:
+        SpmdTypeError: If pairwise ordering conflicts are detected.
+    """
+    shard_axes_seen: list[MeshAxis] = []
+    seen: set[MeshAxis] = set()
+    # edges[a] = {b} means a must come before b.
+    edges: dict[MeshAxis, set[MeshAxis]] = {}
+
+    for ps in partition_specs:
+        if ps is None:
+            continue
+        for entry in ps:
+            if entry is None:
+                continue
+            if isinstance(entry, tuple):
+                global_in_entry = [a for a in entry if a in global_axes]
+                # Record adjacent ordering constraints.
+                for i in range(len(global_in_entry) - 1):
+                    a, b = global_in_entry[i], global_in_entry[i + 1]
+                    # Check for conflicts: a before b here, but b before a
+                    # in another input (direct or transitive).
+                    if _is_reachable(b, a, edges):
+                        raise SpmdTypeError(
+                            f"PartitionSpec device ordering conflict: "
+                            f"{b} before {a} vs {a} before {b}"
+                        )
+                    edges.setdefault(a, set()).add(b)
+                axes = global_in_entry
+            else:
+                axes = [entry] if entry in global_axes else []
+            for a in axes:
+                if a not in seen:
+                    shard_axes_seen.append(a)
+                    seen.add(a)
+
+    # Topological sort using Kahn's algorithm, with first-seen order as
+    # tiebreaker so that axes without ordering constraints preserve their
+    # natural appearance order.
+    if not edges:
+        return shard_axes_seen, edges
+
+    # Precompute position for O(1) ordering lookups.
+    pos: dict[MeshAxis, int] = {a: i for i, a in enumerate(shard_axes_seen)}
+
+    # Build in-degree map over shard axes only.
+    in_degree: dict[MeshAxis, int] = dict.fromkeys(shard_axes_seen, 0)
+    for a in shard_axes_seen:
+        for b in edges.get(a, set()):
+            if b in in_degree:
+                in_degree[b] += 1
+
+    # Seed queue with zero-in-degree axes in first-seen order.
+    # Use a heap keyed by first-seen position for O(log n) insert/pop.
+    import heapq
+
+    heap: list[tuple[int, MeshAxis]] = [
+        (pos[a], a) for a in shard_axes_seen if in_degree[a] == 0
+    ]
+    heapq.heapify(heap)
+    result: list[MeshAxis] = []
+    while heap:
+        _, node = heapq.heappop(heap)
+        result.append(node)
+        for neighbor in edges.get(node, set()):
+            if neighbor not in in_degree:
+                continue
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                heapq.heappush(heap, (pos[neighbor], neighbor))
+
+    if len(result) != len(shard_axes_seen):
+        # Cycle detected -- should not happen if PartitionSpec entries are
+        # consistent, but report clearly just in case.
+        missing = set(shard_axes_seen) - set(result)
+        raise SpmdTypeError(
+            f"Cyclic ordering constraint among global shard axes: "
+            f"{', '.join(format_axis(a) for a in missing)}"
+        )
+
+    return result, edges
+
+
+def spmd_type_to_dtensor_placement(
+    typ: PerMeshAxisSpmdType,
+) -> dtensor_type.Placement:
+    """Convert our per-axis SPMD type to a DTensor Placement.
+
+    I (Invariant) maps to Replicate since DTensor has no Invariant concept.
+    The caller is responsible for recovering I after calling the inverse
+    operation ``dtensor_placement_to_spmd_type`` (which maps Replicate back
+    to R, not I).
+    """
+    if isinstance(typ, Shard):
+        return dtensor_type.Shard(typ.dim)
+    if typ is R or typ is I:
+        return dtensor_type.Replicate()
+    if typ is P:
+        # Only DTensor Partial('sum') is supported.
+        return dtensor_type.Partial()
+    raise ValueError(f"Cannot convert {typ} to DTensor placement")
+
+
+def dtensor_placement_to_spmd_type(
+    placement: dtensor_type.Placement,
+) -> PerMeshAxisSpmdType:
+    """Convert a DTensor Placement to our per-axis SPMD type.
+
+    Replicate maps to R (not I); the caller must recover I if needed.
+    """
+    if isinstance(placement, dtensor_type.Shard):
+        return Shard(placement.dim)
+    if isinstance(placement, dtensor_type.Replicate):
+        return R
+    if isinstance(placement, dtensor_type.Partial):
+        if placement.reduce_op != "sum":
+            raise ValueError(
+                f"Only sum-Partial is supported, got reduce_op={placement.reduce_op!r}"
+            )
+        return P
+    raise ValueError(f"Cannot convert DTensor placement {placement}")
+
+
+class _ShardPropagator:
+    """Per-axis shard propagator using DTensor meta dispatch.
+
+    Creates meta DTensors with the appropriate placements, runs the torch
+    function, and reads the output placements. DTensor's own
+    ``__torch_dispatch__`` handles sharding strategy selection and decomposition
+    propagation naturally.
+
+    Caches 1-D DeviceMeshes by axis dimension size.
+    """
+
+    def __init__(self):
+        # Cache 1-D meshes by axis dimension size.
+        self._meshes: dict[int, DeviceMesh] = {}
+
+    def _get_mesh(self, axis_size: int) -> DeviceMesh:
+        """Get or create a 1-D DeviceMesh of the given size."""
+        cached = self._meshes.get(axis_size)
+        if cached is not None:
+            return cached
+        mesh = DeviceMesh("cpu", torch.arange(axis_size), _init_backend=False, _rank=0)
+        self._meshes[axis_size] = mesh
+        return mesh
+
+    def _to_meta_dtensor(
+        self,
+        arg: object,
+        axis: MeshAxis,
+        mesh: DeviceMesh,
+    ) -> object:
+        """Convert a tensor arg to a meta DTensor for shard propagation.
+
+        Non-tensor args pass through unchanged. Untyped tensors become plain
+        meta tensors (not DTensors, so DTensor dispatch ignores them).
+        """
+        if not isinstance(arg, torch.Tensor):
+            return arg
+        if not has_local_type(arg):
+            return torch.empty(arg.shape, dtype=arg.dtype, device="meta")
+
+        # If the tensor has a PartitionSpec on this axis, use that. Otherwise
+        # fall back to the local SPMD type (R, I, or P).
+        shard = partition_spec_get_shard(get_partition_spec(arg), axis)
+        typ = shard if shard is not None else get_local_type(arg)[axis]
+        # I (Invariant) is lost here -- it maps to Replicate since DTensor
+        # has no Invariant concept. It will be recovered based on local
+        # SPMD propagation in _validate_and_update_local_global_correspondence.
+        placement = spmd_type_to_dtensor_placement(typ)
+        local_meta = torch.empty(arg.shape, dtype=arg.dtype, device="meta")
+        return DTensor.from_local(local_meta, mesh, [placement])
+
+    def propagate(
+        self,
+        func: Callable,
+        axis: MeshAxis,
+        args: tuple,
+        kwargs: dict | None = None,
+    ) -> list[dtensor_type.Placement | None]:
+        """Propagate shard types by running func on meta DTensors.
+
+        Creates meta DTensors with the appropriate placements for the given
+        axis, runs the torch function (DTensor dispatch handles propagation),
+        and reads the output placements as raw DTensor Placements. Always
+        returns a flat list with one entry per output leaf.
+
+        Returns raw DTensor Placements (Shard, Replicate, Partial).
+        """
+        mesh = self._get_mesh(axis.size())
+
+        meta_args = torch.utils._pytree.tree_map(
+            lambda x: self._to_meta_dtensor(x, axis, mesh), args
+        )
+        meta_kwargs = torch.utils._pytree.tree_map(
+            lambda x: self._to_meta_dtensor(x, axis, mesh),
+            kwargs or {},
+        )
+        try:
+            with ExplicitRedistributionContext(strict=True):
+                meta_result = func(*meta_args, **meta_kwargs)
+        except RuntimeError as e:
+            raise SpmdTypeError(
+                f"No valid sharding strategy for {func.__name__} "
+                f"on axis {format_axis(axis)}"
+            ) from e
+
+        # Extract per-leaf output placements.
+        flat, _ = torch.utils._pytree.tree_flatten(meta_result)
+        out: list[dtensor_type.Placement | None] = []
+        for item in flat:
+            if isinstance(item, DTensor):
+                assert len(item.placements) == 1, item.placements
+                out.append(item.placements[0])
+            else:
+                out.append(None)
+        return out
+
+
+_shard_propagator = _ShardPropagator()
+
+
+def _validate_and_update_local_global_correspondence(
+    local_result: PerMeshAxisLocalSpmdType,
+    global_results: list[PerMeshAxisSpmdType | None],
+    axis: MeshAxis,
+) -> list[PerMeshAxisSpmdType | None]:
+    """Validate that local SPMD and DTensor outputs correspond.
+
+    Global SPMD propagation only runs for axes where PartitionSpec exists in the
+    input args. Local SPMD handles R, I, V, and P propagation; DTensor is
+    consulted for shard dimension tracking and Partial('sum') conversion.
+
+    Expected DTensor placement type <-> spmd type correspondence: S(i)->V,
+    P(sum)->P/V, R->R/I (refers to local spmd result to decide on R or I).
+
+    Validates each output element in the flat list.
+    """
+    axis_str = format_axis(axis)
+
+    def mismatch_msg(gr: PerMeshAxisSpmdType, detail: str = "") -> str:
+        return (
+            f"Local SPMD produces {local_result} on axis {axis_str} but "
+            f"DTensor produces {gr}{detail}. "
+            f"This indicates a bug in the SPMD type checker or DTensor "
+            f"shard propagation."
+        )
+
+    out: list[PerMeshAxisSpmdType | None] = []
+    for gr in global_results:
+        if gr is None:
+            out.append(None)
+        elif local_result is I:
+            assert gr is R, mismatch_msg(gr)
+            out.append(I)
+        elif local_result is V:
+            assert gr is V or gr is P, mismatch_msg(gr)
+            out.append(gr)
+        else:
+            mapped_local = to_local_type(gr)
+            assert mapped_local == local_result, mismatch_msg(
+                gr, f" (maps to {mapped_local})"
+            )
+            out.append(gr)
+    return out
+
+
+def _is_reachable(
+    src: MeshAxis,
+    dst: MeshAxis,
+    edges: dict[MeshAxis, set[MeshAxis]],
+) -> bool:
+    """Check if ``dst`` is reachable from ``src`` via directed edges (DFS)."""
+    visited: set[MeshAxis] = set()
+
+    def dfs(node: MeshAxis) -> bool:
+        for neighbor in edges.get(node, set()):
+            if neighbor == dst:
+                return True
+            if neighbor not in visited:
+                visited.add(neighbor)
+                if dfs(neighbor):
+                    return True
+        return False
+
+    return dfs(src)
+
+
+def _assert_shard_order_determined(
+    shard_dict: dict[MeshAxis, PerMeshAxisSpmdType],
+    shard_edges: dict[MeshAxis, set[MeshAxis]],
+    func: Callable,
+) -> None:
+    """Assert that axes sharing the same output Shard dim have a determined order.
+
+    If multiple axes produce Shard(d) for the same tensor dim d, their
+    ordering must be determined by the edge graph from input PartitionSpec
+    tuples. Each consecutive pair of axes on the same dim must be connected
+    by a path in the edge graph (reachable in either direction). Since
+    reachability is transitive, consecutive checks cover all pairs.
+
+    For example, given input tuples ``(a, b, c)`` and ``(c, d)``, the edges
+    are ``a->b, b->c, c->d``. If axes ``(a, d)`` share an output dim,
+    ``a->d`` is reachable via ``a->b->c->d``, so the ordering is valid. But
+    if axes ``(a, e)`` share an output dim with no path between them, the
+    ordering is ambiguous and we raise an error.
+    """
+    # Group axes by their Shard dim.
+    dim_to_axes: dict[int, list[MeshAxis]] = {}
+    for axis, typ in shard_dict.items():
+        assert isinstance(typ, Shard)
+        dim_to_axes.setdefault(typ.dim, []).append(axis)
+
+    # Check consecutive pairs; since reachability is transitive, this
+    # covers all pairs. Check both directions since list order is arbitrary.
+    for dim, axes in dim_to_axes.items():
+        for i in range(len(axes) - 1):
+            a, b = axes[i], axes[i + 1]
+            if not _is_reachable(a, b, shard_edges) and not _is_reachable(
+                b, a, shard_edges
+            ):
+                raise SpmdTypeError(
+                    f"Op {func.__name__}: axes {format_axis(a)} and "
+                    f"{format_axis(b)} both shard output dim {dim} but "
+                    f"no input PartitionSpec provides an ordering "
+                    f"constraint between them. This likely indicates a "
+                    f"bug in combining per mesh axis shard propagation."
+                )
+
+
+def _infer_global_output_type(
+    func: Callable,
+    args: tuple,
+    kwargs: dict | None,
+    global_shard_axes: list[MeshAxis],
+    flat_results: list[object],
+    shard_edges: dict[MeshAxis, set[MeshAxis]] | None = None,
+) -> tuple[
+    list[dict[MeshAxis, dtensor_type.Placement] | None],
+    list[PartitionSpec | None],
+]:
+    """Run DTensor shard propagation and produce output PartitionSpecs.
+
+    For each axis in ``global_shard_axes``, runs DTensor propagation to
+    determine how shard dimensions flow through the op. Only ``Shard(dim)``
+    placements contribute to the output PartitionSpec; ``Replicate`` and
+    ``Partial`` are recorded in the raw placements but do not affect the spec.
+
+    ``global_shard_axes`` is a subset of the current mode's ``global_axes``,
+    containing only those that have S(i) on at least one input tensor
+    (collected by ``_collect_shard_axes``). The list is ordered by tuple
+    sequence from input PartitionSpecs: for ``('tp', 'dp')``, tp is first,
+    dp second. Propagation follows this order and the output PartitionSpec
+    preserves it, so if both axes land on the same dim the result is
+    ``('tp', 'dp')``.
+
+    Args:
+        func: The torch function being propagated.
+        args: Positional arguments to the torch function.
+        kwargs: Keyword arguments to the torch function.
+        global_shard_axes: Topologically sorted shard axes from
+            ``_collect_shard_axes``.
+        flat_results: Flattened output leaves from the op.
+        shard_edges: Optional ordering constraints from ``_collect_shard_axes``.
+            ``shard_edges[a]`` is the set of axes that must come after ``a``.
+            When provided, verifies that axes sharing the same output dim
+            have a defined ordering from the inputs. When ``None``, the
+            check is skipped.
+
+    Returns:
+        A tuple of (placements, partition_specs), both flat lists with one
+        entry per leaf of ``flat_results``:
+        - ``placements``: per-output-leaf dict mapping axis to raw DTensor
+          Placement (or None for non-tensor leaves). The caller should pass
+          these to ``_validate_and_update_local_global_correspondence`` to
+          check consistency with local SPMD results.
+        - ``partition_specs``: ``PartitionSpec | None`` per output leaf.
+    """
+    n_outputs = len(flat_results)
+
+    # Propagate global shard axes, collecting per-axis raw DTensor Placements.
+    # Each entry is a flat list with one Placement per output leaf. Iteration
+    # follows global_shard_axes (topologically sorted from input PartitionSpecs).
+    # axis_order=global_shard_axes is passed to shard_types_to_partition_spec to
+    # determine multi-axis tuple ordering.
+    per_axis: dict[MeshAxis, list[dtensor_type.Placement | None]] = {}
+    for axis in global_shard_axes:
+        axis_out = _shard_propagator.propagate(func, axis, args, kwargs=kwargs)
+        assert len(axis_out) == n_outputs, (
+            f"Op {func.__name__} has {len(axis_out)} outputs on axis "
+            f"{format_axis(axis)} but result has {n_outputs}."
+        )
+        per_axis[axis] = axis_out
+
+    # --- Build flat output lists (one entry per output leaf) ---
+    placements: list[dict[MeshAxis, dtensor_type.Placement] | None] = []
+    partition_specs: list[PartitionSpec | None] = []
+    for i, output_i in enumerate(flat_results):
+        leaf_placements: dict[MeshAxis, dtensor_type.Placement] = {}
+        shard_dict: dict[MeshAxis, PerMeshAxisSpmdType] = {}
+        for axis, axis_pls in per_axis.items():
+            p = axis_pls[i]
+            if p is not None:
+                leaf_placements[axis] = p
+            if isinstance(p, dtensor_type.Shard):
+                shard_dict[axis] = Shard(p.dim)
+        if not isinstance(output_i, torch.Tensor):
+            placements.append(None)
+            partition_specs.append(None)
+        else:
+            placements.append(leaf_placements if leaf_placements else None)
+            if shard_dict:
+                # Verify that axes sharing the same output dim have an ordering
+                # constraint from the input PartitionSpec tuples. If two axes A
+                # and B both produce Shard(d) for the same dim d but neither is
+                # reachable from the other in the edge graph, the output tuple
+                # ordering would be arbitrary.
+                if shard_edges is not None:
+                    _assert_shard_order_determined(shard_dict, shard_edges, func)
+                partition_specs.append(
+                    shard_types_to_partition_spec(
+                        shard_dict, output_i.ndim, axis_order=global_shard_axes
+                    )
+                )
+            else:
+                partition_specs.append(None)
+    return placements, partition_specs
+
+
 # =============================================================================
 # TorchFunctionMode for SPMD Type Tracking
 # =============================================================================
@@ -1983,6 +2849,41 @@ def _get_autograd_function_class(func) -> type | None:
     return None
 
 
+def _validate_partition_spec_for_global_spmd(
+    local_type: LocalSpmdType,
+    spec: PartitionSpec | None,
+) -> None:
+    """Validate PartitionSpec <-> local type consistency.
+
+    Checks bidirectional consistency between a tensor's local SPMD types and
+    its PartitionSpec:
+
+    1. Every V-typed axis must have a PartitionSpec entry.
+    2. Every PartitionSpec axis must have local type V.
+
+    Args:
+        local_type: The tensor's local SPMD type dict.
+        spec: The tensor's PartitionSpec (None if absent).
+    """
+    spec_axes = spec.axes_with_partition_spec() if spec is not None else set()
+    for axis, typ in local_type.items():
+        if typ is V and axis not in spec_axes:
+            ax = format_axis(axis)
+            raise SpmdTypeError(
+                f"Tensor has Varying type on axis {ax} but no PartitionSpec entry. "
+                f"Use assert_type with S(i) or PartitionSpec to specify which "
+                f"dimension is sharded. Otherwise, reinterpret the tensor from V to P."
+            )
+    for axis in spec_axes:
+        typ = local_type.get(axis)
+        if typ is not V:
+            ax = format_axis(axis)
+            raise SpmdTypeError(
+                f"Tensor has PartitionSpec on axis {ax} but local type is "
+                f"{typ!r}, not V. PartitionSpec (sharding) is only valid for Varying axes."
+            )
+
+
 class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
     """
     TorchFunctionMode for tracking SPMD types on tensors.
@@ -2013,19 +2914,29 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
               that has axes raises ``SpmdTypeError`` because the ``{}``
               tensor is missing those axes.  Call ``assert_type()`` to
               assign axes before combining.
+
+        local: When True (default), only local SPMD types are tracked.
+            When False, enables global SPMD mode where every axis with
+            Varying type on a tensor must have a corresponding
+            PartitionSpec entry specifying which tensor dimension is
+            sharded. This ensures DTensor shard propagation can determine
+            how shards flow through ops.
     """
 
     def __init__(
         self,
         *,
         strict_mode: Literal["permissive", "strict"] = "strict",
+        local: bool = True,
     ):
         super().__init__()
         self._strict = strict_mode == "strict"
+        self._local: bool = local
+
         self._disabled = False
 
     def __enter__(self):
-        assert getattr(_state._tls, "active_mode", None) is None, (
+        assert _current_mode() is None, (
             "_SpmdTypeMode must only be entered via typecheck()"
         )
         # FIXME: the autograd patch mutates a global class attribute
@@ -2067,9 +2978,8 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
             return func(*args, **kwargs)
 
         # Outer try/except: apply traceback filtering to SpmdTypeError.
-        # This wraps everything after the early returns so that context
-        # enrichment (inner except) runs first, then filtering strips
-        # internal frames from the traceback the user sees.
+        # _typecheck_core stamps e.context with operator info first,
+        # then this except strips internal frames from the traceback.
         try:
             return self._typecheck_core(func, types, args, kwargs)
         except SpmdTypeError as e:
@@ -2083,41 +2993,62 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
         original_args, original_kwargs = args, kwargs
         args, kwargs = _unwrap_args(args, kwargs)
 
-        # Typecheck-registered autograd function: dispatch to typecheck_forward
-        # INSTEAD of executing func.  The mode is popped off the
-        # TorchFunctionMode stack during __torch_function__ dispatch (via
-        # _pop_mode_temporarily in torch/overrides.py), so .apply() called
-        # inside typecheck_forward executes normally without re-entering
-        # this method.
-        autograd_cls = _get_autograd_function_class(func)
-        if autograd_cls is not None and autograd_cls in _TYPECHECK_AUTOGRAD_FUNCTIONS:
-            return autograd_cls.typecheck_forward(*args, **kwargs)
-
-        # DTensor tracks its own placement metadata; the SPMD type checker
-        # should not interfere with DTensor operations.  Registered autograd
-        # functions (e.g. _ToTorchTensor) are already handled above.
-        if any(issubclass(t, DTensor) for t in types):
-            return func(*args, **kwargs)
-
-        # Run the function, then type-check the result below.
-        # Raw torch.distributed collectives are already type-checked above;
-        # SPMD collectives and regular ops are checked after execution.
-        result = func(*args, **kwargs)
-
         # =============================================================
         # Classification phase: single pass over all tensor args.
+        #
+        # Hoisted before any dispatch so that _format_operator_context
+        # is available in the except handler for ALL code paths
+        # (typecheck_forward, DTensor, collectives, local ops).
         # =============================================================
         info = _classify_args(args, kwargs)
 
-        # =============================================================
-        # Type checking phase.
-        #
-        # Every tensor's type is collected via get_local_type (untyped
-        # tensors contribute {} -- unknown on all axes).  The per-axis
-        # inference rules in infer_output_type will raise SpmdTypeError
-        # when incompatible types are combined.
-        # =============================================================
         try:
+            # Global SPMD validation.
+            if not self._local:
+                for local_type, spec in zip(info.tensor_types, info.partition_specs):
+                    _validate_partition_spec_for_global_spmd(local_type, spec)
+
+            # Typecheck-registered autograd function: dispatch to typecheck_forward
+            # INSTEAD of executing func.  The mode is popped off the
+            # TorchFunctionMode stack during __torch_function__ dispatch (via
+            # _pop_mode_temporarily in torch/overrides.py), so .apply() called
+            # inside typecheck_forward executes normally without re-entering
+            # this method.
+            autograd_cls = _get_autograd_function_class(func)
+            if (
+                autograd_cls is not None
+                and autograd_cls in _TYPECHECK_AUTOGRAD_FUNCTIONS
+            ):
+                return autograd_cls.typecheck_forward(*args, **kwargs)
+
+            # DTensor tracks its own placement metadata; the SPMD type checker
+            # should not interfere with DTensor operations.  This covers
+            # DTensor arithmetic as well as DTensor-internal autograd functions
+            # like _Redistribute (whose .apply() receives the DTensor directly).
+            # Registered boundary functions (_ToTorchTensor, _FromTorchTensor)
+            # are already handled above via _TYPECHECK_AUTOGRAD_FUNCTIONS.
+            #
+            # We check args (not types) because DTensor disables
+            # __torch_function__ (_disabled_torch_function_impl), so
+            # _get_overloaded_args never includes it in types.
+            if any(
+                isinstance(t, DTensor) for arg in args for t in _iter_tensors_in(arg)
+            ):
+                return func(*args, **kwargs)
+
+            # Run the function, then type-check the result below.
+            # Raw torch.distributed collectives are already type-checked above;
+            # SPMD collectives and regular ops are checked after execution.
+            result = func(*args, **kwargs)
+
+            # =============================================================
+            # Type checking phase.
+            #
+            # Every tensor's type is collected via get_local_type (untyped
+            # tensors contribute {} -- unknown on all axes).  The per-axis
+            # inference rules in infer_output_type will raise SpmdTypeError
+            # when incompatible types are combined.
+            # =============================================================
             if func in _SPMD_FUNCTION_DEFAULTS:
                 x = args[0]
                 defaults = _SPMD_FUNCTION_DEFAULTS[func]
@@ -2137,36 +3068,46 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
                 # V when src=P, implicitly reinterpreting V as P.  The runtime
                 # in _collectives.py already handles this conversion.
                 local_type = get_local_type(x)
-                if axis in local_type:
-                    input_type = local_type[axis]
-                    if src is not None and input_type != src:
-                        # Allow V -> P implicit cast for reductions
-                        if not (src is P and input_type is V):
-                            raise SpmdTypeError(
-                                f"{func.__name__}: expected input type {src} on axis "
-                                f"{format_axis(axis)}, got {input_type}"
-                            )
+
+                # Resolve axis to a list of matching axes on the tensor.
+                # Direct match: [axis]. Flattened decomposition: [sub1, sub2, ...].
+                resolved_axes = _resolve_collective_axes(axis, local_type)
+
+                if resolved_axes is not None:
+                    # Validate input types on all resolved axes
+                    for ax in resolved_axes:
+                        input_type = local_type[ax]
+                        if src is not None and input_type != src:
+                            # Allow V -> P implicit cast for reductions
+                            if not (src is P and input_type is V):
+                                raise SpmdTypeError(
+                                    f"{func.__name__}: expected input type {src} on axis "
+                                    f"{format_axis(ax)}, got {input_type}"
+                                )
                 elif axis.size() == 1:
-                    pass  # singleton -- skip type validation
+                    pass  # singleton axes are never stored; skip
                 elif _state.is_strict():
                     raise SpmdTypeError(
                         f"{func.__name__}: tensor has no type for axis "
                         f"{format_axis(axis)}. Use assert_type() to annotate "
                         f"the tensor on this axis before calling collectives."
                     )
-                # else: permissive mode -- skip validation for this axis,
-                # but still propagate types on other axes below.
+                # else: permissive mode -- skip validation for this axis.
 
-                # Build output types: copy all axes from input, override this axis.
-                # Always set dst even if axis was previously missing -- we know
-                # the post-collective type.
+                # Build output types: copy all axes from input, override
+                # resolved axes with dst.
                 output_type = local_type.copy()
-                if dst is not None:
-                    output_type[axis] = dst
+                if resolved_axes is not None and dst is not None:
+                    for ax in resolved_axes:
+                        output_type[ax] = dst
                 _set_local_type(result, output_type)
 
                 if _TRACE:
-                    _trace_op(func, info.tensor_types, output_type)
+                    _trace_op(
+                        func,
+                        info.tensor_types,
+                        get_local_type(result) if has_local_type(result) else None,
+                    )
 
             elif func in RAW_DIST_RULES:
                 # Raw torch.distributed collective (e.g. all_gather_into_tensor).
@@ -2199,18 +3140,11 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
             else:
                 # Local op (regular op or registered local autograd Function):
                 # infer output type from tensor types + scalars.
-                if not info.tensor_types:
-                    # No typed tensor inputs (no tensors at all).
-                    # Set {} (typed but unknown on all axes).
-                    _set_result_type(result, {})
-                    return result
-
                 spec = _OP_REGISTRY.get(func)
                 input_types_list = list(info.tensor_types)
-                if spec is not None:
-                    input_types_list = _collect_scalar_types(
-                        input_types_list, original_args, original_kwargs, spec
-                    )
+                input_types_list = _collect_scalar_types(
+                    input_types_list, original_args, original_kwargs, spec
+                )
 
                 decomp_rule = _DECOMP_TYPE_RULES.get(func)
                 if decomp_rule is not None:
@@ -2251,6 +3185,7 @@ class _SpmdTypeMode(torch.overrides.TorchFunctionMode):
 @contextmanager
 def typecheck(
     strict_mode: Optional[Literal["permissive", "strict"]] = None,
+    local: bool | None = None,
 ):
     """Context manager that activates SPMD type checking.
 
@@ -2263,35 +3198,49 @@ def typecheck(
             ``_SpmdTypeMode`` for details on each mode.  When ``None``
             (the default), inherits the current strict mode if reentrant,
             or uses ``"strict"`` when creating a fresh mode.
+        local: When True (default), only local SPMD types are tracked.
+            When False, enables global SPMD mode where every Varying axis
+            must have a PartitionSpec entry. When None, inherits the
+            current setting if reentrant, or uses True when creating a
+            fresh mode.
     """
-    existing = getattr(_state._tls, "active_mode", None)
+    existing = _current_mode()
     if existing is not None:
         old_strict = existing._strict
         old_disabled = existing._disabled
+        old_local = existing._local
         if strict_mode is not None:
             existing._strict = strict_mode == "strict"
         existing._disabled = False
+        if local is not None:
+            existing._local = local
         try:
             yield
         finally:
             existing._strict = old_strict
             existing._disabled = old_disabled
+            existing._local = old_local
     else:
         if strict_mode is None:
             strict_mode = "strict"
-        mode = _SpmdTypeMode(strict_mode=strict_mode)
+        if local is None:
+            local = True
+        mode = _SpmdTypeMode(
+            strict_mode=strict_mode,
+            local=local,
+        )
         with mode:
-            _state._set_active_mode(mode)
+            _set_current_mode(mode)
             try:
                 yield
             finally:
-                _state._clear_active_mode()
+                _set_current_mode(None)
 
 
 @contextmanager
 def no_typecheck():
     """Temporarily disable type checking on this thread (like ``no_grad``)."""
-    mode = getattr(_state._tls, "active_mode", None)
+    mode = _current_mode()
     if mode is not None:
         old_disabled = mode._disabled
         mode._disabled = True
@@ -2324,64 +3273,3 @@ class _SpmdTypeBackwardCompatibleMode:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         return self._cm.__exit__(exc_type, exc_val, exc_tb)
-
-
-# =============================================================================
-# DTensor <-> local tensor boundary typecheck_forward implementations
-# =============================================================================
-
-
-def _placements_to_local_type(mesh, placements, grad_placements):
-    """Convert DTensor placements to an SPMD local type dict."""
-    from sixlib.spmd_types._dtensor import dtensor_placement_to_spmd_type
-
-    local_type: LocalSpmdType = {}
-    for i, placement in enumerate(placements):
-        pg = mesh.get_group(i)
-        axis = normalize_axis(pg)
-        grad_pl = grad_placements[i] if i < len(grad_placements) else None
-        spmd_type = dtensor_placement_to_spmd_type(placement, grad_pl)
-        # S(i) decays to V for local type storage.
-        if isinstance(spmd_type, Shard):
-            spmd_type = V
-        local_type[axis] = spmd_type
-    return local_type
-
-
-def _typecheck_forward_to_torch_tensor(*args, **kwargs):
-    """typecheck_forward for _ToTorchTensor: run apply, then assert_type."""
-    # _ToTorchTensor.apply(input_dtensor, grad_placements)
-    input_dtensor = args[0]
-    assert isinstance(input_dtensor, DTensor), (
-        f"_ToTorchTensor input must be a DTensor, got {type(input_dtensor)}"
-    )
-    grad_placements = args[1] if len(args) > 1 else None
-    if grad_placements is None:
-        grad_placements = _normalize_placements_for_grad(input_dtensor.placements)
-    result = _ToTorchTensor.apply(*args, **kwargs)
-    local_type = _placements_to_local_type(
-        input_dtensor.device_mesh, input_dtensor.placements, grad_placements
-    )
-    assert_type(result, local_type)
-    return result
-
-
-def _typecheck_forward_from_torch_tensor(*args, **kwargs):
-    """typecheck_forward for _FromTorchTensor: validate types, then run apply."""
-    # _FromTorchTensor.apply(input, device_mesh, placements, run_check,
-    #                        shape, stride, grad_placements)
-    input_tensor = args[0]
-    device_mesh = args[1]
-    placements = args[2]
-    grad_placements = args[6] if len(args) > 6 else None
-    if grad_placements is None:
-        grad_placements = _normalize_placements_for_grad(placements)
-    expected_type = _placements_to_local_type(device_mesh, placements, grad_placements)
-    assert_type(input_tensor, expected_type)
-    return _FromTorchTensor.apply(*args, **kwargs)
-
-
-_ToTorchTensor.typecheck_forward = staticmethod(_typecheck_forward_to_torch_tensor)
-_FromTorchTensor.typecheck_forward = staticmethod(_typecheck_forward_from_torch_tensor)
-_TYPECHECK_AUTOGRAD_FUNCTIONS.add(_ToTorchTensor)
-_TYPECHECK_AUTOGRAD_FUNCTIONS.add(_FromTorchTensor)

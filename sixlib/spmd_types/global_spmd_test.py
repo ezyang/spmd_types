@@ -17,19 +17,30 @@ the operation is rejected: the implicit partial reduction must be handled
 explicitly (e.g. all_gather before reducing, or use local_map).
 """
 
+import unittest
+
 import torch
+import torch.distributed as dist
 from sixlib.spmd_types import (
     MeshAxis,
+    P,
     PartitionSpec,
     R,
     S,
     V,
 )
 from sixlib.spmd_types._checker import (
+    _collect_shard_axes,
+    _infer_global_output_type,
+    _set_partition_spec,
+    _validate_and_update_local_global_correspondence,
     assert_type,
+    dtensor_placement_to_spmd_type,
     get_local_type,
     get_partition_spec,
+    typecheck,
 )
+from sixlib.spmd_types._mesh_axis import _reset
 from sixlib.spmd_types._test_utils import SpmdTypeCheckedTestCase
 from sixlib.spmd_types.types import (
     DeviceMeshAxis,
@@ -38,9 +49,11 @@ from sixlib.spmd_types.types import (
     PerMeshAxisSpmdType,
     PerMeshAxisSpmdTypes,
     SpmdTypeError,
+    to_local_type,
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 def _get_global_type(tensor: torch.Tensor) -> PerMeshAxisSpmdTypes:
@@ -282,6 +295,231 @@ class TestShardTypeStorage(SpmdTypeCheckedTestCase):
         local = get_local_type(x)
         self.assertIs(local[self.ep_key], V)
         self.assertIs(local[self.tp_key], R)
+
+
+# =============================================================================
+# _collect_shard_axes
+# =============================================================================
+
+
+class TestCollectShardAxes(unittest.TestCase):
+    """Test _collect_shard_axes extracts and orders shard axes from PartitionSpecs."""
+
+    @classmethod
+    def setUpClass(cls):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=64, store=store)
+        cls.mesh = init_device_mesh("cpu", (4, 4, 4), mesh_dim_names=("ep", "dp", "tp"))
+
+    @classmethod
+    def tearDownClass(cls):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+
+    def setUp(self):
+        self.tp = normalize_axis(self.mesh.get_group("tp"))
+        self.dp = normalize_axis(self.mesh.get_group("dp"))
+        self.ep = normalize_axis(self.mesh.get_group("ep"))
+
+    def test_no_partition_spec_returns_empty(self):
+        """Tensor without PartitionSpec contributes no axes."""
+        result, edges = _collect_shard_axes([None], {self.tp})
+        self.assertEqual(result, [])
+        self.assertEqual(edges, {})
+
+    def test_multi_axis_tuple_ordering(self):
+        """Tuple entry (tp, dp) yields tp before dp."""
+        specs = [
+            PartitionSpec(None, (self.tp, self.dp), None),
+            PartitionSpec((self.tp, self.dp), None, None),
+            PartitionSpec((self.dp, self.ep), None, None),
+        ]
+        result, edges = _collect_shard_axes(specs, {self.tp, self.dp, self.ep})
+        self.assertEqual(result, [self.tp, self.dp, self.ep])
+        # Verify edges: tp->dp, dp->ep, tp->ep
+        self.assertIn(self.dp, edges[self.tp])
+        self.assertIn(self.ep, edges[self.dp])
+
+    def test_ordering_conflict_raises(self):
+        """Conflicting orderings across inputs raise SpmdTypeError."""
+        specs = [
+            PartitionSpec((self.tp, self.dp), None, None),
+            PartitionSpec((self.dp, self.tp), None, None),
+        ]
+        with self.assertRaises(SpmdTypeError):
+            _collect_shard_axes(specs, {self.tp, self.dp})
+
+
+# =============================================================================
+# DTensor shard propagator and _infer_global_output_type
+# =============================================================================
+
+
+class TestInferGlobalOutputType(unittest.TestCase):
+    """Test _infer_global_output_type with plain tensors.
+
+    Uses plain tensors with SPMD type annotations (no LocalTensorMode)
+    since propagation only needs tensor shapes, dtypes, and type metadata.
+    """
+
+    WORLD_SIZE = 3
+
+    @classmethod
+    def setUpClass(cls):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+        store = FakeStore()
+        dist.init_process_group(
+            backend="fake", rank=0, world_size=cls.WORLD_SIZE, store=store
+        )
+        cls.mesh = init_device_mesh("cpu", (cls.WORLD_SIZE,), mesh_dim_names=("tp",))
+
+    @classmethod
+    def tearDownClass(cls):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        _reset()
+
+    def setUp(self):
+        self.tp = normalize_axis(self.mesh.get_group("tp"))
+
+    def _make_typed(self, shape, typ):
+        """Create a plain tensor with SPMD type and optional PartitionSpec."""
+        x = torch.randn(shape)
+        local_typ = V if isinstance(typ, S) else typ
+        with typecheck(strict_mode="permissive"):
+            assert_type(x, {self.tp: local_typ})
+        if isinstance(typ, S):
+            spec = [self.tp if d == typ.dim else None for d in range(len(shape))]
+            _set_partition_spec(x, PartitionSpec(*spec))
+        return x
+
+    def test_add_s0_s0(self):
+        """add(S(0), S(0)) -> output PartitionSpec has S(0)."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(0))
+        y = self._make_typed((8, 3), S(0))
+        result = torch.add(x, y)
+        pls, specs = _infer_global_output_type(
+            func=torch.add,
+            args=(x, y),
+            kwargs=None,
+            global_shard_axes=[tp],
+            flat_results=[result],
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0], PartitionSpec(tp, None))
+        global_results = [to_local_type(dtensor_placement_to_spmd_type(pls[0][tp]))]
+        _validate_and_update_local_global_correspondence(V, global_results, tp)
+
+    def test_add_s0_s0_out_mismatch(self):
+        """add(S(0), S(0), out=out) -> should fail due to output PartitionSpec
+        mismatch."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(0))
+        y = self._make_typed((8, 3), S(0))
+        out = self._make_typed((8, 3), S(1))
+        result = torch.add(x, y)
+        with self.assertRaises(SpmdTypeError):
+            _infer_global_output_type(
+                func=torch.add,
+                args=(x, y),
+                kwargs={"out": out},
+                global_shard_axes=[tp],
+                flat_results=[result],
+            )
+
+    def test_add_s0_s1(self):
+        """add(S(0), S(1)) -> should fail for DTensor propagation due to
+        redistribution needed."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(0))
+        y = self._make_typed((8, 3), S(1))
+        result = torch.add(x, y)
+        with self.assertRaises(SpmdTypeError):
+            _infer_global_output_type(
+                func=torch.add,
+                args=(x, y),
+                kwargs=None,
+                global_shard_axes=[tp],
+                flat_results=[result],
+            )
+
+    def test_mm_s0_r(self):
+        """matmul(S(0), R) -> output PartitionSpec has S(0)."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(0))
+        w = self._make_typed((3, 5), R)
+        result = torch.mm(x, w)
+        pls, specs = _infer_global_output_type(
+            func=torch.mm,
+            args=(x, w),
+            kwargs=None,
+            global_shard_axes=[tp],
+            flat_results=[result],
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0], PartitionSpec(tp, None))
+        global_results = [to_local_type(dtensor_placement_to_spmd_type(pls[0][tp]))]
+        _validate_and_update_local_global_correspondence(V, global_results, tp)
+
+    def test_mm_r_s1(self):
+        """matmul(R, S(1)) -> output PartitionSpec has S(1)."""
+        tp = self.tp
+        x = self._make_typed((8, 3), R)
+        w = self._make_typed((3, 5), S(1))
+        result = torch.mm(x, w)
+        pls, specs = _infer_global_output_type(
+            func=torch.mm,
+            args=(x, w),
+            kwargs=None,
+            global_shard_axes=[tp],
+            flat_results=[result],
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0], PartitionSpec(None, tp))
+        global_results = [to_local_type(dtensor_placement_to_spmd_type(pls[0][tp]))]
+        _validate_and_update_local_global_correspondence(V, global_results, tp)
+
+    def test_mm_s1_s0_gives_partial(self):
+        """matmul(S(1), S(0)) -> Partial: accepted by correspondence check."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(1))
+        w = self._make_typed((3, 5), S(0))
+        result = torch.mm(x, w)
+        pls, specs = _infer_global_output_type(
+            func=torch.mm,
+            args=(x, w),
+            kwargs=None,
+            global_shard_axes=[tp],
+            flat_results=[result],
+        )
+        # DTensor produces Partial; local SPMD produces V.
+        global_results = [to_local_type(dtensor_placement_to_spmd_type(pls[0][tp]))]
+        out = _validate_and_update_local_global_correspondence(V, global_results, tp)
+        self.assertEqual(out, [P])
+
+    def test_transpose_s0_gives_s1(self):
+        """transpose(S(0), 0, 1) -> output PartitionSpec has S(1)."""
+        tp = self.tp
+        x = self._make_typed((8, 3), S(0))
+        result = torch.transpose(x, 0, 1)
+        pls, specs = _infer_global_output_type(
+            func=torch.transpose,
+            args=(x, 0, 1),
+            kwargs=None,
+            global_shard_axes=[tp],
+            flat_results=[result],
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0], PartitionSpec(None, tp))
+        global_results = [to_local_type(dtensor_placement_to_spmd_type(pls[0][tp]))]
+        _validate_and_update_local_global_correspondence(V, global_results, tp)
 
 
 if __name__ == "__main__":
